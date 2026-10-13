@@ -93,6 +93,16 @@ jobs:
         run: npm ci
         working-directory: test/e2e
 
+      # The system google-chrome wedges under the new headless mode when a
+      # second target exists: CDP Runtime.callFunctionOn responses are lost
+      # while the renderer main thread sits idle in a timed wait. The app
+      # itself is fine (single-page runs and headless-shell runs both pass),
+      # so pin the official headless Chrome binary used for local runs.
+      - name: install chrome-headless-shell
+        run: |
+          npx --yes @puppeteer/browsers install chrome-headless-shell@155.0.8059.39 --path "$HOME/chrome"
+          echo "CHROME_BIN=$(find "$HOME/chrome" -type f -name chrome-headless-shell)" >> "$GITHUB_ENV"
+
       - name: e2e call
         run: node e2e-call.mjs
         working-directory: test/e2e
