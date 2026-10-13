@@ -31,7 +31,10 @@ pub enum Joinability {
         #[serde(with = "time::serde::rfc3339")]
         opens_at: OffsetDateTime,
     },
+    /// The join window (ends_at + grace) is in the past.
     Ended,
+    /// The organizer cancelled the meeting.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
