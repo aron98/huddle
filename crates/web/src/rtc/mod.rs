@@ -10,6 +10,11 @@
 mod peer;
 mod transport;
 
+#[cfg(target_arch = "wasm32")]
+pub mod browser;
+
+#[cfg(target_arch = "wasm32")]
+pub use browser::{BrowserPeerConnection, BrowserSignalingStream};
 pub use peer::{LocalCandidate, PeerConnection, PeerError};
 pub use transport::{SignalingError, SignalingStream};
 
