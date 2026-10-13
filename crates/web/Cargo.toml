@@ -19,6 +19,9 @@ leptos.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+futures.workspace = true
+time.workspace = true
+uuid.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 web-sys.workspace = true
@@ -33,3 +36,4 @@ uuid = { version = "1", features = ["js"] }
 # integration-tested against an in-process mock signaling server.
 tokio.workspace = true
 axum.workspace = true
+tokio-tungstenite.workspace = true

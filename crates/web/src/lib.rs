@@ -1,8 +1,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![allow(async_fn_in_trait)] // our boundary traits are used generically, never dyn/Send
 
 //! The huddle web client.
 //!
 //! Leptos CSR app: the prejoin page and (later) the in-call UI.
+
+pub mod rtc;
 
 use leptos::prelude::*;
 
