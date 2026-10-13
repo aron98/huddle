@@ -205,6 +205,7 @@ fn Prejoin(code: String) -> impl IntoView {
                 <input
                     type="text"
                     placeholder="e.g. Alice"
+                    data-testid="name-input"
                     prop:value=name
                     on:input=move |ev| name.set(event_target_value(&ev))
                 />
@@ -249,7 +250,7 @@ fn Prejoin(code: String) -> impl IntoView {
                 </button>
             </div>
 
-            <button on:click=join>"Join"</button>
+            <button data-testid="join-btn" on:click=join>"Join"</button>
 
             {move || status.get().map(|s| view! { <p role="status">{s}</p> })}
             </>
