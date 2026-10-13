@@ -1,0 +1,56 @@
+# Dev stack: hot-reloading web client + API server + TURN companion.
+#
+#     docker compose up
+#
+# - `web` watches the web crate and rebuilds crates/web/dist on every change;
+# - `server` serves that directory via HUDDLE_WEB_DIR, so UI edits show up on
+#   the next browser refresh (server code changes need a container restart);
+# - `coturn` is the TURN companion from the architecture doc (dev credentials).
+#
+# coturn uses host networking (Linux only), as recommended for TURN.
+
+services:
+  web:
+    image: rust:1.96-slim-bookworm
+    working_dir: /workspace/crates/web
+    # The rust slim images don't ship curl, and trunk is installed from the
+    # same pinned release binary used by CI and the production Dockerfile.
+    command: >
+      sh -c "apt-get update -qq && apt-get install -qq -y --no-install-recommends curl
+      && rustup target add wasm32-unknown-unknown
+      && curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /usr/local/bin
+      && trunk watch"
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+
+  server:
+    image: rust:1.96-slim-bookworm
+    working_dir: /workspace
+    command: cargo run -p huddle-server
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+    environment:
+      HUDDLE_BIND: 0.0.0.0:3000
+      HUDDLE_WEB_DIR: /workspace/crates/web/dist
+      HUDDLE_DATA_DIR: /workspace/data
+      # Point the advertised ICE servers at the dev TURN companion. Nested
+      # env vars use figment's `__` indexing: ICE_SERVERS[0] with urls[0..2].
+      HUDDLE_ICE_SERVERS__0__URLS__0: stun:127.0.0.1:3478
+      HUDDLE_ICE_SERVERS__0__URLS__1: turn:127.0.0.1:3478
+      HUDDLE_ICE_SERVERS__0__USERNAME: huddle
+      HUDDLE_ICE_SERVERS__0__CREDENTIAL: devpassword
+    ports:
+      - "3000:3000"
+    depends_on:
+      - web
+
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    volumes:
+      - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+volumes:
+  cargo-registry:
