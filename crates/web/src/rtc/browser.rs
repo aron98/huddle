@@ -229,6 +229,11 @@ impl BrowserPeerConnection {
         self.remote_streams.borrow().clone()
     }
 
+    /// The underlying JS `RTCPeerConnection`, for debug/test inspection.
+    pub fn raw(&self) -> RtcPeerConnection {
+        self.pc.clone()
+    }
+
     /// Add every track of `stream` to the peer connection (as sender),
     /// so the next offer announces our camera and microphone.
     pub fn attach_stream(&self, stream: &MediaStream) {
