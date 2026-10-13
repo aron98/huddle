@@ -160,6 +160,12 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
     }
 
     /// Offer our local media to the SFU and wait for its answer.
+    ///
+    /// The SFU may send its own renegotiation offer (another participant's
+    /// tracks) while our offer is in flight. Applying it would move the
+    /// peer connection out of `have-local-offer` and make the SFU's answer
+    /// inapplicable ("wrong state"), so server offers are queued and
+    /// applied only once our own negotiation finishes.
     pub async fn publish(&mut self) -> Result<(), RtcError> {
         self.require_in_call()?;
 
@@ -169,6 +175,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             .await?;
         self.flush_local_candidates().await?;
 
+        let mut deferred_offers = Vec::new();
         loop {
             let Some(message) = self.signaling.next_message().await else {
                 self.state = SessionState::Closed;
@@ -177,15 +184,25 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             match message? {
                 ServerMessage::SdpAnswer { sdp } => {
                     self.peer.apply_answer(sdp).await?;
-                    return Ok(());
+                    break;
                 }
                 ServerMessage::Error { code, message } => {
                     return Err(RtcError::Server(ServerError { code, message }));
                 }
+                ServerMessage::SdpOffer { sdp } => deferred_offers.push(sdp),
                 // Candidates and roster chatter can interleave; handle it.
                 other => self.handle_server_message(other).await?,
             }
         }
+
+        for sdp in deferred_offers {
+            let answer = self.peer.apply_remote_offer(sdp).await?;
+            self.signaling
+                .send(ClientMessage::SdpAnswer { sdp: answer })
+                .await?;
+            self.flush_local_candidates().await?;
+        }
+        Ok(())
     }
 
     /// Read and process the next server message. Returns the raw message so
