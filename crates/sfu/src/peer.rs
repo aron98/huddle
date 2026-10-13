@@ -86,6 +86,13 @@ pub(crate) struct Peer {
     pending: Option<SdpPendingOffer>,
     tracks_in: Vec<TrackInEntry>,
     tracks_out: Vec<TrackOut>,
+    /// True once the client completed its own first offer/answer.
+    ///
+    /// Renegotiation offers must not be sent before that: the client's
+    /// initial offer invalidates any pending server offer, and a stale
+    /// offer delivered across that boundary no longer matches the m-line
+    /// order the client established, so browsers reject it.
+    has_session: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
 }
@@ -107,6 +114,7 @@ impl Peer {
             pending: None,
             tracks_in: Vec::new(),
             tracks_out: Vec::new(),
+            has_session: false,
             rx_frames: 0,
             tx_frames: 0,
         };
@@ -134,6 +142,7 @@ impl Peer {
         let offer = SdpOffer::from_sdp_string(sdp)?;
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
         self.pending = None;
+        self.has_session = true;
         for out in &mut self.tracks_out {
             if matches!(out.state, TrackOutState::Negotiating(_)) {
                 out.state = TrackOutState::ToOpen;
@@ -198,7 +207,7 @@ impl Peer {
     /// If any tracks are waiting to be opened, bundle them into a single
     /// renegotiation offer and return its SDP string.
     pub(crate) fn negotiate_if_needed(&mut self) -> Option<String> {
-        if self.pending.is_some() {
+        if !self.has_session || self.pending.is_some() {
             return None;
         }
 
