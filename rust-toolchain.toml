@@ -1,2 +1,7 @@
 [toolchain]
 channel = "1.96.0"
+# Declared here so rustup provisions the pinned toolchain with
+# everything CI and local development need (rustup auto-installs
+# these when the toolchain file resolves).
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

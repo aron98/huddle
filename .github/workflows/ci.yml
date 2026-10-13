@@ -16,10 +16,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The toolchain comes from rust-toolchain.toml.
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # The toolchain (and its rustfmt/clippy/wasm32 components) comes from
+      # rust-toolchain.toml; this provisions it for the job.
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
 
       - uses: Swatinem/rust-cache@v2
 
@@ -32,9 +32,6 @@ jobs:
       - name: tests
         run: cargo test
 
-      - name: wasm target
-        run: rustup target add wasm32-unknown-unknown
-
       - name: check + clippy (wasm32)
         run: |
           cargo check -p huddle-web --target wasm32-unknown-unknown
@@ -46,7 +43,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
 
       - uses: Swatinem/rust-cache@v2
 
@@ -56,9 +54,6 @@ jobs:
             https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
             | tar -xz -C /usr/local/bin
           trunk --version
-
-      - name: wasm target
-        run: rustup target add wasm32-unknown-unknown
 
       - name: e2e stub
         run: scripts/e2e-stub.sh
