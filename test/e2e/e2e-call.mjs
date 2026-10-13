@@ -18,9 +18,13 @@ const CHROME = process.env.CHROME_BIN ?? 'google-chrome';
 const ROOT = resolve(import.meta.dirname, '../..');
 const SERVER = join(ROOT, 'target/debug/huddle');
 
+// Fail fast, but unwind through `finally` so the server/browser clean up.
+class FailSignal extends Error {}
+
 const fail = (msg) => {
   console.error(`FAIL: ${msg}`);
-  process.exit(1);
+  process.exitCode = 1;
+  throw new FailSignal(msg);
 };
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -51,6 +55,7 @@ async function bootServer() {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
       ...process.env,
+      RUST_LOG: process.env.RUST_LOG ?? 'huddle=debug',
       HUDDLE_BIND: `127.0.0.1:${PORT}`,
       HUDDLE_PUBLIC_IP: '127.0.0.1',
       HUDDLE_MEDIA_PORT: '0',
@@ -137,6 +142,27 @@ async function mediaProbe(page, peer) {
   }, peer);
 }
 
+const stateDump = (page, who) =>
+  page
+    .evaluate(() => {
+      const pc = window.__huddlePc;
+      return {
+        status: document.querySelector('[data-testid="call-status"]')?.textContent ?? null,
+        tiles: [...document.querySelectorAll('[data-testid^="tile-"]')].map((e) => e.dataset.testid),
+        roster: [...document.querySelectorAll('[data-testid^="roster-"]')].map((e) => e.textContent),
+        pc: pc
+          ? {
+              conn: pc.connectionState,
+              sig: pc.signalingState,
+              localM: pc.localDescription?.sdp.split('\n').filter((l) => l.startsWith('m=')).length,
+              remoteM: pc.remoteDescription?.sdp.split('\n').filter((l) => l.startsWith('m=')).length,
+            }
+          : null,
+      };
+    })
+    .then((s) => console.log(`[${who} state]`, JSON.stringify(s)))
+    .catch((e) => console.log(`[${who} state] probe failed:`, e.cause?.message ?? e.message));
+
 async function main() {
   console.log(`booting server (${SERVER})`);
   const srv = await bootServer();
@@ -159,14 +185,32 @@ async function main() {
 
     const alice = await browser.newPage();
     const bob = await browser.newPage();
+    for (const [page, who] of [
+      [alice, 'alice'],
+      [bob, 'bob'],
+    ]) {
+      page.on('console', (m) => {
+        if (m.type() !== 'warning') console.log(`[${who} console:${m.type()}]`, m.text());
+      });
+      page.on('pageerror', (e) => console.log(`[${who} pageerror]`, e.message));
+    }
 
     console.log('alice and bob join the meeting');
     await joinAs(alice, code, 'alice');
     await joinAs(bob, code, 'bob');
 
     console.log('waiting for tiles');
-    await alice.waitForSelector('[data-testid="tile-bob"]', { timeout: 30_000 });
-    await bob.waitForSelector('[data-testid="tile-alice"]', { timeout: 30_000 });
+    const waitTile = async (page, sel, who) => {
+      try {
+        await page.waitForSelector(sel, { timeout: 30_000 });
+      } catch (e) {
+        await stateDump(page, who).catch(() => {});
+        const status = await statusText(page).catch(() => '(status probe failed)');
+        fail(`${who}: tile wait ${sel} failed; status: ${status}`);
+      }
+    };
+    await waitTile(alice, '[data-testid="tile-bob"]', 'alice');
+    await waitTile(bob, '[data-testid="tile-alice"]', 'bob');
 
     console.log('asserting media flows through the server');
     for (const [page, peer, who] of [[alice, 'bob', 'alice'], [bob, 'alice', 'bob']]) {
@@ -191,9 +235,13 @@ async function main() {
 
     console.log('PASS: two-person call e2e green');
   } catch (err) {
-    fail(`unexpected error: ${err?.stack ?? err}`);
+    if (!(err instanceof FailSignal)) {
+      console.error(`FAIL: unexpected error: ${err?.stack ?? err}`);
+      process.exitCode = 1;
+    }
   } finally {
     await browser?.close();
+    if (process.env.DUMP_SERVER_LOGS !== '0') console.log('--- server logs:\n' + srv.logs());
     srv.cleanup();
   }
 }
