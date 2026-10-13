@@ -11,3 +11,6 @@ workspace = true
 
 [dependencies]
 huddle-protocol.workspace = true
+str0m = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
