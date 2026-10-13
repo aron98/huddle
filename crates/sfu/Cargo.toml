@@ -1,0 +1,13 @@
+[package]
+name = "huddle-sfu"
+description = "Media plane: SFU built on str0m"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+huddle-protocol.workspace = true
