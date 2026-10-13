@@ -1,5 +1,7 @@
 # huddle
 
+[![ci](https://github.com/aron98/huddle/actions/workflows/ci.yml/badge.svg)](https://github.com/aron98/huddle/actions/workflows/ci.yml)
+
 **Lightweight, self-hostable virtual meetings — in Rust.**
 
 huddle is an open-source video meeting application you can run as a single binary
@@ -8,7 +10,21 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Design phase** — the architecture and implementation plan are agreed; no working code yet.
+🚧 **Phases 0–1 complete** — the foundations and the four independent tracks from
+the [implementation plan](docs/implementation-plan.md) are done:
+
+- `protocol` — v1 signaling and REST wire messages.
+- `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web UI.
+- `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
+  SDP answering, media forwarding, keyframe discipline; tested with synthetic
+  in-process clients and a real-UDP loopback.
+- `web` — Leptos prejoin page (camera preview, device pickers, name) and an
+  `RtcClient` signaling driver, tested against a mock signaling server.
+- Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check),
+  multi-stage Dockerfile, dev compose stack with coturn.
+
+**Next:** phase 2 — wire the prejoin page to the real SFU for a two-person call
+through the server.
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
@@ -43,6 +59,43 @@ The self-hosted landscape splits into two camps: heavyweight platforms
 (Jitsi Meet, BigBlueButton) that are powerful but painful to run, and minimal
 tools (Galène) that are easy to run but spartan. huddle aims for the empty
 middle: **single-binary operational simplicity, modern UX, Rust performance.**
+
+## Development
+
+Prerequisites: [Rust](https://rustup.rs) 1.96 (pinned via `rust-toolchain.toml`),
+the `wasm32-unknown-unknown` target, and [trunk](https://trunkrs.dev) 0.21.x
+(a release binary is fine: grab it from the
+[trunk releases](https://github.com/trunk-rs/trunk/releases) page).
+
+```sh
+# quality gates (what CI runs)
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo check -p huddle-web --target wasm32-unknown-unknown
+
+# dev loop, two terminals:
+(cd crates/web && trunk watch)          # rebuilds the web bundle on change
+HUDDLE_WEB_DIR=crates/web/dist cargo run -p huddle-server   # serves it
+```
+
+Then create a meeting and open its page:
+
+```sh
+curl -s localhost:3000/api/meetings \
+  -H 'content-type: application/json' \
+  -d '{"title":"standup","starts_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","ends_at":"'"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"'"}' | jq .
+# → open http://localhost:3000/m/<code from the response>
+```
+
+Configuration is `HUDDLE_*` environment variables (optionally a `huddle.toml`):
+`HUDDLE_BIND` (default `0.0.0.0:3000`), `HUDDLE_DATA_DIR` (default `./data`),
+`HUDDLE_PUBLIC_IP`, `HUDDLE_MEDIA_PORT` (default `40000`), `HUDDLE_WEB_DIR`
+(serve a web bundle from disk instead of the embedded one).
+
+Docker: `docker build -t huddle .` produces the single-binary image; and
+`docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
+credentials).
 
 ## License
 
