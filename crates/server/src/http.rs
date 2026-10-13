@@ -14,6 +14,7 @@ use huddle_protocol::{
 };
 
 use crate::meetings::{self, MeetingError};
+use crate::session;
 use crate::state::AppState;
 
 /// The web UI bundle. In debug builds rust-embed reads from disk; in release
@@ -33,6 +34,7 @@ pub fn router(state: AppState) -> Router {
                 .patch(update_meeting)
                 .delete(cancel_meeting),
         )
+        .route("/ws", get(session::ws))
         .fallback(fallback)
         .with_state(state)
 }
@@ -236,10 +238,12 @@ mod tests {
     use tower::ServiceExt;
 
     async fn test_state() -> AppState {
-        AppState::new(
-            Arc::new(crate::config::Config::default()),
-            crate::db::test_pool().await,
-        )
+        let config = Arc::new(crate::config::Config {
+            media_port: 0,
+            ..crate::config::Config::default()
+        });
+        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+        AppState::new(config, crate::db::test_pool().await, engine)
     }
 
     #[tokio::test]

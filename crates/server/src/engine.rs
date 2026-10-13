@@ -39,12 +39,6 @@ pub struct JoinRejected {
 
 /// Everything an async session can ask the engine to do. Sessions are the
 /// only writers; the reader thread also sends [`EngineCommand::Packet`].
-///
-/// Only `Packet`/`Shutdown` are used by the binary before the ws session
-/// glue lands (next commit); the rest are driven by the engine tests and
-/// will be called from `session` immediately after.
-// TODO(phase-2): drop once the ws sessions are the callers.
-#[allow(dead_code)]
 pub enum EngineCommand {
     /// Put a participant in a meeting room. The session has already
     /// validated the meeting exists and its join window is open; the
@@ -87,18 +81,12 @@ pub enum EngineCommand {
     Shutdown,
 }
 
-/// Cloneable handle sessions use to talk to the engine thread. The
-/// per-command methods below are called from `session` (next commit);
-/// `join` is exercised by the engine tests in the meantime.
-// TODO(phase-2): drop once the ws sessions are the callers.
-#[allow(dead_code)]
+/// Cloneable handle sessions use to talk to the engine thread.
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: Sender<EngineCommand>,
 }
 
-// TODO(phase-2): drop once the ws sessions are the callers.
-#[allow(dead_code)]
 impl EngineHandle {
     pub fn join(
         &self,

@@ -5,6 +5,7 @@ mod db;
 mod engine;
 mod http;
 mod meetings;
+mod session;
 mod state;
 
 use std::sync::Arc;
@@ -40,7 +41,7 @@ async fn run() -> anyhow::Result<()> {
     let (engine, media_addr) = engine::spawn(&config).context("starting media engine")?;
     info!(media = %media_addr, "media engine ready");
 
-    let app = http::router(state::AppState::new(config.clone(), pool));
+    let app = http::router(state::AppState::new(config.clone(), pool, engine.clone()));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
