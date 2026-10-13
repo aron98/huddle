@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Build output
+/web/dist
+
+# Local runtime state
+/data
+*.db
+*.db-shm
+*.db-wal
+.env
+
+# OS
+.DS_Store
+
+# Tooling
+/.opencode
