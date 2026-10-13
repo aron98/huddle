@@ -57,7 +57,7 @@ float freely across all phases.
 
 ## Phases
 
-### Phase 0 — Foundations *(~1 week, mostly serial)*
+### Phase 0 — Foundations *(~1 week, mostly serial)* ✅
 
 Everything later depends on this; it's small.
 
@@ -72,7 +72,7 @@ Everything later depends on this; it's small.
 Parallel within the phase: infra (D) and protocol work can proceed concurrently;
 crate scaffolds are quick and serial.
 
-### Phase 1 — Independent spin-up *(1–2 weeks, fully parallel A/B/C/D)*
+### Phase 1 — Independent spin-up *(1–2 weeks, fully parallel A/B/C/D)* ✅
 
 - **A1 (SFU proof, native-only):** `Rtc` answered by SFU code; synthetic client
   publishes audio+video, SFU echoes it back. In-process, no sockets needed for the
@@ -87,19 +87,22 @@ crate scaffolds are quick and serial.
   Curl-only, no UI.
 - **D1:** CI from Phase 0 hardened; docker-compose with server+web hot-reload.
 
-### Phase 2 — **S1: Two-person call** *(~1–2 weeks; convergence)*
+### Phase 2 — **S1: Two-person call** *(~1–2 weeks; convergence)* ✅
 
-Delete the mock server: the Leptos prejoin page talks to the real SFU through the
-real WS. This milestone retires ~70% of project risk: interop, ICE, SDP,
-WASM-async boundaries, renegotiation basics.
+Done. The Leptos prejoin page talks to the real SFU through the real WS;
+this milestone retired the interop, ICE, SDP, WASM-async, and renegotiation
+risks.
 
 - A: WS signaling glue in `server`; session join; single-PC publish; forward one
-  peer's tracks to the other.
-- B: minimal in-call page — two tiles, mute/camera toggle, roster.
+  peer's tracks to the other. *(Landed: media engine thread + `/ws` sessions,
+  proven by a synthetic two-client integration test against the full stack.)*
+- B: minimal in-call page — two tiles, mute/camera toggle, roster. *(Landed.)*
 
 **Acceptance:** two Chrome tabs join a room; each sees and hears the other *through
 the server* (verify via `getStats()` in the CI harness — not P2P); mute stops the
 track at the SFU. This E2E test becomes the CI gate forever after.
+*(Landed: `e2e-call` CI job — two headless-Chrome pages, inbound-rtp bytes
+asserted on both, mute propagation asserted across pages.)*
 
 ### Phase 3 — **S2: N-party** *(~2 weeks; A and B parallel, converge at the end)*
 
