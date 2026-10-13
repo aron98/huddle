@@ -354,9 +354,17 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
 
         // The SFU labels each forwarded stream with the origin
-        // participant's id as the msid.
+        // participant's id as the msid. Our own publish is answered
+        // recvonly, but Chrome still creates receivers for it — skip that
+        // self-echo so it does not render as a phantom "Guest" tile.
         let streams = remote_streams;
-        peer.set_on_remote_stream(move |stream| streams.update(|list| list.push(stream)));
+        let local_id = local.as_ref().map(|s| s.id());
+        peer.set_on_remote_stream(move |stream| {
+            if local_id.as_deref() == Some(stream.id().as_str()) {
+                return;
+            }
+            streams.update(|list| list.push(stream));
+        });
         if let Some(local) = &local {
             peer.attach_stream(local);
         }
