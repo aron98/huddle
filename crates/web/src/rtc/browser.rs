@@ -46,9 +46,12 @@ enum SocketEvent {
 }
 
 impl BrowserSignalingStream {
-    /// Open a WebSocket. The browser buffers `send` calls made before the
-    /// connection is established, so no explicit wait for `open` is needed.
-    pub fn connect(url: &str) -> Result<Self, SignalingError> {
+    /// Open a WebSocket and wait for it to connect.
+    ///
+    /// `send` throws `InvalidStateError` while the socket is still in the
+    /// CONNECTING state, so callers must not send before the handshake
+    /// finished — hence `async` and the explicit wait for `open`.
+    pub async fn connect(url: &str) -> Result<Self, SignalingError> {
         let socket = WebSocket::new(url)
             .map_err(|e| SignalingError::Socket(format!("cannot open {url}: {e:?}")))?;
 
@@ -103,14 +106,52 @@ impl BrowserSignalingStream {
         };
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
 
-        Ok(Self {
+        let mut stream = Self {
             socket,
             receiver,
             _on_open: on_open,
             _on_message: on_message,
             _on_error: on_error,
             _on_close: on_close,
-        })
+        };
+
+        // The handshake is asynchronous: hold the stream back until the
+        // socket reports `open` (or fails trying).
+        loop {
+            match stream.receiver.next().await {
+                Some(SocketEvent::Open) => return Ok(stream),
+                // Messages cannot arrive before `open`; be forgiving.
+                Some(SocketEvent::Message(_)) => continue,
+                Some(SocketEvent::Failed(e)) => {
+                    return Err(SignalingError::Socket(format!(
+                        "signaling socket failed: {e}"
+                    )));
+                }
+                Some(SocketEvent::Closed) => {
+                    return Err(SignalingError::Socket(
+                        "signaling socket closed before opening".to_owned(),
+                    ));
+                }
+                None => {
+                    return Err(SignalingError::Socket(
+                        "signaling socket event stream gone".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BrowserSignalingStream {
+    fn drop(&mut self) {
+        // Detach the handlers *before* the closures drop: a late DOM event
+        // firing into a dropped closure panics the whole wasm module
+        // ("closure invoked recursively or after being dropped").
+        self.socket.set_onopen(None);
+        self.socket.set_onmessage(None);
+        self.socket.set_onerror(None);
+        self.socket.set_onclose(None);
+        let _ = self.socket.close();
     }
 }
 

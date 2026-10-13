@@ -313,7 +313,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             .location()
             .host()
             .unwrap_or_else(|_| "localhost".to_owned());
-        let signaling = match BrowserSignalingStream::connect(&format!("ws://{host}/ws")) {
+        let signaling = match BrowserSignalingStream::connect(&format!("ws://{host}/ws")).await {
             Ok(s) => s,
             Err(e) => {
                 status.set(Some(format!("Cannot reach the server: {e}")));
