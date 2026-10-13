@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  checks:
+    name: fmt, clippy, tests, wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The toolchain comes from rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (native)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: tests
+        run: cargo test
+
+      - name: wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: check + clippy (wasm32)
+        run: |
+          cargo check -p huddle-web --target wasm32-unknown-unknown
+          cargo clippy -p huddle-web --target wasm32-unknown-unknown -- -D warnings
+
+  e2e-stub:
+    name: headless chrome render check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install trunk
+        run: |
+          curl -fsSL \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin
+          trunk --version
+
+      - name: wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: e2e stub
+        run: scripts/e2e-stub.sh
