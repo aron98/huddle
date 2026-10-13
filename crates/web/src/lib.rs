@@ -261,7 +261,16 @@ fn Prejoin(code: String) -> impl IntoView {
                 </button>
             </div>
 
-            <button data-testid="join-btn" on:click=join>"Join"</button>
+            // A phase-2 call is media-first: until getUserMedia has
+            // produced a local stream there is nothing to publish, and
+            // an offer with zero m-lines would be rejected by the SFU.
+            <button
+                data-testid="join-btn"
+                disabled=move || stream.get().is_none()
+                on:click=join
+            >
+                {move || if stream.get().is_some() { "Join meeting" } else { "Getting camera and mic…" }}
+            </button>
 
             {move || status.get().map(|s| view! { <p role="status">{s}</p> })}
             </>

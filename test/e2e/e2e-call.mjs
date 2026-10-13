@@ -106,6 +106,11 @@ async function joinAs(page, code, name) {
   await page.goto(`${BASE}/m/${code}?test=1`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-testid="name-input"]');
   await page.type('[data-testid="name-input"]', name);
+  // Join is gated on the local stream being live (the button enables
+  // once getUserMedia has produced tracks) — wait for that, not just
+  // for the button to exist.
+  await page.waitForSelector('[data-testid="join-btn"]:not([disabled])', { timeout: 30_000 })
+    .catch(async () => fail(`join as ${name}: media never became ready (status: ${await statusText(page)})`));
   await page.click('[data-testid="join-btn"]');
   // The prejoin form goes away once the call view mounts.
   await page
