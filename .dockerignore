@@ -1,0 +1,12 @@
+# Build artifacts
+/target
+crates/web/dist
+
+# Runtime state
+/data
+*.db
+
+# Repo tooling
+/.git
+/.github
+/.opencode
