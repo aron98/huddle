@@ -95,6 +95,17 @@ impl Config {
         let config: Self = figment.merge(Env::prefixed("HUDDLE_")).extract()?;
         Ok(config)
     }
+
+    /// Join window for a meeting: `[starts_at - lead, ends_at + grace]`.
+    pub fn join_window(
+        &self,
+        starts_at: time::OffsetDateTime,
+        ends_at: time::OffsetDateTime,
+    ) -> (time::OffsetDateTime, time::OffsetDateTime) {
+        let lead = time::Duration::minutes(i64::from(self.join_window_lead_min));
+        let grace = time::Duration::minutes(i64::from(self.join_window_grace_min));
+        (starts_at - lead, ends_at + grace)
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +132,15 @@ mod tests {
             .unwrap();
         assert_eq!(config.bind.port(), 9999);
         assert_eq!(config.join_window_grace_min, 15); // untouched default
+    }
+
+    #[test]
+    fn join_window_math() {
+        let config = Config::default();
+        let start = time::OffsetDateTime::UNIX_EPOCH;
+        let end = start + time::Duration::hours(1);
+        let (opens, closes) = config.join_window(start, end);
+        assert_eq!(opens, start - time::Duration::minutes(5));
+        assert_eq!(closes, end + time::Duration::minutes(15));
     }
 }

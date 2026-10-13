@@ -1,7 +1,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod config;
+mod db;
 mod http;
+mod meetings;
 mod state;
 
 use std::sync::Arc;
@@ -30,7 +32,11 @@ async fn run() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
 
-    let app = http::router(state::AppState::new(config.clone()));
+    let pool = db::connect(&config.data_dir)
+        .await
+        .context("opening database")?;
+
+    let app = http::router(state::AppState::new(config.clone(), pool));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use sqlx::SqlitePool;
+
 use crate::config::Config;
 
 /// Shared application state, cheap to clone into handlers.
@@ -10,16 +12,21 @@ pub struct AppState {
 
 pub struct Inner {
     pub config: Arc<Config>,
+    pub pool: SqlitePool,
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>) -> Self {
+    pub fn new(config: Arc<Config>, pool: SqlitePool) -> Self {
         Self {
-            inner: Arc::new(Inner { config }),
+            inner: Arc::new(Inner { config, pool }),
         }
     }
 
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    pub fn pool(&self) -> &SqlitePool {
+        &self.inner.pool
     }
 }

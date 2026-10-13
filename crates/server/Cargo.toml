@@ -17,13 +17,18 @@ workspace = true
 anyhow.workspace = true
 axum.workspace = true
 figment.workspace = true
+huddle-protocol.workspace = true
+rand = "0.10"
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
