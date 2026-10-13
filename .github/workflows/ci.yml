@@ -57,3 +57,42 @@ jobs:
 
       - name: e2e stub
         run: scripts/e2e-stub.sh
+
+  e2e-call:
+    name: two person call over the sfu
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install trunk
+        run: |
+          curl -fsSL \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin
+          trunk --version
+
+      - name: build web client
+        run: trunk build
+        working-directory: crates/web
+
+      - name: build server
+        run: cargo build -q -p huddle-server
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: test/e2e/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+        working-directory: test/e2e
+
+      - name: e2e call
+        run: node e2e-call.mjs
+        working-directory: test/e2e
