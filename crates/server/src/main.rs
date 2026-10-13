@@ -2,6 +2,7 @@
 
 mod config;
 mod db;
+mod engine;
 mod http;
 mod meetings;
 mod state;
@@ -36,6 +37,9 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("opening database")?;
 
+    let (engine, media_addr) = engine::spawn(&config).context("starting media engine")?;
+    info!(media = %media_addr, "media engine ready");
+
     let app = http::router(state::AppState::new(config.clone(), pool));
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
@@ -46,6 +50,7 @@ async fn run() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("server error")?;
+    engine.shutdown();
     Ok(())
 }
 
