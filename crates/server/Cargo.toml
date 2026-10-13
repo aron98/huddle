@@ -14,3 +14,17 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+axum.workspace = true
+figment.workspace = true
+rust-embed.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

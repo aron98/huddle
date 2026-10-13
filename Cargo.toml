@@ -26,9 +26,11 @@ futures = "0.3"
 # server
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
+str0m = "0.24"
 figment = { version = "0.10", features = ["toml", "env"] }
 rust-embed = "8"
+anyhow = "1"
 
 # web (wasm)
 leptos = { version = "0.8", features = ["csr"] }
