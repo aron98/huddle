@@ -303,6 +303,18 @@ impl BrowserPeerConnection {
     }
 }
 
+impl Drop for BrowserPeerConnection {
+    fn drop(&mut self) {
+        // Detach the handlers *before* the closures drop: ICE candidate
+        // gathering and track events keep firing on their own schedule, and
+        // a late event calling a dropped closure panics the wasm module
+        // ("closure invoked recursively or after being dropped").
+        self.pc.set_onicecandidate(None);
+        self.pc.set_ontrack(None);
+        self.pc.close();
+    }
+}
+
 fn local_or_remote_description(kind: RtcSdpType, sdp: &str) -> RtcSessionDescriptionInit {
     let description = RtcSessionDescriptionInit::new(kind);
     description.set_sdp(sdp);

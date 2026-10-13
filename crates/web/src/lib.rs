@@ -18,6 +18,17 @@ use wasm_bindgen::JsCast;
 
 #[cfg(target_arch = "wasm32")]
 use rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient};
+
+/// Consume a media-play promise so a late rejection (e.g. the tile was
+/// unmounted mid-play) never surfaces as an unhandled page error.
+#[cfg(target_arch = "wasm32")]
+fn play_silently(video: &web_sys::HtmlVideoElement) {
+    if let Ok(promise) = video.play() {
+        spawn_local(async move {
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        });
+    }
+}
 /// Application root. The URL decides the page:
 /// `/` → landing, `/m/{code}` → the prejoin page for that meeting.
 #[component]
@@ -102,7 +113,7 @@ fn Prejoin(code: String) -> impl IntoView {
         };
         video.set_muted(true);
         video.set_src_object(Some(&s));
-        let _ = video.play();
+        play_silently(&video);
     });
 
     // Re-acquire media when a device is picked.
@@ -529,7 +540,7 @@ fn VideoTile(
         if let Some(video) = video_ref.get() {
             video.set_muted(muted);
             video.set_src_object(Some(&stream));
-            let _ = video.play();
+            play_silently(&video);
         }
     });
     view! {
