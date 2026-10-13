@@ -9,4 +9,27 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "huddle-web"
+path = "src/main.rs"
+
 [dependencies]
+huddle-protocol.workspace = true
+leptos.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true
+console_error_panic_hook.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# uuid's v4 generator needs a randomness source in the browser.
+uuid = { version = "1", features = ["js"] }
+
+[dev-dependencies]
+# Native-only test tooling: the signaling driver is platform-neutral and is
+# integration-tested against an in-process mock signaling server.
+tokio.workspace = true
+axum.workspace = true

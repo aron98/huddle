@@ -3,7 +3,7 @@
 **/*.rs.bk
 
 # Build output
-/web/dist
+/crates/web/dist
 
 # Local runtime state
 /data
