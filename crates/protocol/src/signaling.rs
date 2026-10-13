@@ -89,6 +89,11 @@ pub enum ClientMessage {
     SdpOffer {
         sdp: String,
     },
+    /// SDP answer to a server-initiated offer (renegotiation when the SFU
+    /// needs to add or remove forwarded tracks).
+    SdpAnswer {
+        sdp: String,
+    },
     /// Trickled ICE candidate from the browser, candidate string form.
     IceCandidate {
         candidate: String,
@@ -130,6 +135,11 @@ pub enum ServerMessage {
         id: ParticipantId,
     },
     SdpAnswer {
+        sdp: String,
+    },
+    /// Server-initiated offer: the SFU renegotiates to add/remove forwarded
+    /// tracks. The client replies with [`ClientMessage::SdpAnswer`].
+    SdpOffer {
         sdp: String,
     },
     /// Trickled ICE candidate from the server side.
@@ -245,6 +255,28 @@ mod tests {
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["code"], "meeting_not_yet_open");
+    }
+
+    #[test]
+    fn client_sdp_answer_round_trips() {
+        let msg = ClientMessage::SdpAnswer {
+            sdp: "v=0 answer".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "sdp_answer", "sdp": "v=0 answer"}));
+        let back: ClientMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn server_sdp_offer_round_trips() {
+        let msg = ServerMessage::SdpOffer {
+            sdp: "v=0 offer".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "sdp_offer", "sdp": "v=0 offer"}));
+        let back: ServerMessage = serde_json::from_value(v).unwrap();
+        assert_eq!(back, msg);
     }
 
     #[test]
