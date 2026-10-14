@@ -125,6 +125,45 @@ Docker: `docker build -t huddle .` produces the single-binary image; and
 `docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
 credentials).
 
+## Observability
+
+`GET /metrics` exposes live server state in the [Prometheus text
+format](https://prometheus.io/docs/instrumenting/exposition_formats/) — one
+scrape pulls everything a self-hoster needs:
+
+| Family | Kind | Meaning |
+|---|---|---|
+| `huddle_rooms` | gauge | live meeting rooms |
+| `huddle_room_participants{room}` | gauge | participants per room |
+| `huddle_peer_rx_bytes_total` / `huddle_peer_tx_bytes_total{room,peer,id}` | counter | media payload bytes per peer |
+| `huddle_peer_rx_frames_total` / `huddle_peer_tx_frames_total` | counter | media frames per peer |
+| `huddle_peer_keyframes_requested_total` | counter | FIR/PLI keyframe requests per peer |
+| `huddle_peer_bitrate_in_bps` / `huddle_peer_bitrate_out_bps` | gauge | last-window bitrates |
+| `huddle_peer_rtt_ms` | gauge | round-trip time (sample appears once measured) |
+| `huddle_peer_ingress_loss_fraction` / `huddle_peer_egress_loss_fraction` | gauge | packet loss per direction |
+
+Optional gauges are omitted until they have been measured — a missing sample
+means "not known yet", not zero.
+
+**Access control.** The endpoint is unauthenticated by default, which matches
+how Prometheus scrapes (it cannot log in or carry session cookies). Expect to
+gate it at the deployment layer instead: a firewall rule, a reverse proxy in
+front of the app port, or — the typical docker/k8s setup — a
+Prometheus/Grafana sidecar that is the only thing with network access to the
+server. If your topology needs app-layer auth, set `HUDDLE_STATS_TOKEN`; every
+scrape must then send `Authorization: Bearer <token>` (constant-time
+compared). Note that the endpoint discloses live room codes and participant
+names, so treat it as semi-sensitive.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: huddle
+    # bearer_token: <HUDDLE_STATS_TOKEN>   # only if the token is set
+    static_configs:
+      - targets: ["huddle.internal:3000"]
+```
+
 ## License
 
 [MIT](LICENSE)

@@ -24,8 +24,8 @@ pub use room::{Room, SfuOutput};
 /// Alias for the participant identity used across signaling and the SFU.
 pub use huddle_protocol::ParticipantId as PeerId;
 
-/// Basic per-peer counters exposed for tests and the `/stats` endpoint.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Per-peer counters and link stats, exposed for tests and `/metrics`.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PeerStats {
     /// Media frames received from this peer.
     pub rx_frames: u64,
@@ -35,4 +35,19 @@ pub struct PeerStats {
     /// subscribers trigger one per source; the SRTCP wire form is
     /// encrypted, so tests assert on this counter instead.
     pub keyframes_requested: u64,
+    /// Media payload bytes received from this peer (RTP payload only),
+    /// from the latest str0m stats snapshot. Zero until one lands.
+    pub bytes_rx: u64,
+    /// Media payload bytes sent to this peer (RTP payload only).
+    pub bytes_tx: u64,
+    /// Ingress bitrate over the last stats window, bits per second.
+    pub bitrate_in_bps: u64,
+    /// Egress bitrate over the last stats window, bits per second.
+    pub bitrate_out_bps: u64,
+    /// Most recent round-trip time to this peer, milliseconds.
+    pub rtt_ms: Option<u64>,
+    /// Packet loss on the wire from this peer (fraction 0.0–1.0).
+    pub ingress_loss_fraction: Option<f32>,
+    /// Packet loss on the wire toward this peer (fraction 0.0–1.0).
+    pub egress_loss_fraction: Option<f32>,
 }

@@ -274,6 +274,37 @@ fn two_clients_exchange_media_both_ways() {
 }
 
 #[test]
+fn peer_stats_capture_link_snapshots() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let a_id = a.id;
+    a.join(&mut room);
+
+    drive(&mut room, &mut [&mut a], |_, clients| clients[0].connected);
+
+    // Keep media flowing across several stats windows: the first
+    // snapshot only establishes the byte baseline (no predecessor to
+    // diff against), so a bitrate only shows up from the second window
+    // on — fed here by a continuous trickle of small batches.
+    let deadline = Instant::now() + Duration::from_millis(3500);
+    while Instant::now() < deadline {
+        a.send_audio(5);
+        step(&mut room, &mut [&mut a]);
+        if room.peer_stats(a_id).is_some_and(|s| s.bitrate_in_bps > 0) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let stats = room.peer_stats(a_id).unwrap();
+    assert!(stats.bytes_rx > 0, "no media bytes recorded: {stats:?}");
+    assert!(
+        stats.bitrate_in_bps > 0,
+        "no ingress bitrate computed: {stats:?}"
+    );
+}
+
+#[test]
 fn departed_peers_tracks_are_stopped_and_dropped() {
     let mut room = Room::new(MEDIA_ADDR);
     let mut a = TestClient::new(1);

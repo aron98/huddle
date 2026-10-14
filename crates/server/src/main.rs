@@ -10,6 +10,7 @@ mod ics;
 mod identity;
 mod mailer;
 mod meetings;
+mod metrics;
 mod session;
 mod state;
 

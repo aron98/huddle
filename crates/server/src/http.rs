@@ -16,6 +16,7 @@ use huddle_protocol::{
 use crate::auth;
 use crate::ics;
 use crate::meetings::{self, MeetingError};
+use crate::metrics;
 use crate::session;
 use crate::state::AppState;
 
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/request-link", post(auth::request_link))
         .route("/api/auth/verify", get(auth::verify))
         .route("/api/auth/me", get(auth::me))
+        .route("/metrics", get(metrics_scrape))
         .route("/ws", get(session::ws))
         .fallback(fallback)
         .with_state(state)
@@ -142,6 +144,44 @@ async fn my_meetings(
         })
         .collect();
     Ok(Json(responses))
+}
+
+/// Prometheus scrape endpoint: live rooms, peers, bitrates, loss, RTT.
+///
+/// Open by default (Prometheus cannot send cookies, and deployments
+/// gate scrapes at the network layer); `stats_token` opts into a
+/// bearer-token check for setups where the endpoint is more exposed.
+async fn metrics_scrape(state: State<AppState>, headers: HeaderMap) -> Result<Response, ApiErr> {
+    if let Some(expected) = state.config().stats_token.as_deref() {
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !provided.is_some_and(|p| token_matches(p, expected)) {
+            return Err(ApiErr::unauthorized());
+        }
+    }
+    let report = state.engine().stats().await.map_err(|_| {
+        tracing::error!("engine went away while serving /metrics");
+        ApiErr(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError {
+                code: ErrorCode::Internal,
+                message: "internal error".into(),
+            },
+        )
+    })?;
+    Ok((
+        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        metrics::render(&report),
+    )
+        .into_response())
+}
+
+/// Constant-time bearer-token comparison (same discipline as cookies).
+fn token_matches(provided: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// Download one meeting as an iCalendar file.
@@ -815,5 +855,71 @@ mod tests {
             ics.contains(&format!("/m/{}", created.meeting.code)),
             "join link must be in the calendar: {ics}"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_scrape_is_prometheus_text() {
+        let response = router(test_state().await)
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "got: {content_type}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("# TYPE huddle_rooms gauge"));
+        assert!(text.contains("huddle_rooms 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_token_is_enforced_when_configured() {
+        let config = Arc::new(crate::config::Config {
+            media_port: 0,
+            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            stats_token: Some("secret-token".into()),
+            ..crate::config::Config::default()
+        });
+        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+        let state = AppState::new(config, crate::db::test_pool().await, engine);
+        let app = router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 }
