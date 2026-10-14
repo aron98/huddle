@@ -308,12 +308,13 @@ enum UiAction {
 fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> impl IntoView {
     use futures::future::FutureExt;
     use futures::stream::StreamExt;
-    use huddle_protocol::Participant;
+    use huddle_protocol::{Participant, ServerMessage};
     use uuid::Uuid;
     use web_sys::MediaStream;
 
     let remote_streams = RwSignal::<Vec<MediaStream>>::new(Vec::new());
     let roster = RwSignal::<Vec<Participant>>::new(Vec::new());
+    let speaking = RwSignal::<std::collections::HashSet<Uuid>>::new(Default::default());
     let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
@@ -394,7 +395,15 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             futures::select! {
                 message = client.next_server_message().fuse() => {
                     match message {
-                        Ok(_) => roster.set(client.roster().to_vec()),
+                        Ok(msg) => {
+                            // A departed participant's tile goes with them.
+                            if let ServerMessage::ParticipantLeft { id } = &msg {
+                                remote_streams
+                                    .update(|list| list.retain(|s| s.id() != id.to_string()));
+                            }
+                            roster.set(client.roster().to_vec());
+                            speaking.set(client.speaking().clone());
+                        }
                         Err(e) => {
                             status.set(Some(format!("Disconnected: {e}")));
                             break;
@@ -490,6 +499,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                                 label="You".to_string()
                                 muted=true
                                 testid="tile-you".to_string()
+                                speaking=false
                             />
                         }
                     })}
@@ -498,12 +508,18 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                     {move || {
                         let label = label_for(&s, &roster.get());
                         let testid = format!("tile-{label}");
+                        // The SFU labels streams with the origin
+                        // participant's id, so the speaking set — keyed
+                        // the same way — tells us whose tile to ring.
+                        let is_speaking = Uuid::parse_str(&s.id())
+                            .is_ok_and(|id| speaking.get().contains(&id));
                         view! {
                             <VideoTile
                                 stream=s.clone()
                                 label=label
                                 muted=false
                                 testid=testid
+                                speaking=is_speaking
                             />
                         }
                     }}
@@ -551,6 +567,7 @@ fn VideoTile(
     label: String,
     muted: bool,
     testid: String,
+    speaking: bool,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
     Effect::new(move |_| {
@@ -561,7 +578,7 @@ fn VideoTile(
         }
     });
     view! {
-        <figure class="tile" data-testid=testid>
+        <figure class={if speaking { "tile speaking" } else { "tile" }} data-testid=testid>
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>{label}</figcaption>
         </figure>
