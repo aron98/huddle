@@ -75,11 +75,11 @@ pub fn normalize_code(raw: &str) -> String {
     raw.trim().trim_start_matches('/').to_ascii_uppercase()
 }
 
-fn to_text(t: OffsetDateTime) -> anyhow::Result<String> {
+pub(crate) fn to_text(t: OffsetDateTime) -> anyhow::Result<String> {
     Ok(t.to_utc().format(&Rfc3339)?)
 }
 
-fn from_text(raw: &str, column: &str) -> Result<OffsetDateTime, MeetingError> {
+pub(crate) fn from_text(raw: &str, column: &str) -> Result<OffsetDateTime, MeetingError> {
     OffsetDateTime::parse(raw, &Rfc3339)
         .map_err(|e| MeetingError::Corrupt(format!("{column}: {e}")))
 }

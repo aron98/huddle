@@ -5,6 +5,7 @@ mod config;
 mod db;
 mod engine;
 mod http;
+mod identity;
 mod meetings;
 mod session;
 mod state;
