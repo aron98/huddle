@@ -176,6 +176,50 @@ scrape_configs:
       - targets: ["huddle.internal:3000"]
 ```
 
+## Encryption
+
+**Short answer: your media is always encrypted in flight — everything else is
+only as private as the transport you put in front of the server.**
+
+Media (camera, microphone, screen share) is DTLS-SRTP encrypted on every
+browser↔server hop. WebRTC mandates this: there is no plaintext-media mode to
+accidentally configure and no setting that turns it off. Everything else —
+the web UI, the REST API, and the signaling WebSocket (which also carries
+chat) — is plaintext unless terminated with TLS: the server itself speaks
+plain HTTP/WS on `HUDDLE_BIND`. In production, put a TLS-terminating reverse
+proxy in front ([HTTPS in production](#https-in-production)); a `base_url`
+starting with `https://` also flips the session cookie to `Secure`
+(`crates/server/src/auth.rs`), so organizer sessions never leave the browser
+over plain HTTP.
+
+### Threat model at a glance
+
+| What | From a network observer (ISP, coffee-shop wifi, employer) | From the server operator |
+|---|---|---|
+| Media (camera, mic, screen) | ✅ Always encrypted — DTLS-SRTP, no opt-out | ❌ Fully visible — the SFU terminates DTLS and forwards every stream |
+| Signaling (join, SDP/ICE, roster) | ⚠️ Plaintext unless TLS terminates the connection | ❌ Fully visible — the server is one endpoint of every signaling exchange |
+| Chat | ⚠️ Plaintext unless TLS (rides the signaling WebSocket) | ❌ Fully visible, and persisted per meeting in SQLite |
+| Meeting metadata (titles, times, join codes) | ⚠️ Plaintext unless TLS | ❌ Fully visible, persisted in SQLite |
+| Session cookie | ⚠️ Gains `Secure` (HTTPS-only) once `base_url` is `https://` | Signed (HMAC) — cannot be forged without the session secret |
+
+### What the server inherently sees
+
+The server is in the middle of everything. As the SFU it terminates each
+participant's DTLS connection, so it can see and record all media; as the
+signaling and chat relay it reads every message; and it owns the SQLite file
+with meeting metadata, chat history, and organizer emails. This is true of
+every SFU-based meeting system, and closing that gap is a fundamentally
+different problem from transport encryption: end-to-end encryption (E2EE)
+would have browsers encrypt frames so the server only forwards opaque data
+it cannot decrypt. That work is tracked as
+[#14](https://github.com/aron98/huddle/issues/14) and is not available today.
+
+**"Is my meeting private?"** From anyone watching the network: yes — media
+always, and everything else once HTTPS is in front of the server. From the
+person operating the server: no — the operator (or anyone who compromises
+the box) can see and record all of it. Fixing that is the E2EE story in
+[#14](https://github.com/aron98/huddle/issues/14).
+
 ## Self-hosting
 
 ### Ports and firewall
@@ -192,6 +236,64 @@ The two huddle ports must be open to every participant's browser; the coturn
 range only matters when you run the TURN companion (below). A browser that
 cannot reach the UDP media port directly will fall back to TURN — which is
 why coturn matters even for small self-hosted setups behind NAT.
+
+### HTTPS in production
+
+huddle speaks plain HTTP/WS; TLS is terminated by a reverse proxy in front
+of it (why a proxy rather than built-in TLS is recorded in
+[ADR 005](docs/adr/005-tls-via-reverse-proxy.md)). The proxy only handles
+TCP 443 — media (UDP 40000) and TURN (UDP 3478 + 49160–49200) never traverse
+it: browsers send those straight to huddle and coturn, so the proxy needs
+**no UDP configuration**. Keep the firewall holes from the table above open
+and the proxy out of the media path entirely.
+
+**Caddy** — recommended: single binary, automatic Let's Encrypt
+certificates, and WebSocket proxying needs no extra directives:
+
+```caddyfile
+meet.example.com {
+	reverse_proxy 127.0.0.1:3000
+}
+```
+
+**nginx** — the WebSocket upgrade headers are mandatory (without them the
+signaling socket hangs), and the read timeout must be raised: huddle sends
+no WebSocket keepalives, so nginx's 60s default would close an idle
+signaling connection mid-meeting:
+
+```nginx
+server {
+    listen 443 ssl;
+    http2 on;                    # nginx < 1.25: use "listen 443 ssl http2;"
+    server_name meet.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/meet.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/meet.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade    $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host       $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_read_timeout 1h;      # signaling WS idles for minutes between messages
+        proxy_send_timeout 1h;
+    }
+}
+```
+
+Then tell huddle its public URL — magic links, ICS join links, and the
+`Secure` session-cookie flag all key off it:
+
+```sh
+HUDDLE_BASE_URL=https://meet.example.com
+```
+
+One caveat: per-IP rate limiting keys on the peer socket address, so behind
+a proxy every visitor shares a single bucket (`30/min` by default) — raise
+`HUDDLE_RATE_LIMIT_PER_MIN` for busy public deployments.
 
 ### coturn (TURN relay)
 
