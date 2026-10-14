@@ -146,12 +146,17 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     you,
                     meeting,
                     roster,
-                    ..
+                    ice_servers,
                 } => {
                     if protocol_version != PROTOCOL_VERSION {
                         self.state = SessionState::Closed;
                         return Err(RtcError::ProtocolVersion(protocol_version));
                     }
+                    // The peer connection exists before the join, so the
+                    // TURN/STUN servers the server advertises arrive only
+                    // now — apply them before any offer is created
+                    // (`publish` runs after this returns).
+                    self.peer.update_ice_servers(&ice_servers)?;
                     self.you = Some(you);
                     self.meeting = Some(meeting);
                     self.roster = roster;
