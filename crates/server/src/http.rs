@@ -336,24 +336,51 @@ async fn asset_response(state: &AppState, path: &str) -> Response {
     if let Some(dir) = &state.config().web_dir {
         let full = dir.join(path);
         if let Ok(bytes) = tokio::fs::read(&full).await {
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type(path))],
-                bytes,
-            )
-                .into_response();
+            return with_security_headers(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, content_type(path))],
+                    bytes,
+                )
+                    .into_response(),
+            );
         }
     }
 
     match Ui::get(path) {
-        Some(file) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type(path))],
-            file.data.into_owned(),
-        )
-            .into_response(),
+        Some(file) => with_security_headers(
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type(path))],
+                file.data.into_owned(),
+            )
+                .into_response(),
+        ),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+/// Content-Security-Policy for the shipped UI. Leptos CSR needs
+/// `wasm-unsafe-eval` for the WebAssembly module and inline styles come
+/// from the framework; media elements play `blob:` URLs created by
+/// `URL.createObjectURL` for remote streams, and signaling connects to
+/// the same origin over `ws(s):`. Everything else is locked to `self`.
+const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+                   style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; \
+                   media-src 'self' blob:; img-src 'self' data:; font-src 'self'; \
+                   object-src 'none'; base-uri 'self'; form-action 'self'";
+
+/// Apply the security headers shared by all served UI assets.
+fn with_security_headers(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static(CSP),
+    );
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -377,8 +404,10 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -628,12 +657,16 @@ mod tests {
     #[tokio::test]
     async fn request_link_succeeds_for_any_email_shape() {
         let app = router(test_state().await);
-        for email in ["someone@example.com", "not-an-email"] {
+        for (i, email) in ["someone@example.com", "not-an-email"].iter().enumerate() {
             let response = app
                 .clone()
                 .oneshot(
                     Request::post("/api/auth/request-link")
                         .header("content-type", "application/json")
+                        .extension(ConnectInfo(SocketAddr::from((
+                            [127, 0, 0, 1],
+                            4444 + i as u16,
+                        ))))
                         .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
                         .unwrap(),
                 )
@@ -642,6 +675,64 @@ mod tests {
             // Always 200: responses must not reveal which addresses are valid.
             assert_eq!(response.status(), StatusCode::OK, "email: {email}");
         }
+    }
+
+    #[tokio::test]
+    async fn magic_link_requests_are_rate_limited() {
+        // Default limiter: 30 events/min per IP. The 31st is refused.
+        let app = router(test_state().await);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 4711));
+        for i in 0..30 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/request-link")
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(addr))
+                        .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "request {i}");
+        }
+        let response = app
+            .oneshot(
+                Request::post("/api/auth/request-link")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(addr))
+                    .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_ui_assets() {
+        let app = router(test_state().await);
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            csp.contains("default-src 'self'") && csp.contains("wasm-unsafe-eval"),
+            "csp: {csp}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
     }
 
     #[tokio::test]

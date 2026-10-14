@@ -6,13 +6,14 @@
 //! there.
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Sha256;
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -106,12 +107,21 @@ pub struct RequestLinkBody {
 
 /// POST /api/auth/request-link — issue a magic link for the email.
 ///
-/// Always `200`: the response must not reveal whether an address is
-/// valid or known. Delivery failures are logged server-side.
+/// Always `200` on the happy path: the response must not reveal whether
+/// an address is valid or known. Delivery failures are logged
+/// server-side. One exception: per-IP rate limiting answers `429` so
+/// the endpoint cannot be used to flood mailboxes (or mine the log).
 pub async fn request_link(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<RequestLinkBody>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !state.rate_limiter().allow(addr.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "status": "rate_limited" })),
+        );
+    }
     match state
         .identity()
         .start_login(&body.email, OffsetDateTime::now_utc())

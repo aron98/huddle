@@ -70,6 +70,11 @@ pub struct Config {
     /// that is the only thing with network access). Set it to require
     /// `Authorization: Bearer <token>` on every scrape.
     pub stats_token: Option<String>,
+    /// Per-IP rate limit (events per minute) on magic-link requests and
+    /// new websocket connections. `30` (the default) is generous for
+    /// humans and throttles credential-stuffing and connection floods;
+    /// `0` disables the limiter entirely.
+    pub rate_limit_per_min: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -121,6 +126,7 @@ impl Default for Config {
             session_ttl_min: 120,
             smtp: None,
             stats_token: None,
+            rate_limit_per_min: 30,
         }
     }
 }
@@ -236,6 +242,7 @@ mod tests {
         assert_eq!(config.session_ttl_min, 120);
         assert_eq!(config.smtp, None);
         assert_eq!(config.stats_token, None);
+        assert_eq!(config.rate_limit_per_min, 30);
     }
 
     #[test]

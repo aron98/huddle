@@ -11,6 +11,7 @@ mod identity;
 mod mailer;
 mod meetings;
 mod metrics;
+mod ratelimit;
 mod session;
 mod state;
 
@@ -53,10 +54,13 @@ async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind))?;
 
     info!(url = %config.base_url, "listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .context("server error")?;
     engine.shutdown();
     Ok(())
 }
