@@ -6,6 +6,7 @@ mod db;
 mod engine;
 mod http;
 mod identity;
+mod mailer;
 mod meetings;
 mod session;
 mod state;

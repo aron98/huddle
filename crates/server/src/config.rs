@@ -50,6 +50,12 @@ pub struct Config {
     pub ice_servers: Vec<IceServerConfig>,
     /// How many participants may be in one meeting at once.
     pub max_participants: usize,
+    /// Minutes a magic sign-in link stays valid.
+    pub login_token_ttl_min: u32,
+    /// SMTP relay for magic-link emails. `None` (the default) logs the
+    /// link instead of sending it — fine for development and small
+    /// self-hosted setups, and it keeps the single binary dependency-free.
+    pub smtp: Option<SmtpConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -59,6 +65,28 @@ pub struct IceServerConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub credential: Option<String>,
+}
+
+/// One SMTP relay, as configured in `huddle.toml`:
+///
+/// ```toml
+/// [smtp]
+/// host = "smtp.example.com"
+/// port = 587
+/// username = "huddle@example.com"
+/// password = "…"
+/// from = "huddle@example.com"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
 }
 
 impl Default for Config {
@@ -74,6 +102,8 @@ impl Default for Config {
             join_window_grace_min: 15,
             ice_servers: Vec::new(),
             max_participants: 8,
+            login_token_ttl_min: 15,
+            smtp: None,
         }
     }
 }
@@ -184,6 +214,8 @@ mod tests {
         assert_eq!(config.join_window_grace_min, 15);
         assert_eq!(config.max_participants, 8);
         assert_eq!(config.web_dir, None);
+        assert_eq!(config.login_token_ttl_min, 15);
+        assert_eq!(config.smtp, None);
     }
 
     #[test]
@@ -232,5 +264,28 @@ mod tests {
             config.effective_public_ip_with(None),
             IpAddr::from([127, 0, 0, 1])
         );
+    }
+
+    #[test]
+    fn smtp_section_parses() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [smtp]
+                host = "smtp.example.com"
+                port = 587
+                username = "huddle@example.com"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        let smtp = config.smtp.expect("smtp section");
+        assert_eq!(smtp.host, "smtp.example.com");
+        assert_eq!(smtp.port, 587);
+        assert_eq!(smtp.username.as_deref(), Some("huddle@example.com"));
+        assert_eq!(smtp.password, None);
+        assert_eq!(smtp.from, None);
+        // Untouched defaults survive alongside the section.
+        assert_eq!(config.login_token_ttl_min, 15);
     }
 }
