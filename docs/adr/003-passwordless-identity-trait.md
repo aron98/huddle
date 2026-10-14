@@ -35,3 +35,10 @@ company SSO. Whatever we choose must make that a new implementation, not a rewri
 - Magic links are phishing-prone like all passwordless flows; mitigate with short
   TTLs and single-use hashes.
 - Per-meeting passcodes (defense for leaked links) deferred to post-MVP.
+
+## Amendment (2026-10-14)
+
+- Both post-MVP follow-ups now have issues in the
+  [post-MVP milestone](https://github.com/aron98/huddle/milestone/1):
+  OIDC/SAML in [#11](https://github.com/aron98/huddle/issues/11), per-meeting
+  passcodes in [#13](https://github.com/aron98/huddle/issues/13).
