@@ -358,6 +358,47 @@ fn departure_during_negotiation_is_swept_after_the_answer_lands() {
 }
 
 #[test]
+fn new_subscribers_get_a_keyframe_from_the_sources() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let mut c = TestClient::new(3);
+    a.join(&mut room);
+    b.join(&mut room);
+    c.join(&mut room);
+
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, clients| {
+        clients.iter().all(|x| x.connected)
+    });
+
+    a.send_audio(10);
+    b.send_audio(10);
+    c.send_audio(10);
+
+    // Drive until everyone is receiving AND every origin has been asked for
+    // a keyframe: each client subscribes to two tracks, and each
+    // subscription settles with a FIR to the track's origin.
+    let ids = [a.id, b.id, c.id];
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |room, clients| {
+        let all_have_media = clients.iter().all(|x| x.media_rx > 0);
+        let all_were_asked = ids
+            .iter()
+            .all(|id| room.peer_stats(*id).unwrap().keyframes_requested >= 1);
+        all_have_media && all_were_asked
+    });
+
+    // Every source the mesh pulled in got a keyframe request over RTCP.
+    // (Asserted SFU-side: the wire form is SRTCP, so it is not visible to
+    // a sniffer on the receive path.)
+    for id in ids {
+        assert!(
+            room.peer_stats(id).unwrap().keyframes_requested >= 1,
+            "{id} was never asked for a keyframe"
+        );
+    }
+}
+
+#[test]
 fn room_api_errors() {
     let mut room = Room::new(MEDIA_ADDR);
     let id = PeerId::new_v4();

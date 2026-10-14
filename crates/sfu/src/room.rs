@@ -101,6 +101,7 @@ impl Room {
         self.peers.get(&id).map(|p| PeerStats {
             rx_frames: p.rx_frames,
             tx_frames: p.tx_frames,
+            keyframes_requested: p.keyframes_requested,
         })
     }
 
@@ -119,8 +120,20 @@ impl Room {
     }
 
     /// Deliver a peer's answer to a renegotiation offer we sent.
+    ///
+    /// Every track that just went live gets a keyframe request fan-out to
+    /// its source: a fresh subscriber joins mid-GOP, and without this its
+    /// first tiles would stay black until the next PLI.
     pub fn accept_sdp_answer(&mut self, id: PeerId, sdp: &str) -> Result<(), SfuError> {
-        self.peer_mut(id)?.accept_sdp_answer(sdp)
+        let opened = self.peer_mut(id)?.accept_sdp_answer(sdp)?;
+        for (origin, mid_in) in opened {
+            if let Some(origin_peer) = self.peers.get_mut(&origin)
+                && let Err(e) = origin_peer.request_keyframe(mid_in, None, KeyframeRequestKind::Fir)
+            {
+                tracing::debug!("subscription keyframe request to {origin} failed: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Deliver a trickled ICE candidate from a peer.

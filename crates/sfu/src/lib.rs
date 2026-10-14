@@ -31,4 +31,8 @@ pub struct PeerStats {
     pub rx_frames: u64,
     /// Media frames sent to this peer.
     pub tx_frames: u64,
+    /// Keyframe (FIR/PLI) requests enqueued toward this peer. New
+    /// subscribers trigger one per source; the SRTCP wire form is
+    /// encrypted, so tests assert on this counter instead.
+    pub keyframes_requested: u64,
 }

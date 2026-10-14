@@ -102,6 +102,10 @@ pub(crate) struct Peer {
     has_session: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
+    /// Keyframe (FIR/PLI) requests successfully enqueued toward this
+    /// peer. The wire form is SRTCP, invisible to outside observers, so
+    /// tests assert on this counter instead of sniffing datagrams.
+    pub keyframes_requested: u64,
 }
 
 impl Peer {
@@ -124,6 +128,7 @@ impl Peer {
             has_session: false,
             rx_frames: 0,
             tx_frames: 0,
+            keyframes_requested: 0,
         };
 
         let candidate = Candidate::host(media_addr, "udp")
@@ -161,7 +166,10 @@ impl Peer {
     }
 
     /// Accept the client's answer to a renegotiation offer we sent.
-    pub(crate) fn accept_sdp_answer(&mut self, sdp: &str) -> Result<(), SfuError> {
+    ///
+    /// Returns `(origin, incoming mid)` of every track that just went
+    /// live, so the room can fan keyframe requests out to the sources.
+    pub(crate) fn accept_sdp_answer(&mut self, sdp: &str) -> Result<Vec<(PeerId, Mid)>, SfuError> {
         let Some(pending) = self.pending.take() else {
             return Err(SfuError::NoPendingOffer);
         };
@@ -172,16 +180,18 @@ impl Peer {
         // the offer was in flight, wind them straight back down.
         self.tracks_out
             .retain(|out| !matches!(out.state, TrackOutState::NegotiatingStop(_)));
+        let mut opened = Vec::new();
         for out in &mut self.tracks_out {
-            if let TrackOutState::Negotiating(mid) = out.state {
-                out.state = if out.track_in.upgrade().is_some() {
-                    TrackOutState::Open(mid)
-                } else {
-                    TrackOutState::ToStop(mid)
-                };
+            if let TrackOutState::Negotiating(mid) = out.state
+                && let Some(track) = out.track_in.upgrade()
+            {
+                out.state = TrackOutState::Open(mid);
+                opened.push((track.origin, track.mid));
+            } else if let TrackOutState::Negotiating(mid) = out.state {
+                out.state = TrackOutState::ToStop(mid);
             }
         }
-        Ok(())
+        Ok(opened)
     }
 
     /// Add a trickled ICE candidate from the client.
@@ -398,10 +408,11 @@ impl Peer {
             return;
         }
         entry.last_keyframe_request = Some(now);
-        if let Some(mut writer) = self.rtc.writer(mid)
-            && let Err(e) = writer.request_keyframe(rid, kind)
-        {
-            tracing::warn!("keyframe request on {mid:?} failed: {e}");
+        if let Some(mut writer) = self.rtc.writer(mid) {
+            match writer.request_keyframe(rid, kind) {
+                Ok(()) => self.keyframes_requested += 1,
+                Err(e) => tracing::warn!("keyframe request on {mid:?} failed: {e}"),
+            }
         }
     }
 
@@ -418,6 +429,7 @@ impl Peer {
             .writer(mid_in)
             .ok_or_else(|| SfuError::Internal(format!("no writer for incoming mid {mid_in:?}")))?;
         writer.request_keyframe(rid, kind)?;
+        self.keyframes_requested += 1;
         Ok(())
     }
 }
