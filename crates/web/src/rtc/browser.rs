@@ -14,8 +14,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcIceCandidate, RtcIceCandidateInit,
-    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender, RtcSdpType, RtcSessionDescription,
-    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender, RtcRtpTransceiverDirection,
+    RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescription, RtcSessionDescriptionInit,
+    RtcTrackEvent, WebSocket,
 };
 
 use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
@@ -411,8 +412,20 @@ impl PeerConnection for BrowserPeerConnection {
             .staged
             .take()
             .ok_or_else(|| PeerError::Failed("no screen track staged".to_owned()))?;
-        let sender = self.pc.add_track_0(&track, &stream);
-        self.screen.borrow_mut().sender = Some(sender);
+        // `addTrack` would not create a fresh m-line here: it happily
+        // reuses one of the many recvonly transceivers the server's
+        // forwarded tracks created (flipping it to sendrecv and silently
+        // hijacking that tile's m-line). `addTransceiver` always creates
+        // a new m-line, which the SFU sees as a new (screen) track.
+        let init = RtcRtpTransceiverInit::new();
+        init.set_direction(RtcRtpTransceiverDirection::Sendonly);
+        let streams = js_sys::Array::new();
+        streams.push(&stream);
+        init.set_streams(&streams);
+        let transceiver = self
+            .pc
+            .add_transceiver_with_media_stream_track_and_init(&track, &init);
+        self.screen.borrow_mut().sender = Some(transceiver.sender());
         Ok(())
     }
 
