@@ -114,11 +114,27 @@ async function joinAs(page, code, name) {
   // for the button to exist.
   await page.waitForSelector('[data-testid="join-btn"]:not([disabled])', { timeout: 30_000 })
     .catch(async () => fail(`join as ${name}: media never became ready (status: ${await statusText(page)})`));
-  await page.click('[data-testid="join-btn"]');
+  // Click the button itself rather than screen coordinates: the join
+  // click races the preview's first video frame, and a coordinate click
+  // dispatched while that frame reflows the page can miss the button.
+  // el.click() delivers a real (bubbling) click event to the element,
+  // so handler regressions are still caught.
+  await page.evaluate(() => document.querySelector('[data-testid="join-btn"]')?.click());
   // The prejoin form goes away once the call view mounts.
   await page
     .waitForSelector('[data-testid="name-input"]', { hidden: true, timeout: 30_000 })
-    .catch(async () => fail(`join as ${name} never left the prejoin page (status: ${await statusText(page)})`));
+    .catch(async () => {
+      const stuck = await page
+        .evaluate(() => ({
+          joinDisabled: document.querySelector('[data-testid="join-btn"]')?.disabled ?? null,
+          name: document.querySelector('[data-testid="name-input"]')?.value ?? null,
+        }))
+        .catch(() => null);
+      fail(
+        `join as ${name} never left the prejoin page ` +
+          `(status: ${await statusText(page)}, prejoin: ${JSON.stringify(stuck)})`,
+      );
+    });
 }
 
 // Remote media snapshot: does the tile exist, is a stream attached, and
