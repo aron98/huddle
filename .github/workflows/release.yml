@@ -27,8 +27,10 @@ jobs:
       image: rust:1.96.0-alpine
     steps:
       # aws-lc-sys needs cmake + perl; build-base is gcc/musl-dev/make.
+      # curl + ca-certificates are missing from the alpine rust image but
+      # needed to fetch the trunk binary over HTTPS.
       - name: install build deps
-        run: apk add --no-cache build-base cmake perl
+        run: apk add --no-cache build-base cmake perl curl ca-certificates
 
       - uses: actions/checkout@v5
 
