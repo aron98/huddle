@@ -96,10 +96,23 @@ curl -s localhost:3000/api/meetings \
 # → open http://localhost:3000/m/<code from the response>
 ```
 
+(On macOS, replace the `-d '+1 hour'` date invocation with
+`date -u -v+60M +%Y-%m-%dT%H:%M:%SZ` — BSD date has different flags.)
+
 Configuration is `HUDDLE_*` environment variables (optionally a `huddle.toml`):
 `HUDDLE_BIND` (default `0.0.0.0:3000`), `HUDDLE_DATA_DIR` (default `./data`),
-`HUDDLE_PUBLIC_IP`, `HUDDLE_MEDIA_PORT` (default `40000`), `HUDDLE_WEB_DIR`
-(serve a web bundle from disk instead of the embedded one).
+`HUDDLE_MEDIA_PORT` (default `40000`), `HUDDLE_WEB_DIR` (serve a web bundle
+from disk instead of the embedded one), and `HUDDLE_PUBLIC_IP` — the address
+browsers send media to. Leave `HUDDLE_PUBLIC_IP` unset and the server
+auto-detects its LAN address at startup, which is what local development
+wants; production deployments should set it explicitly (e.g. the VPS's
+public address).
+
+One caveat the auto-detection exists to solve: advertising loopback only
+works when the client's browser sources loopback traffic from loopback —
+Linux Chrome does, macOS Chrome does not (it sends from the default
+interface, and the mismatched reply source fails ICE validation). With
+auto-detection you do not need to care about this on any platform.
 
 Docker: `docker build -t huddle .` produces the single-binary image; and
 `docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
