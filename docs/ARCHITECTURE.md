@@ -1,6 +1,7 @@
 # huddle — Architecture
 
-Design date: 2026-10-13 · Status: agreed blueprint, pre-implementation.
+Design date: 2026-10-13 · Status: implemented — the MVP is complete; post-MVP
+work is tracked in the [post-MVP milestone](https://github.com/aron98/huddle/milestone/1).
 
 ## Goals & non-goals
 
@@ -181,7 +182,8 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 - Rate-limit join attempts + WS message size caps.
 - E2EE (insertable streams, à la Jitsi) is *architecturally possible* only in the
   self-hosted SFU path — a managed-media port (e.g. Cloudflare Calls) would
-  preclude it. Decide before ever promising it. Post-MVP.
+  preclude it. Decide before ever promising it — tracked by
+  [issue #14](https://github.com/aron98/huddle/issues/14).
 
 ## Risks
 
@@ -190,4 +192,4 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 | SFU correctness (PLI storms, NACK buffers, BWE padding) is the schedule risk | Milestone 2 isolates it; sans-io unit tests; synthetic-client soak tests |
 | str0m is pre-1.0 — API churn | Pin a known-good version; batch upgrades; upstream is responsive |
 | Leptos ↔ async/WS boundary ergonomics | Thin `RtcClient` wrapper; budgeted exploration time in milestone 2 |
-| Scope creep (recording, captions, …) | MVP definition of done in the implementation plan is the contract |
+| Scope creep (recording, captions, …) | The MVP shipped against a fixed definition of done; new scope enters through the post-MVP milestone, not in-flight PRs |
