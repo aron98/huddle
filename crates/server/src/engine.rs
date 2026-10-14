@@ -63,8 +63,7 @@ pub enum EngineCommand {
     /// Relay a chat message to everyone in the meeting.
     Chat {
         code: String,
-        id: Uuid,
-        body: String,
+        message: huddle_protocol::ChatMessage,
     },
     /// Update a participant's mute state and broadcast it.
     Mute {
@@ -134,8 +133,8 @@ impl EngineHandle {
         });
     }
 
-    pub fn chat(&self, code: String, id: Uuid, body: String) {
-        let _ = self.tx.send(EngineCommand::Chat { code, id, body });
+    pub fn chat(&self, code: String, message: huddle_protocol::ChatMessage) {
+        let _ = self.tx.send(EngineCommand::Chat { code, message });
     }
 
     pub fn mute(
@@ -388,7 +387,7 @@ impl Engine {
                     tracing::debug!(peer = %id, "bad ice candidate: {e}");
                 }
             }
-            EngineCommand::Chat { code, id, body } => self.relay_chat(&code, id, body),
+            EngineCommand::Chat { code, message } => self.relay_chat(&code, message),
             EngineCommand::Mute {
                 code,
                 id,
@@ -498,20 +497,17 @@ impl Engine {
         }
     }
 
-    fn relay_chat(&mut self, code: &str, id: Uuid, body: String) {
+    /// Relay a chat message verbatim. The session built it (and persisted
+    /// it); the engine only needs to confirm the sender is still here.
+    fn relay_chat(&mut self, code: &str, message: huddle_protocol::ChatMessage) {
         let Some(inst) = self.meetings.get_mut(code) else {
             return;
         };
-        let Some(sender) = inst.participants.get(&id) else {
+        if let Some(sender) = message.sender_id
+            && !inst.participants.contains_key(&sender)
+        {
             return;
-        };
-        let message = huddle_protocol::ChatMessage {
-            id: Uuid::new_v4(),
-            sender_id: Some(id),
-            sender_name: sender.name.clone(),
-            body,
-            sent_at: time::OffsetDateTime::now_utc(),
-        };
+        }
         let msg = ServerMessage::Chat { message };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
@@ -738,9 +734,22 @@ mod tests {
         engine.ice("ABCD-EFGH-JKLM".into(), alice, "junk".into());
 
         // The engine still works for the same session.
-        engine.chat("ABCD-EFGH-JKLM".into(), alice, "still here".into());
+        engine.chat(
+            "ABCD-EFGH-JKLM".into(),
+            chat_message(alice, "alice", "still here"),
+        );
         let msg = next(&mut alice_rx).await;
         assert!(matches!(msg, ServerMessage::Chat { .. }), "got {msg:?}");
+    }
+
+    fn chat_message(sender: Uuid, name: &str, body: &str) -> huddle_protocol::ChatMessage {
+        huddle_protocol::ChatMessage {
+            id: Uuid::new_v4(),
+            sender_id: Some(sender),
+            sender_name: name.into(),
+            body: body.into(),
+            sent_at: time::OffsetDateTime::now_utc(),
+        }
     }
 
     #[tokio::test]
@@ -786,7 +795,10 @@ mod tests {
         next(&mut alice_rx).await; // alice's welcome
         next(&mut alice_rx).await; // ParticipantJoined(bob) on alice's side
 
-        engine.chat("ABCD-EFGH-JKLM".into(), alice, "hello world".into());
+        engine.chat(
+            "ABCD-EFGH-JKLM".into(),
+            chat_message(alice, "alice", "hello world"),
+        );
 
         for rx in [&mut alice_rx, &mut bob_rx] {
             let msg = next(rx).await;
