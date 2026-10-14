@@ -21,3 +21,67 @@ video {
   background: #000;
   border-radius: 8px;
 }
+
+/* Adaptive tile grid: fits 1-on-1 side by side, reflows for N parties. */
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+  align-items: stretch;
+}
+
+.tile {
+  margin: 0;
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #1a1e26;
+}
+
+.tile video {
+  border-radius: 0;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+/* Speaking indicator: green ring while the participant is talking. */
+.tile.speaking {
+  outline: 3px solid #4ade80;
+  outline-offset: -3px;
+}
+
+.tile figcaption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 0.35rem 0.6rem;
+  background: rgba(0, 0, 0, 0.55);
+  font-size: 0.9rem;
+}
+
+.controls {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+}
+
+.controls button {
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: 1px solid #333a46;
+  background: #1a1e26;
+  color: #e6e8ec;
+  cursor: pointer;
+}
+
+.controls button:hover {
+  background: #242a35;
+}
+
+ul[data-testid="roster"] {
+  margin-top: 1.25rem;
+  padding-left: 1.25rem;
+  line-height: 1.6;
+}
