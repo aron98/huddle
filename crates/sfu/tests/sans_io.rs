@@ -31,6 +31,8 @@ struct TestClient {
     mid: str0m::media::Mid,
     connected: bool,
     media_rx: usize,
+    /// Every renegotiation offer the room sent us (for msid assertions).
+    server_offers: Vec<String>,
 }
 
 impl TestClient {
@@ -56,6 +58,7 @@ impl TestClient {
             mid,
             connected: false,
             media_rx: 0,
+            server_offers: Vec::new(),
         }
     }
 
@@ -70,10 +73,58 @@ impl TestClient {
 
     /// Answer a renegotiation offer the room sent us.
     fn handle_server_offer(&mut self, room: &mut Room, sdp: &str) {
+        self.server_offers.push(sdp.to_owned());
         let offer = SdpOffer::from_sdp_string(sdp).unwrap();
         let answer = self.rtc.sdp_api().accept_offer(offer).unwrap();
         room.accept_sdp_answer(self.id, &answer.to_sdp_string())
             .unwrap();
+    }
+
+    /// Add a second (video) m-line — the screen track — and offer it to
+    /// the room, as a browser does after getDisplayMedia + addTrack.
+    fn share_screen(&mut self, room: &mut Room) -> str0m::media::Mid {
+        let mut changes = self.rtc.sdp_api();
+        let mid = changes.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
+        let (offer, pending) = changes.apply().unwrap();
+        let answer = room
+            .answer_sdp_offer(self.id, &offer.to_sdp_string())
+            .unwrap();
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        mid
+    }
+
+    /// Flip the screen m-line's direction, as removeTrack (stop) and a
+    /// re-share (resume) do in a browser.
+    fn set_screen_direction(&mut self, room: &mut Room, mid: str0m::media::Mid, dir: Direction) {
+        let mut changes = self.rtc.sdp_api();
+        changes.set_direction(mid, dir);
+        let (offer, pending) = changes.apply().unwrap();
+        let answer = room
+            .answer_sdp_offer(self.id, &offer.to_sdp_string())
+            .unwrap();
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
+    }
+
+    /// Send `n` vp8 frames on the screen m-line.
+    fn send_screen_frames(&mut self, mid: str0m::media::Mid, n: usize) {
+        let pt = self
+            .rtc
+            .codec_config()
+            .iter()
+            .find(|p| p.spec().codec == Codec::Vp8)
+            .unwrap()
+            .pt();
+        for i in 0..n {
+            let time = MediaTime::from_millis(20 * i as u64);
+            let data = vec![0x22_u8; 120];
+            self.rtc
+                .writer(mid)
+                .unwrap()
+                .write(pt, Instant::now(), time, data)
+                .unwrap();
+        }
     }
 
     /// Send `n` opus frames on the client's own m-line.
@@ -479,4 +530,109 @@ fn room_api_errors() {
         room.answer_sdp_offer(id, "not an sdp"),
         Err(SfuError::InvalidSdp(_))
     ));
+
+    // Share announcement for a stranger.
+    assert!(matches!(
+        room.set_sharing(PeerId::new_v4(), true),
+        Err(SfuError::UnknownPeer)
+    ));
+}
+
+#[test]
+fn screen_shares_flow_to_subscribers_and_survive_camera_mute() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+    a.send_audio(5);
+    b.send_audio(5);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs.iter().all(|c| c.connected) && cs.iter().all(|c| c.media_rx > 0)
+    });
+
+    // a shares: announce first, then add the screen m-line.
+    room.set_sharing(a.id, true).unwrap();
+    let screen_mid = a.share_screen(&mut room);
+    let a_id = a.id;
+    let b_id = b.id;
+    let screen_msid = format!("{a_id}-screen");
+
+    // The fan-out offer labels the screen with its own stream so
+    // viewers can tell it apart from the camera tile. Wait until the
+    // offer has actually been generated — the track entry alone is not
+    // enough to guarantee negotiation has run.
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        r.peer_tracks(b_id).unwrap().1 == 2
+            && cs[1].server_offers.iter().any(|o| o.contains(&screen_msid))
+    });
+
+    // The camera mute must not gate the screen track.
+    room.set_mute(a.id, None, Some(true)).unwrap();
+    let before = b.media_rx;
+    a.send_screen_frames(screen_mid, 10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs[1].media_rx > before
+    });
+
+    // Unmuting the camera changes nothing for the screen either.
+    room.set_mute(a.id, None, Some(false)).unwrap();
+    let before = b.media_rx;
+    a.send_screen_frames(screen_mid, 10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs[1].media_rx > before
+    });
+}
+
+#[test]
+fn stopping_a_share_winds_down_subscribers_and_reshare_reopens() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs.iter().all(|c| c.connected)
+    });
+
+    room.set_sharing(a.id, true).unwrap();
+    let screen_mid = a.share_screen(&mut room);
+    let a_id = a.id;
+    let b_id = b.id;
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 2
+    });
+    // room sweeps b's entry (stop offered, answered, dropped).
+    a.set_screen_direction(&mut room, screen_mid, Direction::RecvOnly);
+    let b_id = b.id;
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 1
+    });
+
+    // A late joiner must not receive the dead share: the replay hands
+    // over a's and b's audio but skips the stopped screen track.
+    let mut c = TestClient::new(3);
+    c.join(&mut room);
+    let c_id = c.id;
+    let screen_msid = format!("{a_id}-screen");
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, cs| {
+        r.peer_tracks(c_id).unwrap().1 == 2 && cs[2].connected
+    });
+    assert!(
+        !c.server_offers.iter().any(|o| o.contains(&screen_msid)),
+        "the stopped share was replayed to the newcomer"
+    );
+
+    // a re-shares on the same transceiver: b is re-subscribed (now
+    // three outgoing entries: a's audio, c's audio, a's screen) and
+    // the screen frames flow again.
+    a.set_screen_direction(&mut room, screen_mid, Direction::SendRecv);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 3
+    });
+    let before = b.media_rx;
+    a.send_screen_frames(screen_mid, 10);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, cs| {
+        cs[1].media_rx > before
+    });
 }

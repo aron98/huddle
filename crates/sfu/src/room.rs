@@ -115,8 +115,39 @@ impl Room {
     }
 
     /// Answer a peer's SDP offer.
+    ///
+    /// If the offer flipped a screen share's state (stop or resume on a
+    /// reused transceiver), resumes are fanned back out immediately;
+    /// stops converge through each subscriber's negotiation sweep.
     pub fn answer_sdp_offer(&mut self, id: PeerId, sdp: &str) -> Result<String, SfuError> {
-        self.peer_mut(id)?.answer_sdp_offer(sdp)
+        let (answer, screens) = self.peer_mut(id)?.answer_sdp_offer(sdp)?;
+        for flip in screens {
+            if flip.active {
+                self.fan_out_track(&flip.track);
+            }
+        }
+        Ok(answer)
+    }
+
+    /// Record a participant's screen-share announcement.
+    ///
+    /// `true` arms the peer so its next remote video m-line is treated
+    /// as the screen track; `false` stands down any live share — the
+    /// sharer may stop without touching the SDP (e.g. the browser UI
+    /// stop button races the removeTrack offer), so the SFU deactivates
+    /// the track here too, idempotently with the direction-change path.
+    pub fn set_sharing(&mut self, id: PeerId, sharing: bool) -> Result<(), SfuError> {
+        let origin = self.peer_mut(id)?;
+        origin.set_sharing(sharing);
+        if sharing {
+            return Ok(());
+        }
+        // Wake every subscriber's negotiation so the stops are offered
+        // promptly rather than on their next unrelated renegotiation.
+        for peer in self.peers.values_mut() {
+            peer.sweep_screens();
+        }
+        Ok(())
     }
 
     /// Deliver a peer's answer to a renegotiation offer we sent.
@@ -229,7 +260,7 @@ impl Room {
                 Ok(PollOutcome::Timeout(t)) => return Some(SfuOutput::Timeout(t)),
                 Ok(PollOutcome::Connected) => return Some(SfuOutput::PeerConnected(id)),
                 Ok(PollOutcome::TrackOpened(track)) => {
-                    self.fan_out_track(id, &track);
+                    self.fan_out_track(&track);
                     continue;
                 }
                 Ok(PollOutcome::Media(data)) => {
@@ -257,11 +288,15 @@ impl Room {
         self.peers.get_mut(&id).ok_or(SfuError::UnknownPeer)
     }
 
-    /// Give every *other* peer an outgoing handle to `origin`'s new track.
-    fn fan_out_track(&mut self, origin: PeerId, track: &Arc<TrackIn>) {
+    /// Give every *other* peer an outgoing handle to `origin`'s track.
+    ///
+    /// Idempotent: existing entries for the same source track are
+    /// resumed (a screen share that stopped and came back) rather than
+    /// duplicated.
+    fn fan_out_track(&mut self, track: &Arc<TrackIn>) {
         for (pid, peer) in self.peers.iter_mut() {
-            if *pid != origin {
-                peer.open_track(track);
+            if *pid != track.origin {
+                peer.open_or_resume_track(track);
             }
         }
     }
