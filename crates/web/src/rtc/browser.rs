@@ -182,6 +182,10 @@ impl SignalingStream for BrowserSignalingStream {
 /// A [`PeerConnection`] over the browser's `RTCPeerConnection`.
 pub struct BrowserPeerConnection {
     pc: RtcPeerConnection,
+    /// Whether this connection was built with the `?turn=relay` knob;
+    /// `setConfiguration` re-asserts it (a fresh RTCConfiguration would
+    /// otherwise reset the policy to "all").
+    relay: bool,
     local_candidates: Rc<RefCell<Vec<LocalCandidate>>>,
     on_remote_stream: RemoteStreamCallback,
     /// Screen-share state shared with the [`ScreenShareHandle`] the UI
@@ -310,6 +314,7 @@ impl BrowserPeerConnection {
 
         Ok(Self {
             pc,
+            relay,
             local_candidates,
             on_remote_stream,
             screen: Rc::new(RefCell::new(ScreenState::default())),
@@ -433,9 +438,13 @@ impl PeerConnection for BrowserPeerConnection {
             servers.push(&ice_server_to_js(server)?);
         }
         configuration.set_ice_servers(&servers);
-        // `setConfiguration` is legal before the first offer — exactly
-        // when this runs: the driver applies the Welcome's servers
-        // between `join` and `publish`.
+        // A freshly-built RTCConfiguration carries the default
+        // `iceTransportPolicy: "all"`, and Chrome's setConfiguration
+        // treats every present field as authoritative — so it would
+        // silently reset the relay knob. Re-assert our own policy.
+        if self.relay {
+            configuration.set_ice_transport_policy(RtcIceTransportPolicy::Relay);
+        }
         self.pc
             .set_configuration_with_configuration(&configuration)
             .map_err(js_error)
