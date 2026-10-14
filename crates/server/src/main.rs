@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod engine;
 mod http;
+mod ics;
 mod identity;
 mod mailer;
 mod meetings;

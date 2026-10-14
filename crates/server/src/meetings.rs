@@ -19,6 +19,9 @@ pub struct Meeting {
     pub title: String,
     pub starts_at: OffsetDateTime,
     pub ends_at: OffsetDateTime,
+    /// The organizer who created the meeting, if any. `None` meetings
+    /// are anonymous: the link is the only capability, anyone may edit.
+    pub organizer_id: Option<Uuid>,
     pub cancelled: bool,
     pub created_at: OffsetDateTime,
 }
@@ -92,6 +95,11 @@ fn row_to_meeting(row: &SqliteRow) -> Result<Meeting, MeetingError> {
         title: row.try_get("title")?,
         starts_at: from_text(row.try_get::<String, _>("starts_at")?.as_str(), "starts_at")?,
         ends_at: from_text(row.try_get::<String, _>("ends_at")?.as_str(), "ends_at")?,
+        organizer_id: row
+            .try_get::<Option<String>, _>("organizer_id")?
+            .map(|raw| Uuid::parse_str(&raw))
+            .transpose()
+            .map_err(|e| MeetingError::Corrupt(format!("organizer_id: {e}")))?,
         cancelled: row.try_get::<i64, _>("cancelled")? != 0,
         created_at: from_text(
             row.try_get::<String, _>("created_at")?.as_str(),
@@ -100,10 +108,13 @@ fn row_to_meeting(row: &SqliteRow) -> Result<Meeting, MeetingError> {
     })
 }
 
-/// Create a meeting with a fresh, collision-checked code.
+/// Create a meeting with a fresh, collision-checked code. `organizer_id`
+/// attaches the meeting to a logged-in organizer; `None` leaves it
+/// anonymous (the meeting link is the only capability, by design).
 pub async fn create(
     pool: &SqlitePool,
     req: &CreateMeetingRequest,
+    organizer_id: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<Meeting, MeetingError> {
     if req.validate().is_err() {
@@ -119,14 +130,15 @@ pub async fn create(
     for _ in 0..5 {
         let code = generate_code();
         let result = sqlx::query(
-            "INSERT INTO meetings (id, code, title, starts_at, ends_at, cancelled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&code)
         .bind(req.title.trim())
         .bind(&starts_at)
         .bind(&ends_at)
+        .bind(organizer_id.map(|id| id.to_string()))
         .bind(&created_at)
         .execute(pool)
         .await;
@@ -147,13 +159,29 @@ pub async fn create(
 /// Look up a meeting by its (normalized) code.
 pub async fn get_by_code(pool: &SqlitePool, code: &str) -> Result<Option<Meeting>, MeetingError> {
     let row = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, cancelled, created_at
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at
          FROM meetings WHERE code = ?1",
     )
     .bind(normalize_code(code))
     .fetch_optional(pool)
     .await?;
     row.map(|r| row_to_meeting(&r)).transpose()
+}
+
+/// All meetings created by one organizer, soonest first — the dashboard
+/// list behind `GET /api/meetings/mine`.
+pub async fn list_for_organizer(
+    pool: &SqlitePool,
+    organizer_id: Uuid,
+) -> Result<Vec<Meeting>, MeetingError> {
+    let rows = sqlx::query(
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at
+         FROM meetings WHERE organizer_id = ?1 ORDER BY starts_at ASC",
+    )
+    .bind(organizer_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(row_to_meeting).collect()
 }
 
 /// Apply a partial update. Unknown code → `None`.
@@ -250,6 +278,7 @@ mod tests {
         let meeting = create(
             &pool,
             &req(Duration::hours(1), Duration::hours(1), "Standup"),
+            None,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -270,6 +299,7 @@ mod tests {
         let meeting = create(
             &pool,
             &req(Duration::hours(1), Duration::hours(1), "Retro"),
+            None,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -289,6 +319,7 @@ mod tests {
                 starts_at: OffsetDateTime::now_utc() + Duration::hours(2),
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
             },
+            None,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -302,6 +333,7 @@ mod tests {
         let meeting = create(
             &pool,
             &req(Duration::hours(1), Duration::hours(1), "Old title"),
+            None,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -331,6 +363,7 @@ mod tests {
         let meeting = create(
             &pool,
             &req(Duration::hours(1), Duration::hours(1), "1:1"),
+            None,
             OffsetDateTime::now_utc(),
         )
         .await
@@ -340,6 +373,42 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(cancelled.cancelled);
+    }
+
+    #[tokio::test]
+    async fn owned_meetings_list_for_their_organizer() {
+        let pool = pool().await;
+
+        // organizers.organizer_id is a foreign key: stand up real rows.
+        let alice = Uuid::new_v4();
+        let bob = Uuid::new_v4();
+        for (id, email) in [(alice, "alice@example.com"), (bob, "bob@example.com")] {
+            sqlx::query("INSERT INTO organizers (id, email, created_at) VALUES (?1, ?2, ?3)")
+                .bind(id.to_string())
+                .bind(email)
+                .bind(to_text(OffsetDateTime::now_utc()).unwrap())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let owned = create(
+            &pool,
+            &req(Duration::hours(1), Duration::hours(1), "Alice's sync"),
+            Some(alice),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(owned.organizer_id, Some(alice));
+
+        // Visible through the dashboard query, invisible to anyone else.
+        let mine = list_for_organizer(&pool, alice).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].id, owned.id);
+
+        let theirs = list_for_organizer(&pool, bob).await.unwrap();
+        assert!(theirs.is_empty());
     }
 
     #[tokio::test]
@@ -363,6 +432,7 @@ mod tests {
             title: "test".into(),
             starts_at: start,
             ends_at: start + Duration::hours(1),
+            organizer_id: None,
             cancelled: false,
             created_at: start,
         };
@@ -389,6 +459,7 @@ mod tests {
             title: "test".into(),
             starts_at: OffsetDateTime::now_utc(),
             ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
+            organizer_id: None,
             cancelled: true,
             created_at: OffsetDateTime::now_utc(),
         };
