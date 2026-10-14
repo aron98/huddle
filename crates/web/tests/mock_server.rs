@@ -122,6 +122,12 @@ impl MockState {
                 audio_muted: true,
                 video_muted: false,
             }],
+            // Speaking is echoed back like the server does, attributed to
+            // a fixture participant.
+            ClientMessage::Speaking { speaking } => vec![ServerMessage::Speaking {
+                id: ALICE_ID,
+                speaking: *speaking,
+            }],
             ClientMessage::SdpAnswer { .. } | ClientMessage::Leave => vec![],
         }
     }
@@ -415,6 +421,17 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
         other => panic!("expected mute state, got {other:?}"),
     }
     assert!(client.roster().iter().any(|p| p.audio_muted));
+
+    // --- Speaking -------------------------------------------------------------
+    client.set_speaking(true).await.unwrap();
+    match client.next_server_message().await.unwrap() {
+        ServerMessage::Speaking { id, speaking } => {
+            assert_eq!(id, ALICE_ID);
+            assert!(speaking);
+        }
+        other => panic!("expected speaking, got {other:?}"),
+    }
+    assert!(client.speaking().contains(&ALICE_ID), "alice is speaking");
 
     // --- Leave ----------------------------------------------------------------
     client.leave().await.unwrap();

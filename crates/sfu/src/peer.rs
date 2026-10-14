@@ -32,8 +32,9 @@ pub(crate) struct TrackInEntry {
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
-/// this peer should receive). Phase 1 has no m-line recycling: a track
-/// only moves forward `ToOpen -> Negotiating -> Open`.
+/// this peer should receive). Tracks move forward `ToOpen -> Negotiating ->
+/// Open`; when the origin disappears they wind down through
+/// `ToStop -> NegotiatingStop` and are dropped once the stop is answered.
 pub(crate) enum TrackOutState {
     /// Needs an SDP m-line allocated in the next renegotiation.
     ToOpen,
@@ -41,6 +42,12 @@ pub(crate) enum TrackOutState {
     Negotiating(Mid),
     /// Fully negotiated; media can be written to `Mid`.
     Open(Mid),
+    /// The origin went away; the m-line is stopped in the next
+    /// renegotiation. No media is forwarded from here on.
+    ToStop(Mid),
+    /// A stop offer has been sent; waiting for the answer to drop the
+    /// entry (a stopped m-line can never be reactivated).
+    NegotiatingStop(Mid),
 }
 
 /// An outgoing track entry on the receiving peer.
@@ -93,8 +100,16 @@ pub(crate) struct Peer {
     /// offer delivered across that boundary no longer matches the m-line
     /// order the client established, so browsers reject it.
     has_session: bool,
+    /// Mute state applied at the SFU: frames of a muted kind arriving
+    /// from this peer are not forwarded to anyone.
+    audio_muted: bool,
+    video_muted: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
+    /// Keyframe (FIR/PLI) requests successfully enqueued toward this
+    /// peer. The wire form is SRTCP, invisible to outside observers, so
+    /// tests assert on this counter instead of sniffing datagrams.
+    pub keyframes_requested: u64,
 }
 
 impl Peer {
@@ -115,8 +130,11 @@ impl Peer {
             tracks_in: Vec::new(),
             tracks_out: Vec::new(),
             has_session: false,
+            audio_muted: false,
+            video_muted: false,
             rx_frames: 0,
             tx_frames: 0,
+            keyframes_requested: 0,
         };
 
         let candidate = Candidate::host(media_addr, "udp")
@@ -136,34 +154,50 @@ impl Peer {
     /// Accept an SDP offer from the client and produce the answer.
     ///
     /// `accept_offer` invalidates any pending offer we sent, so tracks that
-    /// were mid-negotiation are reset to `ToOpen` and renegotiated on the
-    /// next poll.
+    /// were mid-negotiation are reset to `ToOpen` (or back to `ToStop` for
+    /// in-flight stops) and renegotiated on the next poll.
     pub(crate) fn answer_sdp_offer(&mut self, sdp: &str) -> Result<String, SfuError> {
         let offer = SdpOffer::from_sdp_string(sdp)?;
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
         self.pending = None;
         self.has_session = true;
         for out in &mut self.tracks_out {
-            if matches!(out.state, TrackOutState::Negotiating(_)) {
-                out.state = TrackOutState::ToOpen;
+            match out.state {
+                TrackOutState::Negotiating(_) => out.state = TrackOutState::ToOpen,
+                TrackOutState::NegotiatingStop(mid) => out.state = TrackOutState::ToStop(mid),
+                _ => {}
             }
         }
         Ok(answer.to_sdp_string())
     }
 
     /// Accept the client's answer to a renegotiation offer we sent.
-    pub(crate) fn accept_sdp_answer(&mut self, sdp: &str) -> Result<(), SfuError> {
+    ///
+    /// Returns `(origin, incoming mid)` of every track that just went
+    /// live, so the room can fan keyframe requests out to the sources.
+    pub(crate) fn accept_sdp_answer(&mut self, sdp: &str) -> Result<Vec<(PeerId, Mid)>, SfuError> {
         let Some(pending) = self.pending.take() else {
             return Err(SfuError::NoPendingOffer);
         };
         let answer = SdpAnswer::from_sdp_string(sdp)?;
         self.rtc.sdp_api().accept_answer(pending, answer)?;
+        // Stops are confirmed by the answer: the m-line is dead and the
+        // entry can go. Adds become live; if their origin vanished while
+        // the offer was in flight, wind them straight back down.
+        self.tracks_out
+            .retain(|out| !matches!(out.state, TrackOutState::NegotiatingStop(_)));
+        let mut opened = Vec::new();
         for out in &mut self.tracks_out {
-            if let TrackOutState::Negotiating(mid) = out.state {
+            if let TrackOutState::Negotiating(mid) = out.state
+                && let Some(track) = out.track_in.upgrade()
+            {
                 out.state = TrackOutState::Open(mid);
+                opened.push((track.origin, track.mid));
+            } else if let TrackOutState::Negotiating(mid) = out.state {
+                out.state = TrackOutState::ToStop(mid);
             }
         }
-        Ok(())
+        Ok(opened)
     }
 
     /// Add a trickled ICE candidate from the client.
@@ -188,6 +222,16 @@ impl Peer {
         self.rtc.accepts(input)
     }
 
+    /// Number of forwardable outgoing track entries (any state).
+    pub(crate) fn tracks_out_count(&self) -> usize {
+        self.tracks_out.len()
+    }
+
+    /// Number of incoming tracks.
+    pub(crate) fn tracks_in_count(&self) -> usize {
+        self.tracks_in.len()
+    }
+
     /// All incoming tracks of this peer, for replaying to a newcomer.
     pub(crate) fn tracks_in(&self) -> impl Iterator<Item = &Arc<TrackIn>> {
         self.tracks_in.iter().map(|e| &e.track)
@@ -204,8 +248,49 @@ impl Peer {
         });
     }
 
-    /// If any tracks are waiting to be opened, bundle them into a single
-    /// renegotiation offer and return its SDP string.
+    /// Update the SFU-side mute state; `None` leaves that kind untouched.
+    ///
+    /// When video is unmuted, every video source of this peer is asked
+    /// for a keyframe (throttled): subscribers were starved of the GOP
+    /// while muted, and without a fresh intra frame their tiles would
+    /// stay stale until the next PLI.
+    pub(crate) fn set_mute(&mut self, audio_muted: Option<bool>, video_muted: Option<bool>) {
+        let video_was_muted = self.video_muted;
+        if let Some(a) = audio_muted {
+            self.audio_muted = a;
+        }
+        if let Some(v) = video_muted {
+            self.video_muted = v;
+        }
+        if video_was_muted && !self.video_muted {
+            let video_mids: Vec<Mid> = self
+                .tracks_in
+                .iter()
+                .filter(|e| matches!(e.track.kind, MediaKind::Video))
+                .map(|e| e.track.mid)
+                .collect();
+            for mid in video_mids {
+                self.request_keyframe_throttled(mid, None, KeyframeRequestKind::Fir);
+            }
+        }
+    }
+
+    /// Whether an incoming frame on `mid` may be forwarded right now.
+    ///
+    /// Unknown m-lines stay forwardable; a known track is dropped while
+    /// its kind is muted at the source.
+    pub(crate) fn is_forwardable(&self, mid: Mid) -> bool {
+        let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
+            return true;
+        };
+        match entry.track.kind {
+            MediaKind::Audio => !self.audio_muted,
+            MediaKind::Video => !self.video_muted,
+        }
+    }
+
+    /// If any tracks are waiting to be opened or stopped, bundle them into
+    /// a single renegotiation offer and return its SDP string.
     pub(crate) fn negotiate_if_needed(&mut self) -> Option<String> {
         if !self.has_session || self.pending.is_some() {
             return None;
@@ -213,21 +298,53 @@ impl Peer {
 
         let mut changes = self.rtc.sdp_api();
         for out in &mut self.tracks_out {
-            if matches!(out.state, TrackOutState::ToOpen) {
-                let mid = changes.add_media(
-                    out.kind,
-                    Direction::SendOnly,
-                    Some(out.origin.to_string()),
-                    None,
-                    None,
-                );
-                out.state = TrackOutState::Negotiating(mid);
+            match out.state {
+                TrackOutState::ToOpen => {
+                    let mid = changes.add_media(
+                        out.kind,
+                        Direction::SendOnly,
+                        Some(out.origin.to_string()),
+                        None,
+                        None,
+                    );
+                    out.state = TrackOutState::Negotiating(mid);
+                }
+                TrackOutState::ToStop(mid) => {
+                    changes.stop_media(mid);
+                    out.state = TrackOutState::NegotiatingStop(mid);
+                }
+                _ => {}
             }
         }
 
         let (offer, pending) = changes.apply()?;
         self.pending = Some(pending);
         Some(offer.to_sdp_string())
+    }
+
+    /// Wind down entries whose origin track is gone (its peer left).
+    ///
+    /// Un-negotiated entries are dropped outright; negotiated ones are
+    /// stopped in the next renegotiation so the browser's m-line goes
+    /// away with the departed participant.
+    pub(crate) fn reap_dead_tracks(&mut self) {
+        self.tracks_out.retain_mut(|out| {
+            if out.track_in.upgrade().is_some() {
+                return true;
+            }
+            match out.state {
+                TrackOutState::ToOpen => false,
+                TrackOutState::Open(mid) => {
+                    out.state = TrackOutState::ToStop(mid);
+                    true
+                }
+                // Already stopping; the answer completes the removal.
+                TrackOutState::ToStop(_) | TrackOutState::NegotiatingStop(_) => true,
+                // Mid-add with a dead origin: let the answer land, the
+                // post-answer sweep turns it into a stop.
+                TrackOutState::Negotiating(_) => true,
+            }
+        });
     }
 
     /// Poll one step of the underlying `Rtc` and translate it into an
@@ -338,10 +455,11 @@ impl Peer {
             return;
         }
         entry.last_keyframe_request = Some(now);
-        if let Some(mut writer) = self.rtc.writer(mid)
-            && let Err(e) = writer.request_keyframe(rid, kind)
-        {
-            tracing::warn!("keyframe request on {mid:?} failed: {e}");
+        if let Some(mut writer) = self.rtc.writer(mid) {
+            match writer.request_keyframe(rid, kind) {
+                Ok(()) => self.keyframes_requested += 1,
+                Err(e) => tracing::warn!("keyframe request on {mid:?} failed: {e}"),
+            }
         }
     }
 
@@ -358,6 +476,7 @@ impl Peer {
             .writer(mid_in)
             .ok_or_else(|| SfuError::Internal(format!("no writer for incoming mid {mid_in:?}")))?;
         writer.request_keyframe(rid, kind)?;
+        self.keyframes_requested += 1;
         Ok(())
     }
 }

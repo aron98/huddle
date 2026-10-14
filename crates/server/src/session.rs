@@ -84,6 +84,9 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::MuteState { audio_muted, video_muted } => {
                         engine.mute(code.clone(), id, audio_muted, video_muted);
                     }
+                    ClientMessage::Speaking { speaking } => {
+                        engine.speaking(code.clone(), id, speaking);
+                    }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;
@@ -262,6 +265,8 @@ mod tests {
         async fn start() -> Self {
             let config = Config {
                 media_port: 0,
+                // Tests talk loopback-to-loopback; detection is machine-dependent.
+                public_ip: Some(IpAddr::from([127, 0, 0, 1])),
                 ..Config::default()
             };
             let pool = crate::db::test_pool().await;
@@ -787,6 +792,36 @@ mod tests {
         .await
         .expect("left within 5s");
         assert!(matches!(msg, ServerMessage::ParticipantLeft { id } if id == bob.you));
+
+        alice.pump.stop();
+        bob.pump.stop();
+    }
+
+    #[tokio::test]
+    async fn speaking_is_broadcast_to_the_room() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting(0, 60).await;
+
+        let mut alice = TestClient::connect(&server, &code, "alice").await;
+        let mut bob = TestClient::connect(&server, &code, "bob").await;
+
+        // Alice sees bob join first; both then hear alice speak.
+        let msg = alice.next_server_message().await;
+        assert!(matches!(msg, ServerMessage::ParticipantJoined { .. }));
+
+        alice
+            .send_client(&ClientMessage::Speaking { speaking: true })
+            .await;
+
+        let expected = alice.you;
+        for client in [&mut alice, &mut bob] {
+            let msg = client.next_server_message().await;
+            let ServerMessage::Speaking { id, speaking } = msg else {
+                panic!("expected speaking, got {msg:?}")
+            };
+            assert_eq!(id, expected);
+            assert!(speaking);
+        }
 
         alice.pump.stop();
         bob.pump.stop();

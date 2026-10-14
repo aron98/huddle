@@ -297,6 +297,7 @@ enum UiAction {
         audio_muted: Option<bool>,
         video_muted: Option<bool>,
     },
+    Speaking(bool),
     Leave,
 }
 
@@ -308,17 +309,20 @@ enum UiAction {
 fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> impl IntoView {
     use futures::future::FutureExt;
     use futures::stream::StreamExt;
-    use huddle_protocol::Participant;
+    use huddle_protocol::{Participant, ServerMessage};
     use uuid::Uuid;
     use web_sys::MediaStream;
 
-    let remote_streams = RwSignal::<Vec<MediaStream>>::new(Vec::new());
+    let remote_streams = RwSignal::<Vec<(String, MediaStream)>>::new(Vec::new());
     let roster = RwSignal::<Vec<Participant>>::new(Vec::new());
+    let speaking = RwSignal::<std::collections::HashSet<Uuid>>::new(Default::default());
     let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
 
     let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
+    // The session task reports our own speaking through the same channel.
+    let task_ui_tx = ui_tx.clone();
 
     // The session task: connect, join, publish, then pump messages and UI
     // actions until the call ends.
@@ -368,11 +372,11 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         // self-echo so it does not render as a phantom "Guest" tile.
         let streams = remote_streams;
         let local_id = local.as_ref().map(|s| s.id());
-        peer.set_on_remote_stream(move |stream| {
-            if local_id.as_deref() == Some(stream.id().as_str()) {
+        peer.set_on_remote_stream(move |id, stream| {
+            if local_id.as_deref() == Some(id) {
                 return;
             }
-            streams.update(|list| list.push(stream));
+            streams.update(|list| list.push((id.to_owned(), stream)));
         });
         if let Some(local) = &local {
             peer.attach_stream(local);
@@ -390,21 +394,62 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
         status.set(None);
 
+        // Best-effort speaking detection: watch our own level and report
+        // flips through the session. Failure is non-fatal — the call just
+        // runs without the indicator.
+        let _speaking_watch = match local.as_ref() {
+            Some(s) => match media::watch_speaking(s, move |speaking| {
+                let _ = task_ui_tx.unbounded_send(UiAction::Speaking(speaking));
+            })
+            .await
+            {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    leptos::logging::warn!("speaking detection off: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         loop {
+            // Read inside the select but handle OUTSIDE it: handling a server
+            // message awaits browser promises and sends the SDP answer, so a
+            // dropped future (e.g. a speaking flip winning the select mid-way)
+            // would leave the answer unsent and wedge the peer's negotiation
+            // forever. `read_server_message` is cancel-safe; the handling
+            // future below runs to completion.
             futures::select! {
-                message = client.next_server_message().fuse() => {
-                    match message {
-                        Ok(_) => roster.set(client.roster().to_vec()),
-                        Err(e) => {
+                message = client.read_server_message().fuse() => match message {
+                    Ok(msg) => {
+                        if let Err(e) = client.handle_server_message(msg.clone()).await {
                             status.set(Some(format!("Disconnected: {e}")));
                             break;
                         }
+                        // A departed participant's tile goes with them.
+                        if let ServerMessage::ParticipantLeft { id } = &msg {
+                            let gone = id.to_string();
+                            remote_streams
+                                .update(|list| list.retain(|(sid, _)| sid != &gone));
+                        }
+                        roster.set(client.roster().to_vec());
+                        speaking.set(client.speaking().clone());
                     }
-                }
+                    Err(e) => {
+                        status.set(Some(format!("Disconnected: {e}")));
+                        break;
+                    }
+                },
                 action = ui_rx.select_next_some() => {
                     match action {
                         UiAction::Mute { audio_muted, video_muted } => {
                             if let Err(e) = client.set_mute_state(audio_muted, video_muted).await {
+                                status.set(Some(format!("Disconnected: {e}")));
+                                break;
+                            }
+                        }
+                        UiAction::Speaking(speaking) => {
+                            if let Err(e) = client.set_speaking(speaking).await {
                                 status.set(Some(format!("Disconnected: {e}")));
                                 break;
                             }
@@ -465,9 +510,11 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
     };
 
-    // Resolve a remote stream's origin participant from its msid.
-    fn label_for(stream: &MediaStream, roster: &[Participant]) -> String {
-        Uuid::parse_str(&stream.id())
+    // Resolve a remote stream's origin participant from its msid. The id
+    // string was captured at `ontrack` time; never re-read `.id()` from
+    // the stream (unstable in Chrome, see `BrowserPeerConnection::new`).
+    fn label_for(id: &str, roster: &[Participant]) -> String {
+        Uuid::parse_str(id)
             .ok()
             .and_then(|id| roster.iter().find(|p| p.id == id))
             .map(|p| p.name.clone())
@@ -490,20 +537,27 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                                 label="You".to_string()
                                 muted=true
                                 testid="tile-you".to_string()
+                                speaking=false
                             />
                         }
                     })}
 
-                <For each={move || remote_streams.get()} key=|s| s.id() let:s>
+                <For each={move || remote_streams.get()} key=|s| s.0.clone() let:s>
                     {move || {
-                        let label = label_for(&s, &roster.get());
+                        let label = label_for(&s.0, &roster.get());
                         let testid = format!("tile-{label}");
+                        // The SFU labels streams with the origin
+                        // participant's id, so the speaking set — keyed
+                        // the same way — tells us whose tile to ring.
+                        let is_speaking = Uuid::parse_str(&s.0)
+                            .is_ok_and(|id| speaking.get().contains(&id));
                         view! {
                             <VideoTile
-                                stream=s.clone()
+                                stream=s.1.clone()
                                 label=label
                                 muted=false
                                 testid=testid
+                                speaking=is_speaking
                             />
                         }
                     }}
@@ -551,6 +605,7 @@ fn VideoTile(
     label: String,
     muted: bool,
     testid: String,
+    speaking: bool,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
     Effect::new(move |_| {
@@ -561,7 +616,7 @@ fn VideoTile(
         }
     });
     view! {
-        <figure class="tile" data-testid=testid>
+        <figure class={if speaking { "tile speaking" } else { "tile" }} data-testid=testid>
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>{label}</figcaption>
         </figure>

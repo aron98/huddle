@@ -9,9 +9,9 @@
 #
 # Both `server` and `coturn` use host networking (Linux only): WebRTC media
 # is UDP from arbitrary client ports, which double NAT (docker bridge +
-# port mapping) makes flaky. With host networking the default advertised
-# address (127.0.0.1) works for same-machine browser testing; set
-# HUDDLE_PUBLIC_IP below to your LAN ip for calls from other devices.
+# port mapping) makes flaky. With host networking the server auto-detects
+# and advertises the machine's LAN ip, which works for same-machine and
+# same-LAN browser testing alike; set HUDDLE_PUBLIC_IP to override.
 
 services:
   web:

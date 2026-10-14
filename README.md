@@ -10,26 +10,29 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Phases 0–2 complete** — the foundations, the four independent tracks, and
-the two-person call from the [implementation plan](docs/implementation-plan.md)
-are done:
+🚧 **Phases 0–3 complete** — the foundations, the four independent tracks, the
+two-person call, and n-party support from the
+[implementation plan](docs/implementation-plan.md) are done:
 
-- `protocol` — v1 signaling and REST wire messages.
+- `protocol` — v1 signaling and REST wire messages, including speaking
+  indicators.
 - `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web
   UI, `/ws` signaling sessions, and a media engine thread driving one SFU room
   per meeting over UDP.
 - `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
-  SDP answering, media forwarding, keyframe discipline; tested with synthetic
-  in-process clients and a real-UDP loopback.
+  SDP answering, media forwarding, keyframe fan-out to new subscribers, track
+  recycling when participants leave, mute-gated forwarding; tested with
+  synthetic in-process clients and a real-UDP loopback.
 - `web` — Leptos prejoin page (camera preview, device pickers, name), an
   `RtcClient` signaling driver tested against a mock server, and an in-call
-  view with tiles, roster, and mic/camera/leave controls.
+  view with an adaptive tile grid, roster, speaking indicators (Web Audio RMS
+  detection), and mic/camera/leave controls.
 - Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check,
-  and a two-browser-page call e2e that asserts media flows *through the
-  server*), multi-stage Dockerfile, dev compose stack with coturn.
+  and a four-browser-page call e2e with join/leave churn that asserts media
+  flows *through the server*), multi-stage Dockerfile, dev compose stack with
+  coturn.
 
-**Next:** phase 3 — n-party calls: renegotiation fan-out, PLI discipline, and
-a responsive tile grid.
+**Next:** phase 4 — screen share and chat fan-out.
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
@@ -93,10 +96,23 @@ curl -s localhost:3000/api/meetings \
 # → open http://localhost:3000/m/<code from the response>
 ```
 
+(On macOS, replace the `-d '+1 hour'` date invocation with
+`date -u -v+60M +%Y-%m-%dT%H:%M:%SZ` — BSD date has different flags.)
+
 Configuration is `HUDDLE_*` environment variables (optionally a `huddle.toml`):
 `HUDDLE_BIND` (default `0.0.0.0:3000`), `HUDDLE_DATA_DIR` (default `./data`),
-`HUDDLE_PUBLIC_IP`, `HUDDLE_MEDIA_PORT` (default `40000`), `HUDDLE_WEB_DIR`
-(serve a web bundle from disk instead of the embedded one).
+`HUDDLE_MEDIA_PORT` (default `40000`), `HUDDLE_WEB_DIR` (serve a web bundle
+from disk instead of the embedded one), and `HUDDLE_PUBLIC_IP` — the address
+browsers send media to. Leave `HUDDLE_PUBLIC_IP` unset and the server
+auto-detects its LAN address at startup, which is what local development
+wants; production deployments should set it explicitly (e.g. the VPS's
+public address).
+
+One caveat the auto-detection exists to solve: advertising loopback only
+works when the client's browser sources loopback traffic from loopback —
+Linux Chrome does, macOS Chrome does not (it sends from the default
+interface, and the mismatched reply source fails ICE validation). With
+auto-detection you do not need to care about this on any platform.
 
 Docker: `docker build -t huddle .` produces the single-binary image; and
 `docker compose up` runs a hot-reloading dev stack (web + server + coturn dev

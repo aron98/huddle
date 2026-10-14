@@ -19,8 +19,10 @@ pub use peer::{LocalCandidate, PeerConnection, PeerError};
 pub use transport::{SignalingError, SignalingStream};
 
 use huddle_protocol::{
-    ChatMessage, ClientMessage, ErrorCode, MeetingDto, PROTOCOL_VERSION, Participant, ServerMessage,
+    ChatMessage, ClientMessage, ErrorCode, MeetingDto, PROTOCOL_VERSION, Participant,
+    ParticipantId, ServerMessage,
 };
+use std::collections::HashSet;
 
 /// Everything that can go wrong above the two transport boundaries.
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +71,8 @@ pub struct RtcClient<S, P> {
     roster: Vec<Participant>,
     meeting: Option<MeetingDto>,
     chat_log: Vec<ChatMessage>,
+    /// Participants the server last reported as speaking.
+    speaking: HashSet<ParticipantId>,
 }
 
 impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
@@ -81,6 +85,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             roster: Vec::new(),
             meeting: None,
             chat_log: Vec::new(),
+            speaking: HashSet::new(),
         }
     }
 
@@ -103,6 +108,11 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
 
     pub fn chat_log(&self) -> &[ChatMessage] {
         &self.chat_log
+    }
+
+    /// Participants the server currently reports as speaking.
+    pub fn speaking(&self) -> &HashSet<ParticipantId> {
+        &self.speaking
     }
 
     /// Mutable access to the peer connection, e.g. to attach local media
@@ -207,14 +217,27 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
 
     /// Read and process the next server message. Returns the raw message so
     /// the UI layer can react (draw tiles, update chat, show errors).
+    ///
+    /// NOT cancel-safe: `handle_server_message` awaits browser promises and
+    /// sends signaling replies; dropping the returned future mid-flight can
+    /// lose the reply. UI loops that race this against other futures should
+    /// use [`RtcClient::read_server_message`] inside the `select!` and pass
+    /// the result to [`RtcClient::handle_server_message`] afterwards.
     pub async fn next_server_message(&mut self) -> Result<ServerMessage, RtcError> {
+        let message = self.read_server_message().await?;
+        self.handle_server_message(message.clone()).await?;
+        Ok(message)
+    }
+
+    /// Receive the next server message from the signaling stream without
+    /// applying it. Cancel-safe: the only side effect on cancellation is the
+    /// message staying buffered in the stream.
+    pub async fn read_server_message(&mut self) -> Result<ServerMessage, RtcError> {
         let Some(message) = self.signaling.next_message().await else {
             self.state = SessionState::Closed;
             return Err(RtcError::Closed);
         };
-        let message = message?;
-        self.handle_server_message(message.clone()).await?;
-        Ok(message)
+        Ok(message?)
     }
 
     /// Apply one server message to our state, dispatching side effects to the
@@ -232,6 +255,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             }
             ServerMessage::ParticipantLeft { id } => {
                 self.roster.retain(|p| p.id != id);
+                self.speaking.remove(&id);
                 Ok(())
             }
             ServerMessage::SdpAnswer { .. } => Ok(()), // consumed by `publish`
@@ -270,6 +294,14 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 }
                 Ok(())
             }
+            ServerMessage::Speaking { id, speaking } => {
+                if speaking {
+                    self.speaking.insert(id);
+                } else {
+                    self.speaking.remove(&id);
+                }
+                Ok(())
+            }
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }
@@ -299,6 +331,17 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 audio_muted,
                 video_muted,
             })
+            .await
+            .map_err(RtcError::from)
+    }
+
+    /// Report whether we are speaking. The client is the authority on its
+    /// own audio activity; the server echoes the canonical
+    /// [`ServerMessage::Speaking`] back to everyone.
+    pub async fn set_speaking(&mut self, speaking: bool) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.signaling
+            .send(ClientMessage::Speaking { speaking })
             .await
             .map_err(RtcError::from)
     }

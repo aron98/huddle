@@ -73,6 +73,12 @@ pub enum EngineCommand {
         audio_muted: Option<bool>,
         video_muted: Option<bool>,
     },
+    /// Relay a speaking indicator to everyone in the meeting.
+    Speaking {
+        code: String,
+        id: Uuid,
+        speaking: bool,
+    },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
     /// A datagram arrived on the media socket.
@@ -141,6 +147,10 @@ impl EngineHandle {
         });
     }
 
+    pub fn speaking(&self, code: String, id: Uuid, speaking: bool) {
+        let _ = self.tx.send(EngineCommand::Speaking { code, id, speaking });
+    }
+
     pub fn leave(&self, code: String, id: Uuid) {
         let _ = self.tx.send(EngineCommand::Leave { code, id });
     }
@@ -185,14 +195,14 @@ struct Engine {
 ///
 /// The socket binds to all interfaces on `config.media_port`; the port
 /// actually bound (useful when 0 was requested) ends up in the returned
-/// media address, which pairs `config.public_ip` with it.
+/// media address, which pairs the configured/detected public ip with it.
 pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
     let socket = UdpSocket::bind(SocketAddr::new(
         IpAddr::from([0, 0, 0, 0]),
         config.media_port,
     ))?;
     let bound = socket.local_addr()?;
-    let media_addr = SocketAddr::new(config.public_ip, bound.port());
+    let media_addr = SocketAddr::new(config.effective_public_ip(), bound.port());
 
     let (tx, rx) = std::sync::mpsc::channel::<EngineCommand>();
 
@@ -375,6 +385,9 @@ impl Engine {
                 audio_muted,
                 video_muted,
             } => self.set_mute(&code, id, audio_muted, video_muted),
+            EngineCommand::Speaking { code, id, speaking } => {
+                self.relay_speaking(&code, id, speaking);
+            }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Packet { source, bytes } => self.handle_packet(source, &bytes),
             EngineCommand::Shutdown => unreachable!("handled by the run loop"),
@@ -512,11 +525,31 @@ impl Engine {
             p.video_muted = v;
         }
         let (audio_muted, video_muted) = (p.audio_muted, p.video_muted);
+        // Mirror the state into the room so forwarding stops at the SFU,
+        // not just in the clients' tiles.
+        if let Err(e) = inst.room.set_mute(id, Some(audio_muted), Some(video_muted)) {
+            tracing::debug!(peer = %id, "room set_mute: {e}");
+        }
         let msg = ServerMessage::MuteState {
             id,
             audio_muted,
             video_muted,
         };
+        for out in inst.outs.values() {
+            let _ = out.send(msg.clone());
+        }
+    }
+
+    /// Relay a speaking indicator. The engine does not gate the value in
+    /// any way; the client is the authority on its own audio activity.
+    fn relay_speaking(&mut self, code: &str, id: Uuid, speaking: bool) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        if !inst.participants.contains_key(&id) {
+            return;
+        }
+        let msg = ServerMessage::Speaking { id, speaking };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
         }
@@ -585,6 +618,8 @@ mod tests {
         // ends: dropping it disconnects the engine thread.
         let config = Config {
             media_port: 0,
+            // Tests talk loopback-to-loopback; detection is machine-dependent.
+            public_ip: Some(IpAddr::from([127, 0, 0, 1])),
             max_participants,
             ..Config::default()
         };
@@ -755,6 +790,30 @@ mod tests {
             assert_eq!(target, alice);
             assert!(audio_muted);
             assert!(!video_muted);
+        }
+    }
+
+    #[tokio::test]
+    async fn speaking_broadcasts_to_everyone() {
+        let (engine, _keep) = test_engine(8);
+        let (alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        next(&mut bob_rx).await; // welcome
+        next(&mut alice_rx).await; // welcome
+        next(&mut alice_rx).await; // bob joined
+
+        engine.speaking("ABCD-EFGH-JKLM".into(), alice, true);
+        engine.speaking("ABCD-EFGH-JKLM".into(), alice, false);
+
+        for speaking in [true, false] {
+            for rx in [&mut alice_rx, &mut bob_rx] {
+                let msg = next(rx).await;
+                let ServerMessage::Speaking { id, speaking: s } = msg else {
+                    panic!("expected speaking, got {msg:?}");
+                };
+                assert_eq!(id, alice);
+                assert_eq!(s, speaking);
+            }
         }
     }
 

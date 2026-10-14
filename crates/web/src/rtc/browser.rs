@@ -182,14 +182,15 @@ impl SignalingStream for BrowserSignalingStream {
 pub struct BrowserPeerConnection {
     pc: RtcPeerConnection,
     local_candidates: Rc<RefCell<Vec<LocalCandidate>>>,
-    remote_streams: Rc<RefCell<Vec<MediaStream>>>,
     on_remote_stream: RemoteStreamCallback,
     _on_ice_candidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _on_track: Closure<dyn FnMut(RtcTrackEvent)>,
 }
 
-/// A Rust callback invoked for every new remote [`MediaStream`].
-type RemoteStreamCallback = Rc<RefCell<Option<Box<dyn FnMut(MediaStream)>>>>;
+/// A Rust callback invoked for every new remote [`MediaStream`], with the
+/// stream id captured at `ontrack` time (see the comment in `new` for why
+/// the id must be captured then rather than re-read later).
+type RemoteStreamCallback = Rc<RefCell<Option<Box<dyn FnMut(&str, MediaStream)>>>>;
 
 impl BrowserPeerConnection {
     pub fn new(ice_servers: &[IceServer]) -> Result<Self, PeerError> {
@@ -222,7 +223,16 @@ impl BrowserPeerConnection {
         // participant's id (`a=msid`), so `event.streams[0].id` is the
         // origin participant's uuid. `ontrack` fires once per track, so
         // deduplicate by stream id before notifying.
-        let remote_streams = Rc::new(RefCell::new(Vec::<MediaStream>::new()));
+        //
+        // In Chrome the `MediaStream` object handed to `ontrack` does not
+        // report a stable `.id()`: the same stored object can read as one
+        // id during the event and a different one microseconds later
+        // (observed with a three-party call; presumably the id is
+        // normalised to the SDP msid asynchronously). The id read *at
+        // event time* is the correct msid, so capture it into a `String`
+        // and deduplicate — and carry the id onward — instead of ever
+        // re-reading `.id()` from a stored stream.
+        let remote_streams = Rc::new(RefCell::new(Vec::<(String, MediaStream)>::new()));
         let on_remote_stream: RemoteStreamCallback = Rc::new(RefCell::new(None));
         let streams_sink = Rc::clone(&remote_streams);
         let callback_sink = Rc::clone(&on_remote_stream);
@@ -234,14 +244,14 @@ impl BrowserPeerConnection {
                 };
                 let id = stream.id();
                 let mut seen = streams_sink.borrow_mut();
-                if seen.iter().any(|existing| existing.id() == id) {
+                if seen.iter().any(|(existing, _)| existing == &id) {
                     continue;
                 }
-                seen.push(stream.clone());
+                seen.push((id.clone(), stream.clone()));
                 drop(seen);
                 let mut callback = callback_sink.borrow_mut();
                 if let Some(notify) = callback.as_mut() {
-                    notify(stream);
+                    notify(&id, stream);
                 }
             }
         });
@@ -250,24 +260,16 @@ impl BrowserPeerConnection {
         Ok(Self {
             pc,
             local_candidates,
-            remote_streams,
             on_remote_stream,
             _on_ice_candidate: on_ice_candidate,
             _on_track: on_track,
         })
     }
 
-    /// Register a callback fired once for every NEW remote stream.
-    ///
-    /// Streams that arrived before the callback was installed are still
-    /// available via [`remote_streams`](Self::remote_streams).
-    pub fn set_on_remote_stream(&self, callback: impl FnMut(MediaStream) + 'static) {
+    /// Register a callback fired once for every NEW remote stream, with the
+    /// stream id captured at `ontrack` time (stable msid) and the stream.
+    pub fn set_on_remote_stream(&self, callback: impl FnMut(&str, MediaStream) + 'static) {
         *self.on_remote_stream.borrow_mut() = Some(Box::new(callback));
-    }
-
-    /// Every remote stream seen so far, in arrival order.
-    pub fn remote_streams(&self) -> Vec<MediaStream> {
-        self.remote_streams.borrow().clone()
     }
 
     /// The underlying JS `RTCPeerConnection`, for debug/test inspection.

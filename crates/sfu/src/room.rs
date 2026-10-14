@@ -74,10 +74,15 @@ impl Room {
         Ok(())
     }
 
-    /// Remove a participant, disconnecting its `Rtc`.
+    /// Remove a participant, disconnecting its `Rtc`. Every remaining
+    /// peer's forwarding table is swept so tracks sourced by the departed
+    /// peer are wound down (and their m-lines stopped) in renegotiation.
     pub fn remove_peer(&mut self, id: PeerId) {
         if let Some(mut peer) = self.peers.remove(&id) {
             peer.disconnect();
+        }
+        for peer in self.peers.values_mut() {
+            peer.reap_dead_tracks();
         }
     }
 
@@ -96,7 +101,17 @@ impl Room {
         self.peers.get(&id).map(|p| PeerStats {
             rx_frames: p.rx_frames,
             tx_frames: p.tx_frames,
+            keyframes_requested: p.keyframes_requested,
         })
+    }
+
+    /// `(incoming, outgoing)` track counts for one peer — outgoing counts
+    /// every entry, including ones being torn down. For tests and the
+    /// future `/stats` endpoint.
+    pub fn peer_tracks(&self, id: PeerId) -> Option<(usize, usize)> {
+        self.peers
+            .get(&id)
+            .map(|p| (p.tracks_in_count(), p.tracks_out_count()))
     }
 
     /// Answer a peer's SDP offer.
@@ -105,13 +120,37 @@ impl Room {
     }
 
     /// Deliver a peer's answer to a renegotiation offer we sent.
+    ///
+    /// Every track that just went live gets a keyframe request fan-out to
+    /// its source: a fresh subscriber joins mid-GOP, and without this its
+    /// first tiles would stay black until the next PLI.
     pub fn accept_sdp_answer(&mut self, id: PeerId, sdp: &str) -> Result<(), SfuError> {
-        self.peer_mut(id)?.accept_sdp_answer(sdp)
+        let opened = self.peer_mut(id)?.accept_sdp_answer(sdp)?;
+        for (origin, mid_in) in opened {
+            if let Some(origin_peer) = self.peers.get_mut(&origin)
+                && let Err(e) = origin_peer.request_keyframe(mid_in, None, KeyframeRequestKind::Fir)
+            {
+                tracing::debug!("subscription keyframe request to {origin} failed: {e}");
+            }
+        }
+        Ok(())
     }
 
     /// Deliver a trickled ICE candidate from a peer.
     pub fn add_remote_candidate(&mut self, id: PeerId, candidate: &str) -> Result<(), SfuError> {
         self.peer_mut(id)?.add_remote_candidate(candidate)
+    }
+
+    /// Apply a (partial) mute update for a peer. Frames of a muted kind
+    /// arriving from that peer are no longer forwarded to the room.
+    pub fn set_mute(
+        &mut self,
+        id: PeerId,
+        audio_muted: Option<bool>,
+        video_muted: Option<bool>,
+    ) -> Result<(), SfuError> {
+        self.peer_mut(id)?.set_mute(audio_muted, video_muted);
+        Ok(())
     }
 
     /// The peer (if any) that accepts this input. This is the demultiplex
@@ -234,6 +273,10 @@ impl Room {
             peer.rx_frames += 1;
             if !data.contiguous {
                 peer.request_keyframe_throttled(data.mid, data.rid, KeyframeRequestKind::Fir);
+            }
+            // Muted at the source: the frame is counted but not forwarded.
+            if !peer.is_forwardable(data.mid) {
+                return;
             }
         }
 

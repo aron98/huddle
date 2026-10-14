@@ -104,14 +104,21 @@ track at the SFU. This E2E test becomes the CI gate forever after.
 *(Landed: `e2e-call` CI job — two headless-Chrome pages, inbound-rtp bytes
 asserted on both, mute propagation asserted across pages.)*
 
-### Phase 3 — **S2: N-party** *(~2 weeks; A and B parallel, converge at the end)*
+### Phase 3 — **S2: N-party** ✅ *(~2 weeks; A and B parallel, converge at the end)*
 
 - **A2:** join/leave renegotiation (add/remove forwarded tracks), forwarding
   tables, PLI fan-out on subscribe + on new-subscriber join (late joiner gets a
   keyframe, not a frozen tile), mute stops forwarding, speaking-indicator events.
+  *(Landed: stop-media renegotiation on departure (`341767c`), keyframe requests
+  from sources on every new subscription (`f5be869`), mute-gated forwarding at
+  the SFU (`ea855a6`), speaking relayed through the engine (`2ba58d7`).)*
 - **B2 (parallel):** adaptive tile grid, roster, speaking indicator UI.
+  *(Landed: Web Audio speaking detection + tile ring (`9abd9e1`, `f14f7f7`),
+  tile cleanup on `ParticipantLeft` (`351f800`).)*
 - Converge: E2E test grows to 4 tabs with join/leave churn (join late → no frozen
   tiles; leave → tiles clean up).
+  *(Landed: `e2e-call` CI job now runs four pages — late joiner receives fresh
+  media, departure removes tiles and roster rows everywhere (`7bd28bd`).)*
 
 ### Phase 4 — Feature fan-out *(~2 weeks; two features in parallel)*
 

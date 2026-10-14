@@ -240,6 +240,8 @@ mod tests {
     async fn test_state() -> AppState {
         let config = Arc::new(crate::config::Config {
             media_port: 0,
+            // Tests talk loopback-to-loopback; detection is machine-dependent.
+            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
             ..crate::config::Config::default()
         });
         let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
