@@ -313,7 +313,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
     use uuid::Uuid;
     use web_sys::MediaStream;
 
-    let remote_streams = RwSignal::<Vec<MediaStream>>::new(Vec::new());
+    let remote_streams = RwSignal::<Vec<(String, MediaStream)>>::new(Vec::new());
     let roster = RwSignal::<Vec<Participant>>::new(Vec::new());
     let speaking = RwSignal::<std::collections::HashSet<Uuid>>::new(Default::default());
     let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
@@ -372,11 +372,11 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         // self-echo so it does not render as a phantom "Guest" tile.
         let streams = remote_streams;
         let local_id = local.as_ref().map(|s| s.id());
-        peer.set_on_remote_stream(move |stream| {
-            if local_id.as_deref() == Some(stream.id().as_str()) {
+        peer.set_on_remote_stream(move |id, stream| {
+            if local_id.as_deref() == Some(id) {
                 return;
             }
-            streams.update(|list| list.push(stream));
+            streams.update(|list| list.push((id.to_owned(), stream)));
         });
         if let Some(local) = &local {
             peer.attach_stream(local);
@@ -419,8 +419,9 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                         Ok(msg) => {
                             // A departed participant's tile goes with them.
                             if let ServerMessage::ParticipantLeft { id } = &msg {
+                                let gone = id.to_string();
                                 remote_streams
-                                    .update(|list| list.retain(|s| s.id() != id.to_string()));
+                                    .update(|list| list.retain(|(sid, _)| sid != &gone));
                             }
                             roster.set(client.roster().to_vec());
                             speaking.set(client.speaking().clone());
@@ -501,9 +502,11 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
     };
 
-    // Resolve a remote stream's origin participant from its msid.
-    fn label_for(stream: &MediaStream, roster: &[Participant]) -> String {
-        Uuid::parse_str(&stream.id())
+    // Resolve a remote stream's origin participant from its msid. The id
+    // string was captured at `ontrack` time; never re-read `.id()` from
+    // the stream (unstable in Chrome, see `BrowserPeerConnection::new`).
+    fn label_for(id: &str, roster: &[Participant]) -> String {
+        Uuid::parse_str(id)
             .ok()
             .and_then(|id| roster.iter().find(|p| p.id == id))
             .map(|p| p.name.clone())
@@ -531,18 +534,18 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                         }
                     })}
 
-                <For each={move || remote_streams.get()} key=|s| s.id() let:s>
+                <For each={move || remote_streams.get()} key=|s| s.0.clone() let:s>
                     {move || {
-                        let label = label_for(&s, &roster.get());
+                        let label = label_for(&s.0, &roster.get());
                         let testid = format!("tile-{label}");
                         // The SFU labels streams with the origin
                         // participant's id, so the speaking set — keyed
                         // the same way — tells us whose tile to ring.
-                        let is_speaking = Uuid::parse_str(&s.id())
+                        let is_speaking = Uuid::parse_str(&s.0)
                             .is_ok_and(|id| speaking.get().contains(&id));
                         view! {
                             <VideoTile
-                                stream=s.clone()
+                                stream=s.1.clone()
                                 label=label
                                 muted=false
                                 testid=testid
