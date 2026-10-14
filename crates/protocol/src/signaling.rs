@@ -113,6 +113,12 @@ pub enum ClientMessage {
     Speaking {
         speaking: bool,
     },
+    /// Sent just before the screen-share track is added to the peer
+    /// connection (and just after it is removed), so the SFU can tell the
+    /// incoming screen m-line apart from the camera one.
+    Sharing {
+        sharing: bool,
+    },
     /// Graceful leave; the socket closing implies the same.
     Leave,
 }
@@ -167,6 +173,13 @@ pub enum ServerMessage {
     Speaking {
         id: ParticipantId,
         speaking: bool,
+    },
+    /// Broadcast screen-share state, including echo back to the
+    /// originator. Drives the "X is sharing" indicator and tile cleanup
+    /// when a share stops.
+    Sharing {
+        id: ParticipantId,
+        sharing: bool,
     },
     Error {
         code: ErrorCode,
@@ -311,6 +324,25 @@ mod tests {
         assert_eq!(
             v,
             json!({"type": "speaking", "id": Uuid::nil().to_string(), "speaking": false})
+        );
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn sharing_round_trips_both_directions() {
+        let msg = ClientMessage::Sharing { sharing: true };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "sharing", "sharing": true}));
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+
+        let msg = ServerMessage::Sharing {
+            id: Uuid::nil(),
+            sharing: false,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "sharing", "id": Uuid::nil().to_string(), "sharing": false})
         );
         assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
     }

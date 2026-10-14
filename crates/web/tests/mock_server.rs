@@ -128,6 +128,11 @@ impl MockState {
                 id: ALICE_ID,
                 speaking: *speaking,
             }],
+            // Screen-share state; scripted in a follow-up commit.
+            ClientMessage::Sharing { sharing } => vec![ServerMessage::Sharing {
+                id: ALICE_ID,
+                sharing: *sharing,
+            }],
             ClientMessage::SdpAnswer { .. } | ClientMessage::Leave => vec![],
         }
     }

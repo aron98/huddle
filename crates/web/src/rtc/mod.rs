@@ -302,6 +302,9 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 }
                 Ok(())
             }
+            // Screen-share broadcast; wired into the roster in a
+            // follow-up commit.
+            ServerMessage::Sharing { .. } => Ok(()),
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }
