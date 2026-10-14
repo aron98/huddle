@@ -45,29 +45,16 @@ jobs:
       - name: helm lint
         run: helm lint deploy/helm/huddle
 
-  e2e-stub:
-    name: headless chrome render check
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: install trunk
-        run: |
-          curl -fsSL \
-            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C /usr/local/bin
-          trunk --version
-
-      - name: e2e stub
-        run: scripts/e2e-stub.sh
-
-  e2e-call:
-    name: two person call over the sfu
+  # One e2e job: build once, then run every test/e2e/e2e-*.mjs suite
+  # sequentially through test/e2e/run-all.mjs. The runner discovers
+  # suites by filename, so a new e2e test is just a new script — no
+  # workflow edit. Failures list every broken suite (the runner keeps
+  # going after the first failure), and each suite runs under its own
+  # process-group kill timer so a hung script cannot wedge the job.
+  # Deliberately separate from `checks`: fmt/clippy/tests are fast and
+  # orthogonal to browser flake, so a bisect keeps cheap signal.
+  e2e:
+    name: browser e2e suites
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -111,102 +98,13 @@ jobs:
           npx --yes @puppeteer/browsers install chrome-headless-shell@155.0.8059.39 --path "$HOME/chrome"
           echo "CHROME_BIN=$(find "$HOME/chrome" -type f -name chrome-headless-shell)" >> "$GITHUB_ENV"
 
-      - name: e2e call
-        run: node e2e-call.mjs
-        working-directory: test/e2e
-
-  e2e-auth:
-    name: magic link and dashboard e2e
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: install trunk
-        run: |
-          curl -fsSL \
-            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C /usr/local/bin
-          trunk --version
-
-      - name: build web client
-        run: trunk build
-        working-directory: crates/web
-
-      - name: build server
-        run: cargo build -q -p huddle-server
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: test/e2e/package-lock.json
-
-      - name: npm ci
-        run: npm ci
-        working-directory: test/e2e
-
-      # Same headless-shell pin and rationale as the e2e-call job.
-      - name: install chrome-headless-shell
-        run: |
-          npx --yes @puppeteer/browsers install chrome-headless-shell@155.0.8059.39 --path "$HOME/chrome"
-          echo "CHROME_BIN=$(find "$HOME/chrome" -type f -name chrome-headless-shell)" >> "$GITHUB_ENV"
-
-      - name: e2e auth
-        run: node e2e-auth.mjs
-        working-directory: test/e2e
-
-  e2e-turn:
-    name: turn-relayed call over coturn
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: toolchain (from rust-toolchain.toml)
-        run: rustup toolchain install --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: install trunk
-        run: |
-          curl -fsSL \
-            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C /usr/local/bin
-          trunk --version
-
-      - name: build web client
-        run: trunk build
-        working-directory: crates/web
-
-      - name: build server
-        run: cargo build -q -p huddle-server
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: test/e2e/package-lock.json
-
-      - name: npm ci
-        run: npm ci
-        working-directory: test/e2e
-
-      # Same headless-shell pin and rationale as the e2e-call job.
-      - name: install chrome-headless-shell
-        run: |
-          npx --yes @puppeteer/browsers install chrome-headless-shell@155.0.8059.39 --path "$HOME/chrome"
-          echo "CHROME_BIN=$(find "$HOME/chrome" -type f -name chrome-headless-shell)" >> "$GITHUB_ENV"
-
-      # coturn provides the TURN relay the test asserts against; the
-      # e2e spawns its own turnserver instance (config file, port 3479)
-      # so a distribution's default service can never conflict.
+      # coturn provides the TURN relay the e2e-turn suite asserts
+      # against; the suite spawns its own turnserver instance (config
+      # file, port 3479) so a distribution's default service can never
+      # conflict.
       - name: install coturn
         run: sudo apt-get update && sudo apt-get install -y coturn
 
-      - name: e2e turn
-        run: node e2e-turn.mjs
+      - name: e2e suites
+        run: node run-all.mjs
         working-directory: test/e2e
