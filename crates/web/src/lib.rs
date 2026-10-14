@@ -413,25 +413,33 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         };
 
         loop {
+            // Read inside the select but handle OUTSIDE it: handling a server
+            // message awaits browser promises and sends the SDP answer, so a
+            // dropped future (e.g. a speaking flip winning the select mid-way)
+            // would leave the answer unsent and wedge the peer's negotiation
+            // forever. `read_server_message` is cancel-safe; the handling
+            // future below runs to completion.
             futures::select! {
-                message = client.next_server_message().fuse() => {
-                    match message {
-                        Ok(msg) => {
-                            // A departed participant's tile goes with them.
-                            if let ServerMessage::ParticipantLeft { id } = &msg {
-                                let gone = id.to_string();
-                                remote_streams
-                                    .update(|list| list.retain(|(sid, _)| sid != &gone));
-                            }
-                            roster.set(client.roster().to_vec());
-                            speaking.set(client.speaking().clone());
-                        }
-                        Err(e) => {
+                message = client.read_server_message().fuse() => match message {
+                    Ok(msg) => {
+                        if let Err(e) = client.handle_server_message(msg.clone()).await {
                             status.set(Some(format!("Disconnected: {e}")));
                             break;
                         }
+                        // A departed participant's tile goes with them.
+                        if let ServerMessage::ParticipantLeft { id } = &msg {
+                            let gone = id.to_string();
+                            remote_streams
+                                .update(|list| list.retain(|(sid, _)| sid != &gone));
+                        }
+                        roster.set(client.roster().to_vec());
+                        speaking.set(client.speaking().clone());
                     }
-                }
+                    Err(e) => {
+                        status.set(Some(format!("Disconnected: {e}")));
+                        break;
+                    }
+                },
                 action = ui_rx.select_next_some() => {
                     match action {
                         UiAction::Mute { audio_muted, video_muted } => {

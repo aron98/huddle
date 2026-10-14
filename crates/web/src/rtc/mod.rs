@@ -217,14 +217,27 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
 
     /// Read and process the next server message. Returns the raw message so
     /// the UI layer can react (draw tiles, update chat, show errors).
+    ///
+    /// NOT cancel-safe: `handle_server_message` awaits browser promises and
+    /// sends signaling replies; dropping the returned future mid-flight can
+    /// lose the reply. UI loops that race this against other futures should
+    /// use [`RtcClient::read_server_message`] inside the `select!` and pass
+    /// the result to [`RtcClient::handle_server_message`] afterwards.
     pub async fn next_server_message(&mut self) -> Result<ServerMessage, RtcError> {
+        let message = self.read_server_message().await?;
+        self.handle_server_message(message.clone()).await?;
+        Ok(message)
+    }
+
+    /// Receive the next server message from the signaling stream without
+    /// applying it. Cancel-safe: the only side effect on cancellation is the
+    /// message staying buffered in the stream.
+    pub async fn read_server_message(&mut self) -> Result<ServerMessage, RtcError> {
         let Some(message) = self.signaling.next_message().await else {
             self.state = SessionState::Closed;
             return Err(RtcError::Closed);
         };
-        let message = message?;
-        self.handle_server_message(message.clone()).await?;
-        Ok(message)
+        Ok(message?)
     }
 
     /// Apply one server message to our state, dispatching side effects to the
