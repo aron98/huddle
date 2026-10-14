@@ -1,13 +1,16 @@
 #!/usr/bin/env node
-// N-party end-to-end call test with join/leave churn.
+// N-party end-to-end call test with join/leave churn, screen share, and
+// chat persistence.
 //
 // Boots a real huddle server, opens the meeting in headless Chrome
 // pages with fake cameras/microphones, and asserts that each page
 // receives the others' audio *and* video through the SFU (there is no
 // peer-to-peer path at all), that a late joiner gets fresh media
 // rather than frozen tiles, that a departing participant's tile and
-// roster entry disappear everywhere, and that mute state broadcasts
-// propagate.
+// roster entry disappear everywhere, that mute state broadcasts
+// propagate, that a shared screen reaches subscribers as a live,
+// decoding tile (and withdraws when stopped), and that chat survives
+// a participant reloading and rejoining.
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -167,6 +170,23 @@ async function mediaProbe(page, peer) {
   }, peer);
 }
 
+// Snapshot of inbound video ssrcs → decoded frames. ssrcs are stable
+// RTP identifiers, unlike the provisional track/stream wrapper objects
+// Chrome hands out at ontrack time (same quirk class as the unstable
+// MediaStream.id in the tile dedupe).
+async function videoInboundSnapshot(page) {
+  return page.evaluate(async () => {
+    const stats = await window.__huddlePc.getStats();
+    const live = {};
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+        live[report.ssrc] = report.framesDecoded ?? 0;
+      }
+    });
+    return live;
+  });
+}
+
 const stateDump = (page, who) =>
   page
     .evaluate(() => {
@@ -322,6 +342,96 @@ async function main() {
       { timeout: 30_000, polling: 250 },
     );
     console.log('bob sees alice (mic off, cam on)');
+
+    console.log('asserting screen share reaches subscribers');
+    // Which video ssrcs exist before the share starts.
+    const videoBefore = await videoInboundSnapshot(bob);
+    await alice.click('[data-testid="share-screen"]');
+    // The start flow (getDisplayMedia → announce → renegotiate) finishes
+    // when the button flips to its stop form.
+    await alice
+      .waitForFunction(
+        () =>
+          document.querySelector('[data-testid="share-screen"]')?.textContent.includes('Stop sharing'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(alice, 'alice').catch(() => {});
+        fail(`alice: screen share never started (status: ${await statusText(alice)})`);
+      });
+    await waitTile(bob, '[data-testid="tile-alice-screen"]', 'bob');
+    await waitTile(carol, '[data-testid="tile-alice-screen"]', 'carol');
+    await bob.waitForFunction(
+      () => document.querySelector('[data-testid="roster-alice"]')?.textContent.includes('sharing'),
+      { timeout: 30_000, polling: 250 },
+    );
+    // The screen must be live media: a NEW video ssrc (none of the
+    // pre-share ones) that is actually decoding frames.
+    let screenSnapshot = null;
+    await waitFor(
+      'bob receiving the shared screen',
+      async () => {
+        screenSnapshot = await videoInboundSnapshot(bob);
+        const fresh = Object.keys(screenSnapshot).filter((s) => !(s in videoBefore));
+        return fresh.length > 0 && fresh.every((s) => screenSnapshot[s] > 0);
+      },
+      60_000,
+    ).catch(async () => {
+      await stateDump(bob, 'bob').catch(() => {});
+      fail(
+        `bob: shared screen not decoding (before: ${JSON.stringify(videoBefore)}, ` +
+          `after: ${JSON.stringify(screenSnapshot)})`,
+      );
+    });
+    console.log('bob sees a fresh decoding video ssrc for the shared screen');
+
+    console.log('alice stops sharing; the screen tile withdraws everywhere');
+    await alice.click('[data-testid="share-screen"]');
+    for (const [page, who] of [
+      [bob, 'bob'],
+      [carol, 'carol'],
+    ]) {
+      await page
+        .waitForFunction(() => !document.querySelector('[data-testid="tile-alice-screen"]'), {
+          timeout: 30_000,
+          polling: 250,
+        })
+        .catch(async () => {
+          await stateDump(page, who).catch(() => {});
+          fail(`${who}: alice's screen tile never withdrew`);
+        });
+    }
+
+    console.log('asserting chat and its persistence across a rejoin');
+    await alice.type('[data-testid="chat-input"]', 'hello from alice');
+    await alice.click('[data-testid="chat-send"]');
+    await bob
+      .waitForFunction(
+        () =>
+          [...document.querySelectorAll('[data-testid="chat-log"] li')].some((li) =>
+            li.textContent.includes('hello from alice'),
+          ),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(bob, 'bob').catch(() => {});
+        fail('bob never saw the chat message');
+      });
+    // Reload bob: the server replays persisted history to rejoiners.
+    await joinAs(bob, code, 'bob');
+    await bob
+      .waitForFunction(
+        () =>
+          [...document.querySelectorAll('[data-testid="chat-log"] li')].some((li) =>
+            li.textContent.includes('hello from alice'),
+          ),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(bob, 'bob').catch(() => {});
+        fail('chat history did not survive bob reloading and rejoining');
+      });
+    console.log('bob rejoined and sees the persisted chat history');
 
     console.log('PASS: n-party call e2e green');
   } catch (err) {
