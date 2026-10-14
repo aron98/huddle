@@ -37,6 +37,14 @@ jobs:
           cargo check -p huddle-web --target wasm32-unknown-unknown
           cargo clippy -p huddle-web --target wasm32-unknown-unknown -- -D warnings
 
+      - name: install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint
+        run: helm lint deploy/helm/huddle
+
   e2e-stub:
     name: headless chrome render check
     runs-on: ubuntu-24.04

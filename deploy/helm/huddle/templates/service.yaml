@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "huddle.fullname" . }}
+  labels:
+    app: {{ include "huddle.fullname" . }}
+spec:
+  {{- if .Values.hostNetwork }}
+  # With hostNetwork the pod serves the node's ports directly; the
+  # Service exists for in-cluster DNS convenience only.
+  type: {{ .Values.service.type }}
+  clusterIP: None
+  {{- else }}
+  type: {{ .Values.service.type }}
+  {{- end }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    app: {{ include "huddle.fullname" . }}

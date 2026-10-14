@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "huddle.fullname" . }}
+  labels:
+    app: {{ include "huddle.fullname" . }}
+spec:
+  # One replica per node: meeting state lives in this pod's SFU.
+  replicas: 1
+  strategy:
+    # Rolling would kill meetings on every deploy; take the pod down
+    # deliberately (kubectl rollout restart during a quiet window).
+    type: Recreate
+  selector:
+    matchLabels:
+      app: {{ include "huddle.fullname" . }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "huddle.fullname" . }}
+    spec:
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      containers:
+        - name: huddle
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              {{- if .Values.hostNetwork }}
+              hostPort: {{ .Values.service.port }}
+              {{- end }}
+            - name: media
+              protocol: UDP
+              containerPort: {{ .Values.server.mediaPort }}
+              {{- if .Values.hostNetwork }}
+              hostPort: {{ .Values.server.mediaPort }}
+              {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "huddle.fullname" . }}
+          {{- if or .Values.server.sessionSecret .Values.existingSecret }}
+          env:
+            - name: HUDDLE_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.existingSecret | default (printf "%s-secret" (include "huddle.fullname" .)) }}
+                  key: HUDDLE_SESSION_SECRET
+          {{- else }}
+          # No secret configured: huddle falls back to a random key per
+          # boot with a warning (sessions do not survive restarts).
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "huddle.fullname" . }}
+        {{- else }}
+        - name: data
+          emptyDir: {}
+        {{- end }}
