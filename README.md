@@ -10,9 +10,10 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Phases 0–5 complete** — the foundations, the four independent tracks, the
-two-person call, n-party support, screen share + chat, and scheduling with
-organizer auth from the [implementation plan](docs/implementation-plan.md) are
+🚧 **Phases 0–6 complete** — the foundations, the four independent tracks, the
+two-person call, n-party support, screen share + chat, scheduling with
+organizer auth, and the hardening pass (metrics, security, TURN, deploy
+artifacts) from the [implementation plan](docs/implementation-plan.md) are
 done:
 
 - `protocol` — v1 signaling and REST wire messages, including speaking
@@ -21,25 +22,37 @@ done:
   UI, `/ws` signaling sessions, a media engine thread driving one SFU room
   per meeting over UDP, chat persistence with history replay on join,
   magic-link login with hashed single-use tokens (lettre delivery with a log
-  fallback), signed session cookies, organizer-owned meetings, and ICS export.
+  fallback), signed session cookies, organizer-owned meetings, ICS export,
+  a Prometheus `/metrics` endpoint (per-room and per-peer counters, bitrates,
+  RTT, loss), per-IP rate limits on auth requests and new websocket
+  connections, a 256 KiB cap on signaling frames, and a CSP (with a
+  runtime-computed hash allowance for the trunk bootstrap script) plus
+  `nosniff` on all served UI assets.
 - `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
   SDP answering, media forwarding, keyframe fan-out to new subscribers, track
-  recycling when participants leave, mute-gated forwarding, and a screen-share
+  recycling when participants leave, mute-gated forwarding, a screen-share
   lifecycle (labeled `-screen` streams, reshare on the same transceiver,
-  screen tracks immune to camera mute); tested with synthetic in-process
-  clients and a real-UDP loopback.
+  screen tracks immune to camera mute), and per-peer `PeerStats` snapshots
+  (bytes, bitrates, RTT, loss) fed by str0m's stats events — tested with
+  synthetic in-process clients and a real-UDP loopback.
 - `web` — Leptos prejoin page (camera preview, device pickers, name), an
   `RtcClient` signaling driver tested against a mock server, and an in-call
   view with an adaptive tile grid, roster, speaking indicators (Web Audio RMS
   detection), screen share with dedicated tiles, an in-call chat sidebar, and
-  mic/camera/share/leave controls — plus a login page and a meeting dashboard.
-- Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check,
-  a four-browser-page call e2e with join/leave churn, screen share, and
-  chat-across-reload assertions that verify media flows *through the server*,
-  and a magic-link + dashboard e2e), multi-stage Dockerfile, dev compose stack
-  with coturn.
+  mic/camera/share/leave controls — plus a login page, a meeting dashboard,
+  and a `?turn=relay` test knob that forces every ICE candidate through the
+  configured TURN relay.
+- Infra — CI (fmt, clippy native + wasm32, tests, helm lint, headless-Chrome
+  render check, a four-browser-page call e2e with join/leave churn, screen
+  share, and chat-across-reload assertions that verify media flows *through
+  the server*, a magic-link + dashboard e2e, and a TURN-relayed call e2e
+  that proves browser → coturn → SFU with relay-only ICE), multi-stage
+  Dockerfile, dev compose stack with coturn, a Helm chart, and a release
+  workflow that ships the web client baked into one static musl binary.
 
-**Next:** phase 6 — hardening (coturn guide, `/stats`, security, Helm).
+**MVP complete.** Post-MVP backlog: OIDC/SAML identity providers, simulcast,
+per-meeting passcodes, E2EE, recording, a Cloudflare Workers port, Tauri
+desktop, RRULE support (see the [implementation plan](docs/implementation-plan.md)).
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
@@ -121,9 +134,8 @@ Linux Chrome does, macOS Chrome does not (it sends from the default
 interface, and the mismatched reply source fails ICE validation). With
 auto-detection you do not need to care about this on any platform.
 
-Docker: `docker build -t huddle .` produces the single-binary image; and
-`docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
-credentials).
+Deployment (Docker, compose, Helm, release tarballs, coturn, firewall
+ports) is covered in [Self-hosting](#self-hosting) below.
 
 ## Observability
 
@@ -163,6 +175,81 @@ scrape_configs:
     static_configs:
       - targets: ["huddle.internal:3000"]
 ```
+
+## Self-hosting
+
+### Ports and firewall
+
+A stock huddle needs exactly three holes in the firewall:
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| 3000 | TCP | web UI, REST API, and websocket signaling (`HUDDLE_BIND`) |
+| 40000 | UDP | SFU media socket (`HUDDLE_MEDIA_PORT`) — one port for all calls |
+| 3478 + 49160–49200 | UDP | coturn: TURN listener + relay port range (optional but recommended) |
+
+The two huddle ports must be open to every participant's browser; the coturn
+range only matters when you run the TURN companion (below). A browser that
+cannot reach the UDP media port directly will fall back to TURN — which is
+why coturn matters even for small self-hosted setups behind NAT.
+
+### coturn (TURN relay)
+
+[coturn](https://github.com/coturn/coturn) gives browsers a relay when their
+own network blocks direct UDP (corporate firewalls, CGNAT, hotel wifi). A
+minimal `turnserver.conf`:
+
+```conf
+listening-port=3478
+fingerprint
+lt-cred-mech
+realm=meet.example.com
+user=huddle:<a-long-random-password>
+min-port=49160
+max-port=49200
+no-cli
+# TLS: uncomment once you have certs (letsencrypt or otherwise)
+# listening-ip= and relay-ip= if the box has several interfaces
+```
+
+Then tell huddle to advertise it (env var or `huddle.toml`):
+
+```toml
+# huddle.toml
+[[ice_servers]]
+urls = ["turn:meet.example.com:3478"]
+username = "huddle"
+credential = "<the same long random password>"
+```
+
+Browsers get the relay in their `Welcome` and use it only when direct
+connectivity fails. For a quick check of the whole chain, the web client
+supports `?turn=relay` — the call then refuses every non-relayed candidate,
+which is exactly what the TURN e2e in CI asserts against a real local
+coturn.
+
+Production checklist: real credentials (not the dev pair), TLS on 5349 for
+clients that split-tunnel TCP, and — unless you are building an internal
+setup — do **not** copy `allow-loopback-peers` from the e2e configs; coturn
+refuses loopback peers by default for good reason.
+
+### Docker / Kubernetes
+
+Docker: `docker build -t huddle .` produces the single-binary image; and
+`docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
+credentials).
+
+Kubernetes: the [Helm chart](deploy/helm/huddle) deploys one pod with the web
+client embedded in the binary. It defaults to host networking because a k8s
+Service cannot proxy the SFU's UDP media correctly for ICE — the advertised
+candidate must be directly reachable. `helm install huddle deploy/helm/huddle
+--set server.baseUrl=https://meet.example.com` and check `helm show values`
+for the knobs (`server.publicIp`, `server.iceServers`, an existing session
+secret, persistence).
+
+Releases: pushing a `v*` tag makes CI build a static musl binary with the web
+client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
+(+ sha256) to the GitHub release.
 
 ## License
 
