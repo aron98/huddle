@@ -48,4 +48,23 @@ pub trait PeerConnection {
 
     /// Drain locally gathered candidates so they can be trickled out.
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate>;
+
+    /// Attach the staged screen track so the next offer announces it.
+    ///
+    /// How a track comes to be "staged" is implementation-specific (the
+    /// browser keeps a handle for its `getDisplayMedia` flow); the driver
+    /// only needs to know the attachment happened before it renegotiates.
+    async fn add_screen_track(&mut self) -> Result<(), PeerError> {
+        Err(PeerError::Failed(
+            "screen share is not supported".to_owned(),
+        ))
+    }
+
+    /// Detach the track attached by [`PeerConnection::add_screen_track`],
+    /// so the next offer withdraws it.
+    async fn remove_screen_track(&mut self) -> Result<(), PeerError> {
+        Err(PeerError::Failed(
+            "screen share is not supported".to_owned(),
+        ))
+    }
 }

@@ -63,8 +63,7 @@ pub enum EngineCommand {
     /// Relay a chat message to everyone in the meeting.
     Chat {
         code: String,
-        id: Uuid,
-        body: String,
+        message: huddle_protocol::ChatMessage,
     },
     /// Update a participant's mute state and broadcast it.
     Mute {
@@ -78,6 +77,12 @@ pub enum EngineCommand {
         code: String,
         id: Uuid,
         speaking: bool,
+    },
+    /// Update a participant's share state and broadcast it.
+    Sharing {
+        code: String,
+        id: Uuid,
+        sharing: bool,
     },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
@@ -128,8 +133,8 @@ impl EngineHandle {
         });
     }
 
-    pub fn chat(&self, code: String, id: Uuid, body: String) {
-        let _ = self.tx.send(EngineCommand::Chat { code, id, body });
+    pub fn chat(&self, code: String, message: huddle_protocol::ChatMessage) {
+        let _ = self.tx.send(EngineCommand::Chat { code, message });
     }
 
     pub fn mute(
@@ -149,6 +154,10 @@ impl EngineHandle {
 
     pub fn speaking(&self, code: String, id: Uuid, speaking: bool) {
         let _ = self.tx.send(EngineCommand::Speaking { code, id, speaking });
+    }
+
+    pub fn sharing(&self, code: String, id: Uuid, sharing: bool) {
+        let _ = self.tx.send(EngineCommand::Sharing { code, id, sharing });
     }
 
     pub fn leave(&self, code: String, id: Uuid) {
@@ -378,7 +387,7 @@ impl Engine {
                     tracing::debug!(peer = %id, "bad ice candidate: {e}");
                 }
             }
-            EngineCommand::Chat { code, id, body } => self.relay_chat(&code, id, body),
+            EngineCommand::Chat { code, message } => self.relay_chat(&code, message),
             EngineCommand::Mute {
                 code,
                 id,
@@ -387,6 +396,9 @@ impl Engine {
             } => self.set_mute(&code, id, audio_muted, video_muted),
             EngineCommand::Speaking { code, id, speaking } => {
                 self.relay_speaking(&code, id, speaking);
+            }
+            EngineCommand::Sharing { code, id, sharing } => {
+                self.set_sharing(&code, id, sharing);
             }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Packet { source, bytes } => self.handle_packet(source, &bytes),
@@ -485,20 +497,17 @@ impl Engine {
         }
     }
 
-    fn relay_chat(&mut self, code: &str, id: Uuid, body: String) {
+    /// Relay a chat message verbatim. The session built it (and persisted
+    /// it); the engine only needs to confirm the sender is still here.
+    fn relay_chat(&mut self, code: &str, message: huddle_protocol::ChatMessage) {
         let Some(inst) = self.meetings.get_mut(code) else {
             return;
         };
-        let Some(sender) = inst.participants.get(&id) else {
+        if let Some(sender) = message.sender_id
+            && !inst.participants.contains_key(&sender)
+        {
             return;
-        };
-        let message = huddle_protocol::ChatMessage {
-            id: Uuid::new_v4(),
-            sender_id: Some(id),
-            sender_name: sender.name.clone(),
-            body,
-            sent_at: time::OffsetDateTime::now_utc(),
-        };
+        }
         let msg = ServerMessage::Chat { message };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
@@ -550,6 +559,25 @@ impl Engine {
             return;
         }
         let msg = ServerMessage::Speaking { id, speaking };
+        for out in inst.outs.values() {
+            let _ = out.send(msg.clone());
+        }
+    }
+
+    /// Update a participant's share state, mirror it into the room so
+    /// the SFU stops/resumes screen forwarding, and tell everyone.
+    fn set_sharing(&mut self, code: &str, id: Uuid, sharing: bool) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        let Some(p) = inst.participants.get_mut(&id) else {
+            return;
+        };
+        p.sharing = sharing;
+        if let Err(e) = inst.room.set_sharing(id, sharing) {
+            tracing::debug!(peer = %id, "room set_sharing: {e}");
+        }
+        let msg = ServerMessage::Sharing { id, sharing };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
         }
@@ -706,9 +734,22 @@ mod tests {
         engine.ice("ABCD-EFGH-JKLM".into(), alice, "junk".into());
 
         // The engine still works for the same session.
-        engine.chat("ABCD-EFGH-JKLM".into(), alice, "still here".into());
+        engine.chat(
+            "ABCD-EFGH-JKLM".into(),
+            chat_message(alice, "alice", "still here"),
+        );
         let msg = next(&mut alice_rx).await;
         assert!(matches!(msg, ServerMessage::Chat { .. }), "got {msg:?}");
+    }
+
+    fn chat_message(sender: Uuid, name: &str, body: &str) -> huddle_protocol::ChatMessage {
+        huddle_protocol::ChatMessage {
+            id: Uuid::new_v4(),
+            sender_id: Some(sender),
+            sender_name: name.into(),
+            body: body.into(),
+            sent_at: time::OffsetDateTime::now_utc(),
+        }
     }
 
     #[tokio::test]
@@ -754,7 +795,10 @@ mod tests {
         next(&mut alice_rx).await; // alice's welcome
         next(&mut alice_rx).await; // ParticipantJoined(bob) on alice's side
 
-        engine.chat("ABCD-EFGH-JKLM".into(), alice, "hello world".into());
+        engine.chat(
+            "ABCD-EFGH-JKLM".into(),
+            chat_message(alice, "alice", "hello world"),
+        );
 
         for rx in [&mut alice_rx, &mut bob_rx] {
             let msg = next(rx).await;
@@ -815,6 +859,46 @@ mod tests {
                 assert_eq!(s, speaking);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sharing_broadcasts_to_everyone_and_updates_the_roster() {
+        let (engine, _keep) = test_engine(8);
+        let (alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        next(&mut bob_rx).await; // welcome
+        next(&mut alice_rx).await; // welcome
+        next(&mut alice_rx).await; // bob joined
+
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, true);
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, false);
+
+        for sharing in [true, false] {
+            for rx in [&mut alice_rx, &mut bob_rx] {
+                let msg = next(rx).await;
+                let ServerMessage::Sharing { id, sharing: s } = msg else {
+                    panic!("expected sharing, got {msg:?}");
+                };
+                assert_eq!(id, alice);
+                assert_eq!(s, sharing);
+            }
+        }
+
+        // A late joiner's Welcome roster reflects the current share state.
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, true);
+        next(&mut alice_rx).await; // echo to alice
+        next(&mut bob_rx).await; // relay to bob
+
+        let (_carol, mut carol_rx) = join(&engine, "ABCD-EFGH-JKLM", "carol").await;
+        let welcome = next(&mut carol_rx).await;
+        let ServerMessage::Welcome { roster, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        let alice_in_roster = roster
+            .iter()
+            .find(|p| p.name == "alice")
+            .expect("alice in roster");
+        assert!(alice_in_roster.sharing);
     }
 
     #[tokio::test]

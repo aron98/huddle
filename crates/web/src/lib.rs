@@ -298,7 +298,19 @@ enum UiAction {
         video_muted: Option<bool>,
     },
     Speaking(bool),
+    ShareScreen(ScreenCommand),
+    Chat {
+        body: String,
+    },
     Leave,
+}
+
+/// Which direction the share-screen flow goes.
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+enum ScreenCommand {
+    Start,
+    Stop,
 }
 
 /// The in-call page: media tiles, roster, and controls. One spawned task
@@ -319,6 +331,10 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
     let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
+    let sharing = RwSignal::new(false);
+    // Chat messages (live relay + history replay) shown in the sidebar.
+    let chat = RwSignal::<Vec<huddle_protocol::ChatMessage>>::new(Vec::new());
+    let chat_draft = RwSignal::new(String::new());
 
     let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
     // The session task reports our own speaking through the same channel.
@@ -394,6 +410,12 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
         status.set(None);
 
+        // The screen-share flow reports the browser's own stop-sharing
+        // signal (track ended) back into the session through the same
+        // channel the buttons use; clone the sender before the speaking
+        // watcher below moves it into its closure.
+        let screen_ui_tx = task_ui_tx.clone();
+
         // Best-effort speaking detection: watch our own level and report
         // flips through the session. Failure is non-fatal — the call just
         // runs without the indicator.
@@ -412,6 +434,10 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             None => None,
         };
 
+        // Keeps the browser-native stop-sharing handler alive while the
+        // share is live; dropped when we stop (or when a new share starts).
+        let mut screen_end_guard: Option<media::TrackEndGuard> = None;
+
         loop {
             // Read inside the select but handle OUTSIDE it: handling a server
             // message awaits browser promises and sends the SDP answer, so a
@@ -426,14 +452,24 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                             status.set(Some(format!("Disconnected: {e}")));
                             break;
                         }
-                        // A departed participant's tile goes with them.
+                        // A departed participant's tiles go with them: the
+                        // camera stream carries their id, the screen
+                        // stream carries `{id}-screen`.
                         if let ServerMessage::ParticipantLeft { id } = &msg {
                             let gone = id.to_string();
+                            let screen = format!("{gone}-screen");
                             remote_streams
-                                .update(|list| list.retain(|(sid, _)| sid != &gone));
+                                .update(|list| list.retain(|(sid, _)| sid != &gone && sid != &screen));
+                        }
+                        // A stopped share withdraws the owner's screen tile.
+                        if let ServerMessage::Sharing { id, sharing: false } = &msg {
+                            let screen = format!("{id}-screen");
+                            remote_streams
+                                .update(|list| list.retain(|(sid, _)| sid != &screen));
                         }
                         roster.set(client.roster().to_vec());
                         speaking.set(client.speaking().clone());
+                        chat.set(client.chat_log().to_vec());
                     }
                     Err(e) => {
                         status.set(Some(format!("Disconnected: {e}")));
@@ -450,6 +486,57 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                         }
                         UiAction::Speaking(speaking) => {
                             if let Err(e) = client.set_speaking(speaking).await {
+                                status.set(Some(format!("Disconnected: {e}")));
+                                break;
+                            }
+                        }
+                        UiAction::ShareScreen(command) => match command {
+                            ScreenCommand::Start => {
+                                // Acquire the capture first: a denied
+                                // picker is a UI hiccup, not a call ender.
+                                match media::request_screen().await {
+                                    Ok((stream, track)) => {
+                                        client
+                                            .peer_mut()
+                                            .screen_share_handle()
+                                            .stage(track.clone(), stream);
+                                        let stop_tx = screen_ui_tx.clone();
+                                        let guard = media::watch_track_ended(&track, move || {
+                                            let _ = stop_tx.unbounded_send(
+                                                UiAction::ShareScreen(ScreenCommand::Stop),
+                                            );
+                                        });
+                                        // Reading the old guard via `replace` also
+                                        // drops it — one share watcher at a time.
+                                        screen_end_guard.replace(guard);
+                                        match client.start_screen_share().await {
+                                            Ok(()) => sharing.set(true),
+                                            Err(e) => {
+                                                screen_end_guard.take();
+                                                sharing.set(false);
+                                                status.set(Some(format!("Screen share failed: {e}")));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        status.set(Some(format!("Screen share unavailable: {e}")));
+                                    }
+                                }
+                            }
+                            ScreenCommand::Stop => {
+                                // Dropping the watcher detaches `onended`; the
+                                // task keeps no share state of its own.
+                                screen_end_guard.take();
+                                sharing.set(false);
+                                if let Err(e) = client.stop_screen_share().await {
+                                    status.set(Some(format!("Disconnected: {e}")));
+                                    break;
+                                }
+                            }
+                        },
+                        UiAction::Chat { body } => {
+                            if let Err(e) = client.send_chat(body).await {
                                 status.set(Some(format!("Disconnected: {e}")));
                                 break;
                             }
@@ -509,6 +596,42 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             let _ = ui_tx.unbounded_send(UiAction::Leave);
         }
     };
+    let share = {
+        let ui_tx = ui_tx.clone();
+        move |_| {
+            let command = if sharing.get_untracked() {
+                ScreenCommand::Stop
+            } else {
+                ScreenCommand::Start
+            };
+            let _ = ui_tx.unbounded_send(UiAction::ShareScreen(command));
+        }
+    };
+
+    // Send the chat draft, shared by the button and the Enter key.
+    fn submit_chat_body(
+        chat_draft: RwSignal<String>,
+        ui_tx: &futures::channel::mpsc::UnboundedSender<UiAction>,
+    ) {
+        let body = chat_draft.get_untracked().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        chat_draft.set(String::new());
+        let _ = ui_tx.unbounded_send(UiAction::Chat { body });
+    }
+    let on_send_click = {
+        let ui_tx = ui_tx.clone();
+        move |_: web_sys::MouseEvent| submit_chat_body(chat_draft, &ui_tx)
+    };
+    let on_send_key = {
+        let ui_tx = ui_tx.clone();
+        move |ev: web_sys::KeyboardEvent| {
+            if ev.key() == "Enter" {
+                submit_chat_body(chat_draft, &ui_tx);
+            }
+        }
+    };
 
     // Resolve a remote stream's origin participant from its msid. The id
     // string was captured at `ontrack` time; never re-read `.id()` from
@@ -538,19 +661,31 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                                 muted=true
                                 testid="tile-you".to_string()
                                 speaking=false
+                                screen=false
                             />
                         }
                     })}
 
                 <For each={move || remote_streams.get()} key=|s| s.0.clone() let:s>
                     {move || {
-                        let label = label_for(&s.0, &roster.get());
-                        let testid = format!("tile-{label}");
-                        // The SFU labels streams with the origin
-                        // participant's id, so the speaking set — keyed
-                        // the same way — tells us whose tile to ring.
-                        let is_speaking = Uuid::parse_str(&s.0)
-                            .is_ok_and(|id| speaking.get().contains(&id));
+                        // The SFU labels forwarded camera streams with the
+                        // origin participant's id and screen streams with
+                        // `{id}-screen`, so the suffix decides the tile.
+                        let (origin, is_screen) = match s.0.strip_suffix("-screen") {
+                            Some(origin) => (origin, true),
+                            None => (s.0.as_str(), false),
+                        };
+                        let base = label_for(origin, &roster.get());
+                        // The speaking set is keyed by participant id, so
+                        // it tells us whose camera tile to ring.
+                        let is_speaking = !is_screen
+                            && Uuid::parse_str(origin)
+                                .is_ok_and(|id| speaking.get().contains(&id));
+                        let (label, testid) = if is_screen {
+                            (format!("{base}'s screen"), format!("tile-{base}-screen"))
+                        } else {
+                            (base.clone(), format!("tile-{base}"))
+                        };
                         view! {
                             <VideoTile
                                 stream=s.1.clone()
@@ -558,6 +693,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                                 muted=false
                                 testid=testid
                                 speaking=is_speaking
+                                screen=is_screen
                             />
                         }
                     }}
@@ -576,7 +712,11 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                         let testid = format!("roster-{}", current.name);
                         let mic = if current.audio_muted { "mic off" } else { "mic on" };
                         let cam = if current.video_muted { "cam off" } else { "cam on" };
-                        let text = format!("{} ({mic}, {cam})", current.name);
+                        let text = if current.sharing {
+                            format!("{} ({mic}, {cam}, sharing)", current.name)
+                        } else {
+                            format!("{} ({mic}, {cam})", current.name)
+                        };
                         view! {
                             <li data-testid=testid>{text}</li>
                         }
@@ -584,12 +724,41 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                 </For>
             </ul>
 
+            <aside class="chat">
+                <h2>"Chat"</h2>
+                <ul data-testid="chat-log">
+                    <For each={move || chat.get()} key=|m| m.id let:m>
+                        {move || {
+                            view! {
+                                <li class={if m.sender_id.is_none() { "system" } else { "" }}>
+                                    <strong>{m.sender_name.clone()}</strong>
+                                    " "
+                                    {m.body.clone()}
+                                </li>
+                            }
+                        }}
+                    </For>
+                </ul>
+                <input
+                    type="text"
+                    placeholder="Message everyone"
+                    data-testid="chat-input"
+                    prop:value=chat_draft
+                    on:input=move |ev| chat_draft.set(event_target_value(&ev))
+                    on:keydown=on_send_key
+                />
+                <button data-testid="chat-send" on:click=on_send_click>"Send"</button>
+            </aside>
+
             <div class="controls">
                 <button data-testid="toggle-mic" on:click=toggle_mic>
                     {move || if mic_on.get() { "Mic on" } else { "Mic off" }}
                 </button>
                 <button data-testid="toggle-cam" on:click=toggle_cam>
                     {move || if cam_on.get() { "Camera on" } else { "Camera off" }}
+                </button>
+                <button data-testid="share-screen" on:click=share>
+                    {move || if sharing.get() { "Stop sharing" } else { "Share screen" }}
                 </button>
                 <button data-testid="leave-btn" on:click=leave>"Leave"</button>
             </div>
@@ -606,6 +775,7 @@ fn VideoTile(
     muted: bool,
     testid: String,
     speaking: bool,
+    screen: bool,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
     Effect::new(move |_| {
@@ -615,8 +785,13 @@ fn VideoTile(
             play_silently(&video);
         }
     });
+    let class = match (speaking, screen) {
+        (_, true) => "tile screen",
+        (true, false) => "tile speaking",
+        (false, false) => "tile",
+    };
     view! {
-        <figure class={if speaking { "tile speaking" } else { "tile" }} data-testid=testid>
+        <figure class=class data-testid=testid>
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>{label}</figcaption>
         </figure>

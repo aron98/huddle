@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,6 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 
 use crate::PeerId;
 use crate::error::SfuError;
-
 /// Minimum interval between automatic keyframe requests for the same track.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -22,6 +22,36 @@ pub(crate) struct TrackIn {
     pub origin: PeerId,
     pub mid: Mid,
     pub kind: MediaKind,
+    /// True for screen-share tracks. They are labeled with an
+    /// `"{origin}-screen"` msid and gated by the share state rather than
+    /// the camera mute.
+    pub screen: bool,
+    /// Screen tracks stop and resume without their peer dying (the
+    /// sharer keeps the connection and simply stops sending). `active`
+    /// gates forwarding and newcomer replay; camera/mic tracks are always
+    /// active while the peer lives.
+    active: AtomicBool,
+}
+
+impl TrackIn {
+    fn new(origin: PeerId, mid: Mid, kind: MediaKind, screen: bool) -> Self {
+        Self {
+            origin,
+            mid,
+            kind,
+            screen,
+            active: AtomicBool::new(true),
+        }
+    }
+
+    /// Whether this track currently delivers media.
+    fn active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
+    fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::Relaxed);
+    }
 }
 
 /// Bookkeeping for an incoming track: the strong handle plus keyframe
@@ -55,8 +85,17 @@ pub(crate) struct TrackOut {
     pub origin: PeerId,
     pub mid_in: Mid,
     pub kind: MediaKind,
+    /// Copied from the source [`TrackIn`]: decides the msid the SFU
+    /// labels this m-line with (plain origin id vs `"{origin}-screen"`).
+    pub screen: bool,
     pub track_in: Weak<TrackIn>,
     pub state: TrackOutState,
+}
+
+/// A screen-share state change observed in a client offer.
+pub(crate) struct ScreenFlip {
+    pub track: Arc<TrackIn>,
+    pub active: bool,
 }
 
 /// One polled step of a peer, with all borrowed data owned.
@@ -104,6 +143,11 @@ pub(crate) struct Peer {
     /// from this peer are not forwarded to anyone.
     audio_muted: bool,
     video_muted: bool,
+    /// Set when the client announces a screen share
+    /// ([`crate::Room::set_sharing`]); the next remote video m-line is
+    /// marked as the screen track. `false` is also set when a share
+    /// stops, so a late offer never creates a phantom screen.
+    screen_pending: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
     /// Keyframe (FIR/PLI) requests successfully enqueued toward this
@@ -132,6 +176,7 @@ impl Peer {
             has_session: false,
             audio_muted: false,
             video_muted: false,
+            screen_pending: false,
             rx_frames: 0,
             tx_frames: 0,
             keyframes_requested: 0,
@@ -156,8 +201,42 @@ impl Peer {
     /// `accept_offer` invalidates any pending offer we sent, so tracks that
     /// were mid-negotiation are reset to `ToOpen` (or back to `ToStop` for
     /// in-flight stops) and renegotiated on the next poll.
-    pub(crate) fn answer_sdp_offer(&mut self, sdp: &str) -> Result<String, SfuError> {
+    ///
+    /// Returns the answer and every screen track of this peer whose
+    /// share state flipped in this offer — the room re-subscribes peers
+    /// for resumes (stops converge via the sweep on each negotiation
+    /// attempt).
+    pub(crate) fn answer_sdp_offer(
+        &mut self,
+        sdp: &str,
+    ) -> Result<(String, Vec<ScreenFlip>), SfuError> {
         let offer = SdpOffer::from_sdp_string(sdp)?;
+
+        // Screen tracks flip with the direction the client offers:
+        // removeTrack turns the m-line recvonly, a re-share (reusing
+        // the same transceiver) turns it sendrecv again. The offer is
+        // the authoritative statement of what the client will send —
+        // str0m's MediaChanged event covers the same transition but
+        // its pending flag is unreliable (see `handle_event`).
+        let mut screens = Vec::new();
+        for line in &offer.media_lines {
+            let mid = line.mid();
+            let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
+                continue;
+            };
+            if !entry.track.screen {
+                continue;
+            }
+            let active = line.direction().is_sending();
+            if entry.track.active() != active {
+                entry.track.set_active(active);
+                screens.push(ScreenFlip {
+                    track: Arc::clone(&entry.track),
+                    active,
+                });
+            }
+        }
+
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
         self.pending = None;
         self.has_session = true;
@@ -168,7 +247,7 @@ impl Peer {
                 _ => {}
             }
         }
-        Ok(answer.to_sdp_string())
+        Ok((answer.to_sdp_string(), screens))
     }
 
     /// Accept the client's answer to a renegotiation offer we sent.
@@ -239,13 +318,40 @@ impl Peer {
 
     /// Register another peer's incoming track as an outgoing track here.
     pub(crate) fn open_track(&mut self, track_in: &Arc<TrackIn>) {
+        // A stopped screen share is not (re)played to newcomers: it would
+        // open an m-line that never delivers media. A resume goes through
+        // [`Peer::open_or_resume_track`], which resets the state directly.
+        if track_in.screen && !track_in.active() {
+            return;
+        }
         self.tracks_out.push(TrackOut {
             origin: track_in.origin,
             mid_in: track_in.mid,
             kind: track_in.kind,
+            screen: track_in.screen,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
+    }
+
+    /// Open `track_in` here, or wake an existing stopped entry for it
+    /// (a screen share resumed). Idempotent: an already-open or
+    /// mid-negotiation entry is left alone.
+    pub(crate) fn open_or_resume_track(&mut self, track_in: &Arc<TrackIn>) {
+        if let Some(out) = self
+            .tracks_out
+            .iter_mut()
+            .find(|o| o.origin == track_in.origin && o.mid_in == track_in.mid)
+        {
+            if matches!(
+                out.state,
+                TrackOutState::ToStop(_) | TrackOutState::NegotiatingStop(_)
+            ) {
+                out.state = TrackOutState::ToOpen;
+            }
+            return;
+        }
+        self.open_track(track_in);
     }
 
     /// Update the SFU-side mute state; `None` leaves that kind untouched.
@@ -277,12 +383,17 @@ impl Peer {
 
     /// Whether an incoming frame on `mid` may be forwarded right now.
     ///
-    /// Unknown m-lines stay forwardable; a known track is dropped while
-    /// its kind is muted at the source.
+    /// Unknown m-lines stay forwardable; a known camera/mic track is
+    /// dropped while its kind is muted at the source. Screen tracks are
+    /// not tied to the camera mute — the share state (`active`) alone
+    /// decides whether they flow.
     pub(crate) fn is_forwardable(&self, mid: Mid) -> bool {
         let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
             return true;
         };
+        if entry.track.screen {
+            return entry.track.active();
+        }
         match entry.track.kind {
             MediaKind::Audio => !self.audio_muted,
             MediaKind::Video => !self.video_muted,
@@ -292,6 +403,11 @@ impl Peer {
     /// If any tracks are waiting to be opened or stopped, bundle them into
     /// a single renegotiation offer and return its SDP string.
     pub(crate) fn negotiate_if_needed(&mut self) -> Option<String> {
+        // Screen stops mark entries below before the pending gate: stops
+        // queue up even while another offer is in flight, and the sweep
+        // runs again on every poll.
+        self.sweep_screens();
+
         if !self.has_session || self.pending.is_some() {
             return None;
         }
@@ -300,13 +416,16 @@ impl Peer {
         for out in &mut self.tracks_out {
             match out.state {
                 TrackOutState::ToOpen => {
-                    let mid = changes.add_media(
-                        out.kind,
-                        Direction::SendOnly,
-                        Some(out.origin.to_string()),
-                        None,
-                        None,
-                    );
+                    // Screen shares travel on their own labeled stream so
+                    // viewers can render (and clean up) them separately
+                    // from the sharer's camera tile.
+                    let msid = if out.screen {
+                        format!("{}-screen", out.origin)
+                    } else {
+                        out.origin.to_string()
+                    };
+                    let mid =
+                        changes.add_media(out.kind, Direction::SendOnly, Some(msid), None, None);
                     out.state = TrackOutState::Negotiating(mid);
                 }
                 TrackOutState::ToStop(mid) => {
@@ -320,6 +439,50 @@ impl Peer {
         let (offer, pending) = changes.apply()?;
         self.pending = Some(pending);
         Some(offer.to_sdp_string())
+    }
+
+    /// Wind down entries whose source screen track stopped sharing
+    /// (the sharer's peer connection lives on, so the weak reference is
+    /// still alive — only `active` went false).
+    ///
+    /// Un-negotiated entries are dropped outright; negotiated ones are
+    /// stopped in the next renegotiation. This mirrors
+    /// [`Peer::reap_dead_tracks`] for the share-stop case and runs on
+    /// every negotiation attempt, so stop state set anywhere converges.
+    pub(crate) fn sweep_screens(&mut self) {
+        self.tracks_out.retain_mut(|out| {
+            let Some(track) = out.track_in.upgrade() else {
+                return true; // dead-origin entries are reaped elsewhere
+            };
+            if !track.screen || track.active() {
+                return true;
+            }
+            match out.state {
+                // Never opened: nothing to stop.
+                TrackOutState::ToOpen => false,
+                TrackOutState::Open(mid) => {
+                    out.state = TrackOutState::ToStop(mid);
+                    true
+                }
+                // Mid-flight or already stopping; the answer path resolves.
+                _ => true,
+            }
+        });
+    }
+
+    /// Update the share state. `true` arms the next remote video m-line
+    /// as the screen track; `false` also deactivates this peer's live
+    /// screen tracks (subscribers' entries are swept on their next
+    /// negotiation).
+    pub(crate) fn set_sharing(&mut self, sharing: bool) {
+        self.screen_pending = sharing;
+        if !sharing {
+            for entry in &self.tracks_in {
+                if entry.track.screen && entry.track.active() {
+                    entry.track.set_active(false);
+                }
+            }
+        }
     }
 
     /// Wind down entries whose origin track is gone (its peer left).
@@ -383,17 +546,28 @@ impl Peer {
                 }
             }
             Event::MediaAdded(m) => {
-                let track = Arc::new(TrackIn {
-                    origin: self.id,
-                    mid: m.mid,
-                    kind: m.kind,
-                });
+                // The client announces a share before adding the m-line,
+                // so the next remote video m-line is the screen. Order
+                // is guaranteed: the Sharing message reaches the room
+                // before the offer that carries the new m-line.
+                let screen = self.screen_pending && matches!(m.kind, MediaKind::Video);
+                if screen {
+                    self.screen_pending = false;
+                }
+                let track = Arc::new(TrackIn::new(self.id, m.mid, m.kind, screen));
                 self.tracks_in.push(TrackInEntry {
                     track: Arc::clone(&track),
                     last_keyframe_request: None,
                 });
                 PollOutcome::TrackOpened(track)
             }
+            // Screen-share stop/resume is tracked from the client's
+            // offers in [`Peer::answer_sdp_offer`] instead of this
+            // event: str0m's pending MediaChanged flag can be cleared
+            // by its internal direction bookkeeping before we ever
+            // poll it, which makes the event unreliable for the
+            // stop/reshare transitions (observed with re-shares on a
+            // reused transceiver never surfacing the event).
             Event::MediaData(data) => PollOutcome::Media(data),
             Event::KeyframeRequest(req) => PollOutcome::KeyframeRequested(req),
             _ => PollOutcome::Ignored,

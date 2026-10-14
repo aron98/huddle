@@ -120,17 +120,20 @@ asserted on both, mute propagation asserted across pages.)*
   *(Landed: `e2e-call` CI job now runs four pages — late joiner receives fresh
   media, departure removes tiles and roster rows everywhere (`7bd28bd`).)*
 
-### Phase 4 — Feature fan-out *(~2 weeks; two features in parallel)*
+### Phase 4 — Feature fan-out ✅ *(~2 weeks; two features in parallel)*
 
-- **Screen share:** A3 (forward high-bitrate track; treat screen content
-  differently — no simulcast budget games, generous max bitrate, keyframe on
-  subscribe) runs in parallel with B3 (`getDisplayMedia`, listen for the browser's
-  own "stop sharing" signal via track `onended`, screen tile treatment, "X is
-  sharing" system event).
-- **Chat:** C2 (persistence) + B4 (sidebar UI) run in parallel with the above —
-  chat is pure WS + SQLite and doesn't touch media at all.
+- **Screen share:** ✅ A3 (forward high-bitrate track; screen content treated
+  differently — labeled `-screen` streams, keyframe on subscribe via the
+  existing fan-out, no camera-mute gating; *Landed: a6b6e75*) ran in parallel
+  with ✅ B3 (`getDisplayMedia`, listen for the browser's own "stop sharing"
+  signal via track `onended`, screen tile treatment, sharing roster state;
+  *Landed: 2060523, f1382e8, 4cb52eb, 47b2daf*).
+- **Chat:** ✅ C2 (persistence in `chat_messages` with history replay on join)
+  + ✅ B4 (sidebar UI) — chat is pure WS + SQLite and doesn't touch media at
+  all; *Landed: 318e7eb, b4b1e29*.
 
-**Acceptance:** share a screen in a 4-tab meeting, chat persists across reload.
+**Acceptance:** ✅ share a screen in a 4-tab meeting, chat persists across
+reload — enforced by the e2e (`test/e2e/e2e-call.mjs`, *Landed: 4e4d1c5*).
 
 ### Phase 5 — Scheduling & identity *(~1–2 weeks; C + B, media tracks idle)*
 

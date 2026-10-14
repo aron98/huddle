@@ -10,29 +10,32 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Phases 0–3 complete** — the foundations, the four independent tracks, the
-two-person call, and n-party support from the
+🚧 **Phases 0–4 complete** — the foundations, the four independent tracks, the
+two-person call, n-party support, and screen share + chat from the
 [implementation plan](docs/implementation-plan.md) are done:
 
 - `protocol` — v1 signaling and REST wire messages, including speaking
-  indicators.
+  indicators and screen-share state.
 - `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web
-  UI, `/ws` signaling sessions, and a media engine thread driving one SFU room
-  per meeting over UDP.
+  UI, `/ws` signaling sessions, a media engine thread driving one SFU room
+  per meeting over UDP, chat persistence with history replay on join.
 - `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
   SDP answering, media forwarding, keyframe fan-out to new subscribers, track
-  recycling when participants leave, mute-gated forwarding; tested with
-  synthetic in-process clients and a real-UDP loopback.
+  recycling when participants leave, mute-gated forwarding, and a screen-share
+  lifecycle (labeled `-screen` streams, reshare on the same transceiver,
+  screen tracks immune to camera mute); tested with synthetic in-process
+  clients and a real-UDP loopback.
 - `web` — Leptos prejoin page (camera preview, device pickers, name), an
   `RtcClient` signaling driver tested against a mock server, and an in-call
   view with an adaptive tile grid, roster, speaking indicators (Web Audio RMS
-  detection), and mic/camera/leave controls.
+  detection), screen share with dedicated tiles, an in-call chat sidebar, and
+  mic/camera/share/leave controls.
 - Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check,
-  and a four-browser-page call e2e with join/leave churn that asserts media
-  flows *through the server*), multi-stage Dockerfile, dev compose stack with
-  coturn.
+  and a four-browser-page call e2e with join/leave churn, screen share, and
+  chat-across-reload assertions that verify media flows *through the server*),
+  multi-stage Dockerfile, dev compose stack with coturn.
 
-**Next:** phase 4 — screen share and chat fan-out.
+**Next:** phase 5 — scheduling and the organizer auth UI.
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design

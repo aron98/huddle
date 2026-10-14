@@ -14,8 +14,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcIceCandidate, RtcIceCandidateInit,
-    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType, RtcSessionDescription,
-    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket,
+    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender, RtcRtpTransceiverDirection,
+    RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescription, RtcSessionDescriptionInit,
+    RtcTrackEvent, WebSocket,
 };
 
 use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
@@ -183,6 +184,9 @@ pub struct BrowserPeerConnection {
     pc: RtcPeerConnection,
     local_candidates: Rc<RefCell<Vec<LocalCandidate>>>,
     on_remote_stream: RemoteStreamCallback,
+    /// Screen-share state shared with the [`ScreenShareHandle`] the UI
+    /// holds; see [`BrowserPeerConnection::screen_share_handle`].
+    screen: SharedScreenState,
     _on_ice_candidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _on_track: Closure<dyn FnMut(RtcTrackEvent)>,
 }
@@ -191,6 +195,35 @@ pub struct BrowserPeerConnection {
 /// stream id captured at `ontrack` time (see the comment in `new` for why
 /// the id must be captured then rather than re-read later).
 type RemoteStreamCallback = Rc<RefCell<Option<Box<dyn FnMut(&str, MediaStream)>>>>;
+
+/// Screen-share state, shared between the session task (which owns the
+/// [`BrowserPeerConnection`]) and the UI (which holds a
+/// [`ScreenShareHandle`]): the UI stages the `getDisplayMedia` track it
+/// acquired, the task attaches it during `add_screen_track`.
+#[derive(Default)]
+struct ScreenState {
+    /// Track + carrying stream staged by the UI, awaiting attachment.
+    staged: Option<(MediaStreamTrack, MediaStream)>,
+    /// The sender created by the last `add_screen_track`.
+    sender: Option<RtcRtpSender>,
+}
+
+type SharedScreenState = Rc<RefCell<ScreenState>>;
+
+/// Handle for the UI to stage a screen track for the session task. The
+/// session task is the only side that attaches/removes it — via
+/// [`PeerConnection::add_screen_track`] /
+/// [`PeerConnection::remove_screen_track`] — so the negotiation sequence
+/// stays inside `RtcClient`.
+pub struct ScreenShareHandle(SharedScreenState);
+
+impl ScreenShareHandle {
+    /// Stage `track` (carried by `stream`) so the session task's next
+    /// `add_screen_track` attaches it to the peer connection.
+    pub fn stage(&self, track: MediaStreamTrack, stream: MediaStream) {
+        self.0.borrow_mut().staged = Some((track, stream));
+    }
+}
 
 impl BrowserPeerConnection {
     pub fn new(ice_servers: &[IceServer]) -> Result<Self, PeerError> {
@@ -261,6 +294,7 @@ impl BrowserPeerConnection {
             pc,
             local_candidates,
             on_remote_stream,
+            screen: Rc::new(RefCell::new(ScreenState::default())),
             _on_ice_candidate: on_ice_candidate,
             _on_track: on_track,
         })
@@ -270,6 +304,12 @@ impl BrowserPeerConnection {
     /// stream id captured at `ontrack` time (stable msid) and the stream.
     pub fn set_on_remote_stream(&self, callback: impl FnMut(&str, MediaStream) + 'static) {
         *self.on_remote_stream.borrow_mut() = Some(Box::new(callback));
+    }
+
+    /// A handle the UI uses to stage a `getDisplayMedia` track; the session
+    /// task attaches it via [`PeerConnection::add_screen_track`].
+    pub fn screen_share_handle(&self) -> ScreenShareHandle {
+        ScreenShareHandle(Rc::clone(&self.screen))
     }
 
     /// The underlying JS `RTCPeerConnection`, for debug/test inspection.
@@ -363,6 +403,41 @@ impl PeerConnection for BrowserPeerConnection {
 
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate> {
         std::mem::take(&mut *self.local_candidates.borrow_mut())
+    }
+
+    async fn add_screen_track(&mut self) -> Result<(), PeerError> {
+        let (track, stream) = self
+            .screen
+            .borrow_mut()
+            .staged
+            .take()
+            .ok_or_else(|| PeerError::Failed("no screen track staged".to_owned()))?;
+        // `addTrack` would not create a fresh m-line here: it happily
+        // reuses one of the many recvonly transceivers the server's
+        // forwarded tracks created (flipping it to sendrecv and silently
+        // hijacking that tile's m-line). `addTransceiver` always creates
+        // a new m-line, which the SFU sees as a new (screen) track.
+        let init = RtcRtpTransceiverInit::new();
+        init.set_direction(RtcRtpTransceiverDirection::Sendonly);
+        let streams = js_sys::Array::new();
+        streams.push(&stream);
+        init.set_streams(&streams);
+        let transceiver = self
+            .pc
+            .add_transceiver_with_media_stream_track_and_init(&track, &init);
+        self.screen.borrow_mut().sender = Some(transceiver.sender());
+        Ok(())
+    }
+
+    async fn remove_screen_track(&mut self) -> Result<(), PeerError> {
+        let mut screen = self.screen.borrow_mut();
+        // Clear any staged-but-never-attached track too, so a fresh share
+        // stages on a clean slate.
+        screen.staged = None;
+        if let Some(sender) = screen.sender.take() {
+            self.pc.remove_track(&sender);
+        }
+        Ok(())
     }
 }
 

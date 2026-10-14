@@ -14,11 +14,12 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use huddle_protocol::{ClientMessage, ErrorCode, Joinability, ServerMessage};
+use huddle_protocol::{ChatMessage, ClientMessage, ErrorCode, Joinability, ServerMessage};
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use uuid::Uuid;
 
+use crate::chat;
 use crate::meetings::{self, normalize_code};
 use crate::state::AppState;
 
@@ -45,13 +46,25 @@ async fn run_session(socket: WebSocket, state: AppState) {
     // engine. The engine enforces capacity and name uniqueness; both it
     // and this validation must agree on the meeting's normalized code.
     let (out_tx, mut out_rx) = unbounded_channel::<ServerMessage>();
-    let id = match try_join(&state, &meeting_code, &name, out_tx).await {
-        Ok(id) => id,
+    let (id, meeting_id) = match try_join(&state, &meeting_code, &name, out_tx.clone()).await {
+        Ok(ids) => ids,
         Err((code, message)) => {
             send_error(&mut sender, code, message).await;
             return;
         }
     };
+
+    // Replay chat history through the same ordered queue the engine
+    // uses: the `Welcome` is already at the front, history follows it,
+    // and everything live arrives after that in send order.
+    match chat::history(state.pool(), meeting_id).await {
+        Ok(messages) => {
+            for message in messages {
+                let _ = out_tx.send(ServerMessage::Chat { message });
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "chat history replay failed"),
+    }
 
     let code = normalize_code(&meeting_code);
     let engine = state.engine().clone();
@@ -80,12 +93,28 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::IceCandidate { candidate, .. } => {
                         engine.ice(code.clone(), id, candidate);
                     }
-                    ClientMessage::Chat { body } => engine.chat(code.clone(), id, body),
+                    ClientMessage::Chat { body } => {
+                        let message = ChatMessage {
+                            id: Uuid::new_v4(),
+                            sender_id: Some(id),
+                            sender_name: name.clone(),
+                            body,
+                            sent_at: OffsetDateTime::now_utc(),
+                        };
+                        // Persist first, then relay: once any other
+                        // session has the message, a rejoiner must be
+                        // able to see it in history too.
+                        chat::persist(state.pool(), meeting_id, &message).await;
+                        engine.chat(code.clone(), message);
+                    }
                     ClientMessage::MuteState { audio_muted, video_muted } => {
                         engine.mute(code.clone(), id, audio_muted, video_muted);
                     }
                     ClientMessage::Speaking { speaking } => {
                         engine.speaking(code.clone(), id, speaking);
+                    }
+                    ClientMessage::Sharing { sharing } => {
+                        engine.sharing(code.clone(), id, sharing);
                     }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
@@ -149,13 +178,14 @@ async fn expect_join(receiver: &mut SplitStream<WebSocket>) -> JoinOutcome {
 
 /// Validate a join and register the participant with the engine. On
 /// success the engine is already sending: `Welcome` sits at the front of
-/// the session's outbound queue.
+/// the session's outbound queue. Returns the participant id together
+/// with the meeting's database id (chat history is keyed on it).
 async fn try_join(
     state: &AppState,
     meeting_code: &str,
     name: &str,
     out: UnboundedSender<ServerMessage>,
-) -> Result<Uuid, (ErrorCode, String)> {
+) -> Result<(Uuid, Uuid), (ErrorCode, String)> {
     let name = name.trim();
     if name.is_empty() {
         return Err((ErrorCode::InvalidMessage, "name must not be empty".into()));
@@ -193,13 +223,14 @@ async fn try_join(
         }
     }
 
+    let meeting_id = meeting.id;
     let id = Uuid::new_v4();
     match state
         .engine()
         .join(id, name.to_owned(), meeting.into(), out)
         .await
     {
-        Ok(Ok(())) => Ok(id),
+        Ok(Ok(())) => Ok((id, meeting_id)),
         Ok(Err(rejected)) => Err((rejected.code, join_refused_message(rejected.code).into())),
         Err(_) => Err((
             ErrorCode::Internal,
@@ -795,6 +826,51 @@ mod tests {
 
         alice.pump.stop();
         bob.pump.stop();
+    }
+
+    #[tokio::test]
+    async fn chat_history_is_replayed_to_late_joiners() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting(0, 60).await;
+
+        let mut alice = TestClient::connect(&server, &code, "alice").await;
+        let mut bob = TestClient::connect(&server, &code, "bob").await;
+
+        // Alice sees bob join first.
+        let msg = alice.next_server_message().await;
+        assert!(matches!(msg, ServerMessage::ParticipantJoined { .. }));
+
+        alice
+            .send_client(&ClientMessage::Chat {
+                body: "hello from the past".into(),
+            })
+            .await;
+
+        // Both receive the relay. The session persists before relaying,
+        // so once bob has the message it is durable — which is what the
+        // late joiner below relies on.
+        for client in [&mut alice, &mut bob] {
+            let msg = client.next_server_message().await;
+            let ServerMessage::Chat { message } = msg else {
+                panic!("expected chat, got {msg:?}")
+            };
+            assert_eq!(message.body, "hello from the past");
+            assert_eq!(message.sender_name, "alice");
+        }
+
+        // A late joiner gets the stored message replayed after Welcome.
+        let mut carol = TestClient::connect(&server, &code, "carol").await;
+        let msg = carol.next_server_message().await;
+        let ServerMessage::Chat { message } = msg else {
+            panic!("expected history chat, got {msg:?}")
+        };
+        assert_eq!(message.body, "hello from the past");
+        assert_eq!(message.sender_name, "alice");
+        assert_eq!(message.sender_id, Some(alice.you));
+
+        alice.pump.stop();
+        bob.pump.stop();
+        carol.pump.stop();
     }
 
     #[tokio::test]

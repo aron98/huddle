@@ -128,6 +128,12 @@ impl MockState {
                 id: ALICE_ID,
                 speaking: *speaking,
             }],
+            // Screen-share state, echoed back like the server does,
+            // attributed to a fixture participant.
+            ClientMessage::Sharing { sharing } => vec![ServerMessage::Sharing {
+                id: ALICE_ID,
+                sharing: *sharing,
+            }],
             ClientMessage::SdpAnswer { .. } | ClientMessage::Leave => vec![],
         }
     }
@@ -268,6 +274,7 @@ struct FakePeerConnection {
     remote_offers_applied: Vec<String>,
     remote_candidates: Vec<LocalCandidate>,
     pending_local_candidates: Vec<LocalCandidate>,
+    screen_tracks: usize,
 }
 
 impl FakePeerConnection {
@@ -303,6 +310,16 @@ impl PeerConnection for FakePeerConnection {
 
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate> {
         std::mem::take(&mut self.pending_local_candidates)
+    }
+
+    async fn add_screen_track(&mut self) -> Result<(), PeerError> {
+        self.screen_tracks += 1;
+        Ok(())
+    }
+
+    async fn remove_screen_track(&mut self) -> Result<(), PeerError> {
+        self.screen_tracks = self.screen_tracks.saturating_sub(1);
+        Ok(())
     }
 }
 
@@ -432,6 +449,49 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
         other => panic!("expected speaking, got {other:?}"),
     }
     assert!(client.speaking().contains(&ALICE_ID), "alice is speaking");
+
+    // --- Screen share --------------------------------------------------------
+    client.start_screen_share().await.unwrap();
+    // The share must be announced before the renegotiation offer.
+    {
+        let log = server.received.lock().unwrap();
+        let share_at = log
+            .iter()
+            .position(|m| matches!(m, ClientMessage::Sharing { sharing: true }))
+            .expect("sharing start was sent");
+        assert!(
+            log.iter()
+                .skip(share_at + 1)
+                .any(|m| matches!(m, ClientMessage::SdpOffer { .. })),
+            "a renegotiation offer follows the share announcement"
+        );
+    }
+    assert_eq!(client.peer_mut().screen_tracks, 1, "screen track attached");
+    // The echoed Sharing travels with the renegotiation exchange; publish's
+    // inner loop applies it to the roster.
+    assert!(
+        client
+            .roster()
+            .iter()
+            .any(|p| p.id == ALICE_ID && p.sharing),
+        "roster reflects the share"
+    );
+
+    client.stop_screen_share().await.unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(m, ClientMessage::Sharing { sharing: false }))
+            .await,
+        "server should see the share stop"
+    );
+    assert_eq!(client.peer_mut().screen_tracks, 0, "screen track detached");
+    assert!(
+        !client
+            .roster()
+            .iter()
+            .any(|p| p.id == ALICE_ID && p.sharing),
+        "roster reflects the stop"
+    );
 
     // --- Leave ----------------------------------------------------------------
     client.leave().await.unwrap();
