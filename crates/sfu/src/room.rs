@@ -141,6 +141,18 @@ impl Room {
         self.peer_mut(id)?.add_remote_candidate(candidate)
     }
 
+    /// Apply a (partial) mute update for a peer. Frames of a muted kind
+    /// arriving from that peer are no longer forwarded to the room.
+    pub fn set_mute(
+        &mut self,
+        id: PeerId,
+        audio_muted: Option<bool>,
+        video_muted: Option<bool>,
+    ) -> Result<(), SfuError> {
+        self.peer_mut(id)?.set_mute(audio_muted, video_muted);
+        Ok(())
+    }
+
     /// The peer (if any) that accepts this input. This is the demultiplex
     /// step for datagrams arriving on the shared media socket.
     pub fn accepts(&self, input: &Input) -> Option<PeerId> {
@@ -261,6 +273,10 @@ impl Room {
             peer.rx_frames += 1;
             if !data.contiguous {
                 peer.request_keyframe_throttled(data.mid, data.rid, KeyframeRequestKind::Fir);
+            }
+            // Muted at the source: the frame is counted but not forwarded.
+            if !peer.is_forwardable(data.mid) {
+                return;
             }
         }
 

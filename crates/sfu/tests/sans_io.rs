@@ -399,6 +399,55 @@ fn new_subscribers_get_a_keyframe_from_the_sources() {
 }
 
 #[test]
+fn muted_sources_stop_forwarding_until_unmuted() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients.iter().all(|c| c.connected)
+    });
+    a.send_audio(10);
+    b.send_audio(10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients.iter().all(|c| c.media_rx > 0)
+    });
+
+    // str0m paces RTP emission against real time, so frames keep
+    // trickling in after the drive above returns. Drain until the
+    // settle-phase media has fully landed, or stale frames would fake
+    // a mute leak below.
+    let drain_until = Instant::now() + Duration::from_millis(600);
+    while Instant::now() < drain_until {
+        step(&mut room, &mut [&mut a, &mut b]);
+    }
+
+    // Mute a's audio at the SFU. Both keep sending for a while, but b
+    // must receive none of a's frames: they die at the forwarding step.
+    let (a_baseline, b_baseline) = (a.media_rx, b.media_rx);
+    room.set_mute(a.id, Some(true), None).unwrap();
+    a.send_audio(20);
+    b.send_audio(20);
+    let mute_until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < mute_until {
+        step(&mut room, &mut [&mut a, &mut b]);
+    }
+    assert_eq!(b.media_rx, b_baseline, "muted frames leaked to b");
+
+    // b's own audio still flows to a — the mute only gates a's media.
+    assert!(a.media_rx > a_baseline, "b's audio stopped flowing to a");
+
+    // Unmute: forwarding to b resumes.
+    room.set_mute(a.id, Some(false), None).unwrap();
+    a.send_audio(20);
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients[1].media_rx > b_baseline
+    });
+}
+
+#[test]
 fn room_api_errors() {
     let mut room = Room::new(MEDIA_ADDR);
     let id = PeerId::new_v4();

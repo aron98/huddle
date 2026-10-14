@@ -100,6 +100,10 @@ pub(crate) struct Peer {
     /// offer delivered across that boundary no longer matches the m-line
     /// order the client established, so browsers reject it.
     has_session: bool,
+    /// Mute state applied at the SFU: frames of a muted kind arriving
+    /// from this peer are not forwarded to anyone.
+    audio_muted: bool,
+    video_muted: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
     /// Keyframe (FIR/PLI) requests successfully enqueued toward this
@@ -126,6 +130,8 @@ impl Peer {
             tracks_in: Vec::new(),
             tracks_out: Vec::new(),
             has_session: false,
+            audio_muted: false,
+            video_muted: false,
             rx_frames: 0,
             tx_frames: 0,
             keyframes_requested: 0,
@@ -240,6 +246,47 @@ impl Peer {
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
+    }
+
+    /// Update the SFU-side mute state; `None` leaves that kind untouched.
+    ///
+    /// When video is unmuted, every video source of this peer is asked
+    /// for a keyframe (throttled): subscribers were starved of the GOP
+    /// while muted, and without a fresh intra frame their tiles would
+    /// stay stale until the next PLI.
+    pub(crate) fn set_mute(&mut self, audio_muted: Option<bool>, video_muted: Option<bool>) {
+        let video_was_muted = self.video_muted;
+        if let Some(a) = audio_muted {
+            self.audio_muted = a;
+        }
+        if let Some(v) = video_muted {
+            self.video_muted = v;
+        }
+        if video_was_muted && !self.video_muted {
+            let video_mids: Vec<Mid> = self
+                .tracks_in
+                .iter()
+                .filter(|e| matches!(e.track.kind, MediaKind::Video))
+                .map(|e| e.track.mid)
+                .collect();
+            for mid in video_mids {
+                self.request_keyframe_throttled(mid, None, KeyframeRequestKind::Fir);
+            }
+        }
+    }
+
+    /// Whether an incoming frame on `mid` may be forwarded right now.
+    ///
+    /// Unknown m-lines stay forwardable; a known track is dropped while
+    /// its kind is muted at the source.
+    pub(crate) fn is_forwardable(&self, mid: Mid) -> bool {
+        let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
+            return true;
+        };
+        match entry.track.kind {
+            MediaKind::Audio => !self.audio_muted,
+            MediaKind::Video => !self.video_muted,
+        }
     }
 
     /// If any tracks are waiting to be opened or stopped, bundle them into
