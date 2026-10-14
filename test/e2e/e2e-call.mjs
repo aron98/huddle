@@ -433,6 +433,141 @@ async function main() {
       });
     console.log('bob rejoined and sees the persisted chat history');
 
+    console.log('asserting prejoin toggles hit only their own track kind (issue #7)');
+    const erin = await newClient('erin');
+    await erin.goto(`${BASE}/m/${code}?test=1`, { waitUntil: 'domcontentloaded' });
+    await erin
+      .waitForSelector('[data-testid="join-btn"]:not([disabled])', { timeout: 30_000 })
+      .catch(async () => fail(`erin: media never became ready (status: ${await statusText(erin)})`));
+
+    // track.enabled probe against the preview's live stream.
+    const prejoinProbe = () =>
+      erin.evaluate(() => {
+        const stream = document.querySelector('#preview')?.srcObject;
+        const audio = stream?.getAudioTracks()[0] ?? null;
+        const video = stream?.getVideoTracks()[0] ?? null;
+        return {
+          hasStream: !!stream,
+          audioEnabled: audio?.enabled ?? null,
+          videoEnabled: video?.enabled ?? null,
+          audioId: audio?.id ?? null,
+          videoId: video?.id ?? null,
+        };
+      });
+
+    let probe = await prejoinProbe();
+    if (!probe.hasStream || probe.audioEnabled !== true || probe.videoEnabled !== true)
+      fail(`erin: fresh prejoin stream not fully enabled: ${JSON.stringify(probe)}`);
+
+    // Mic off must leave the camera track alone — before the fix, both
+    // toggles hit every track in the stream and the preview went black.
+    await erin.evaluate(() => document.querySelector('[data-testid="prejoin-toggle-mic"]')?.click());
+    await waitFor(
+      'mic toggle to disable only the audio track',
+      async () => {
+        probe = await prejoinProbe();
+        return probe.audioEnabled === false && probe.videoEnabled === true;
+      },
+      10_000,
+    ).catch(async () => fail(`erin: mic off also hit the video track: ${JSON.stringify(probe)}`));
+
+    // And the converse: camera off must leave the (already muted) audio
+    // track alone.
+    await erin.evaluate(() => document.querySelector('[data-testid="prejoin-toggle-cam"]')?.click());
+    await waitFor(
+      'camera toggle to disable only the video track',
+      async () => {
+        probe = await prejoinProbe();
+        return probe.videoEnabled === false && probe.audioEnabled === false;
+      },
+      10_000,
+    ).catch(async () => fail(`erin: camera off also hit the audio track: ${JSON.stringify(probe)}`));
+
+    // Camera back on: the muted mic must not come back with it.
+    await erin.evaluate(() => document.querySelector('[data-testid="prejoin-toggle-cam"]')?.click());
+    await waitFor(
+      'camera re-enable to leave the mic muted',
+      async () => {
+        probe = await prejoinProbe();
+        return probe.videoEnabled === true && probe.audioEnabled === false;
+      },
+      10_000,
+    ).catch(async () => fail(`erin: camera re-enable resurrected the muted mic: ${JSON.stringify(probe)}`));
+    console.log(`erin: prejoin toggles are kind-filtered (${JSON.stringify(probe)})`);
+
+    // Device re-acquisition: picking a concrete mic re-runs getUserMedia,
+    // and the fresh tracks come back enabled by default — the toggle
+    // state must be re-applied (muted mic stays muted, camera stays on).
+    const micDevice = await waitFor(
+      'a concrete mic device in the prejoin picker',
+      async () => {
+        const opts = await erin.$$eval(
+          '[data-testid="mic-select"] option',
+          (os) => os.map((o) => o.value),
+        );
+        return opts.find((v) => v !== '') ?? false;
+      },
+      30_000,
+    );
+    const beforeReswitch = await prejoinProbe();
+    await erin.select('[data-testid="mic-select"]', micDevice);
+    await waitFor(
+      're-acquired mic tracks to inherit the toggle state',
+      async () => {
+        probe = await prejoinProbe();
+        return (
+          probe.hasStream &&
+          probe.audioId !== null &&
+          probe.audioId !== beforeReswitch.audioId &&
+          probe.audioEnabled === false &&
+          probe.videoEnabled === true
+        );
+      },
+      30_000,
+    ).catch(async () =>
+      fail(
+        `erin: device re-acquisition resurrected the muted mic or disabled the camera: ` +
+          `before ${JSON.stringify(beforeReswitch)}, after ${JSON.stringify(probe)}`,
+      ),
+    );
+    console.log(`erin: device re-acquisition kept the toggle state (${JSON.stringify(probe)})`);
+
+    // Join with the mic muted: the state must survive the transition —
+    // the in-call buttons read track.enabled, and the roster (via the
+    // server) must agree.
+    await erin.type('[data-testid="name-input"]', 'erin');
+    await erin.evaluate(() => document.querySelector('[data-testid="join-btn"]')?.click());
+    await erin
+      .waitForSelector('[data-testid="name-input"]', { hidden: true, timeout: 30_000 })
+      .catch(async () => fail(`erin never left the prejoin page (status: ${await statusText(erin)})`));
+    await erin
+      .waitForFunction(
+        () => document.querySelector('[data-testid="toggle-mic"]')?.textContent.includes('Mic off'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () =>
+        fail(`erin: in-call mic button lost the prejoin mute (status: ${await statusText(erin)})`),
+      );
+    await erin
+      .waitForFunction(
+        () => document.querySelector('[data-testid="toggle-cam"]')?.textContent.includes('Camera on'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => fail('erin: in-call camera button lost the prejoin state'));
+    await bob
+      .waitForFunction(
+        () => {
+          const erinRoster = document.querySelector('[data-testid="roster-erin"]')?.textContent ?? '';
+          return erinRoster.includes('mic off') && erinRoster.includes('cam on');
+        },
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(bob, 'bob').catch(() => {});
+        fail(`bob never saw erin's prejoin mute in the roster (status: ${await statusText(bob)})`);
+      });
+    console.log("erin's prejoin mute survived into the call (buttons and roster agree)");
+
     console.log('PASS: n-party call e2e green');
   } catch (err) {
     if (!(err instanceof FailSignal)) {

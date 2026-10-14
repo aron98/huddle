@@ -129,12 +129,17 @@ fn Prejoin(code: String) -> impl IntoView {
         play_silently(&video);
     });
 
-    // Re-acquire media when a device is picked.
+    // Re-acquire media when a device is picked. Fresh getUserMedia
+    // tracks always come back enabled, so the toggle state is re-applied
+    // to the new stream: switching the mic must not resurrect a muted
+    // track, and it must not disable a live camera either.
     fn reacquire(
         which: &'static str,
         id: Option<String>,
         camera_id: RwSignal<Option<String>>,
         mic_id: RwSignal<Option<String>>,
+        cam_on: RwSignal<bool>,
+        mic_on: RwSignal<bool>,
         stream: RwSignal<Option<MediaStream>>,
         status: RwSignal<Option<String>>,
     ) {
@@ -151,7 +156,11 @@ fn Prejoin(code: String) -> impl IntoView {
             )
             .await
             {
-                Ok(s) => stream.set(Some(s)),
+                Ok(s) => {
+                    media::set_track_kind_enabled(&s, "audio", mic_on.get_untracked());
+                    media::set_track_kind_enabled(&s, "video", cam_on.get_untracked());
+                    stream.set(Some(s));
+                }
                 Err(e) => status.set(Some(format!("{which} unavailable: {e}"))),
             }
         });
@@ -160,28 +169,28 @@ fn Prejoin(code: String) -> impl IntoView {
     let on_camera_change = move |ev| {
         let id = event_target_value(&ev);
         let id = if id.is_empty() { None } else { Some(id) };
-        reacquire("camera", id, camera_id, mic_id, stream, status);
+        reacquire(
+            "camera", id, camera_id, mic_id, cam_on, mic_on, stream, status,
+        );
     };
     let on_mic_change = move |ev| {
         let id = event_target_value(&ev);
         let id = if id.is_empty() { None } else { Some(id) };
-        reacquire("mic", id, camera_id, mic_id, stream, status);
+        reacquire("mic", id, camera_id, mic_id, cam_on, mic_on, stream, status);
     };
 
+    // Each toggle touches only its own track kind — a mic-off must never
+    // black out the camera preview (issue #7).
     let toggle_cam = move |_| {
         cam_on.update(|v| *v = !*v);
         if let Some(s) = stream.get_untracked() {
-            for track in media::tracks_of(&s) {
-                track.set_enabled(cam_on.get_untracked());
-            }
+            media::set_track_kind_enabled(&s, "video", cam_on.get_untracked());
         }
     };
     let toggle_mic = move |_| {
         mic_on.update(|v| *v = !*v);
         if let Some(s) = stream.get_untracked() {
-            for track in media::tracks_of(&s) {
-                track.set_enabled(mic_on.get_untracked());
-            }
+            media::set_track_kind_enabled(&s, "audio", mic_on.get_untracked());
         }
     };
 
@@ -237,7 +246,7 @@ fn Prejoin(code: String) -> impl IntoView {
 
             <label>
                 "Camera"
-                <select on:change=on_camera_change>
+                <select data-testid="camera-select" on:change=on_camera_change>
                     <option value="">"Default"</option>
                     <For each={move || cameras.get()} key=|d| d.id.clone() let:d>
                         <option
@@ -252,7 +261,7 @@ fn Prejoin(code: String) -> impl IntoView {
 
             <label>
                 "Microphone"
-                <select on:change=on_mic_change>
+                <select data-testid="mic-select" on:change=on_mic_change>
                     <option value="">"Default"</option>
                     <For each={move || microphones.get()} key=|d| d.id.clone() let:d>
                         <option
@@ -266,10 +275,10 @@ fn Prejoin(code: String) -> impl IntoView {
             </label>
 
             <div>
-                <button on:click=toggle_cam>
+                <button data-testid="prejoin-toggle-cam" on:click=toggle_cam>
                     {move || if cam_on.get() { "Camera on" } else { "Camera off" }}
                 </button>
-                <button on:click=toggle_mic>
+                <button data-testid="prejoin-toggle-mic" on:click=toggle_mic>
                     {move || if mic_on.get() { "Mic on" } else { "Mic off" }}
                 </button>
             </div>
@@ -342,8 +351,21 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
     let roster = RwSignal::<Vec<Participant>>::new(Vec::new());
     let speaking = RwSignal::<std::collections::HashSet<Uuid>>::new(Default::default());
     let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
-    let mic_on = RwSignal::new(true);
-    let cam_on = RwSignal::new(true);
+    // The prejoin toggles survive the handover: the local stream is the
+    // same object, so each track's `enabled` state is the truth to seed
+    // the buttons from — muted on prejoin renders "Mic off" in-call.
+    let mic_on = RwSignal::new(
+        local
+            .as_ref()
+            .map(|s| media::track_kind_enabled(s, "audio"))
+            .unwrap_or(true),
+    );
+    let cam_on = RwSignal::new(
+        local
+            .as_ref()
+            .map(|s| media::track_kind_enabled(s, "video"))
+            .unwrap_or(true),
+    );
     let sharing = RwSignal::new(false);
     // Chat messages (live relay + history replay) shown in the sidebar.
     let chat = RwSignal::<Vec<huddle_protocol::ChatMessage>>::new(Vec::new());
@@ -435,6 +457,23 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             return;
         }
         status.set(None);
+
+        // A prejoin mute must survive into the call for everyone: the
+        // roster's canonical state lives on the server, which assumes a
+        // fresh joiner is live, so mirror the actual track state once
+        // media is up. Only a muted track needs the correction.
+        if let Some(local) = &local {
+            let audio_muted = !media::track_kind_enabled(local, "audio");
+            let video_muted = !media::track_kind_enabled(local, "video");
+            if (audio_muted || video_muted)
+                && let Err(e) = client
+                    .set_mute_state(Some(audio_muted), Some(video_muted))
+                    .await
+            {
+                status.set(Some(format!("Disconnected: {e}")));
+                return;
+            }
+        }
 
         // The screen-share flow reports the browser's own stop-sharing
         // signal (track ended) back into the session through the same
@@ -585,11 +624,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             mic_on.update(|v| *v = !*v);
             let muted = !mic_on.get_untracked();
             if let Some(s) = &local {
-                for track in media::tracks_of(s) {
-                    if track.kind() == "audio" {
-                        track.set_enabled(!muted);
-                    }
-                }
+                media::set_track_kind_enabled(s, "audio", !muted);
             }
             let _ = ui_tx.unbounded_send(UiAction::Mute {
                 audio_muted: Some(muted),
@@ -604,11 +639,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
             cam_on.update(|v| *v = !*v);
             let muted = !cam_on.get_untracked();
             if let Some(s) = &local {
-                for track in media::tracks_of(s) {
-                    if track.kind() == "video" {
-                        track.set_enabled(!muted);
-                    }
-                }
+                media::set_track_kind_enabled(s, "video", !muted);
             }
             let _ = ui_tx.unbounded_send(UiAction::Mute {
                 audio_muted: None,
