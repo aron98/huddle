@@ -40,3 +40,8 @@ app: Leptos, Dioxus, Yew. Native-only clients (egui, iced) were also considered.
 - *Yew*: oldest ecosystem but heavier reactivity model.
 - *egui/iced native*: doubles the media-stack surface for desktop that almost
   nobody in the self-host audience needs; rejected.
+
+## Amendment (2026-10-14)
+
+- The post-MVP Tauri shell is tracked in
+  [#18](https://github.com/aron98/huddle/issues/18).

@@ -99,6 +99,29 @@ pub fn tracks_of(stream: &MediaStream) -> Vec<MediaStreamTrack> {
         .collect()
 }
 
+/// Enable or disable every track of one kind (`"audio"` or `"video"`) in
+/// the stream, leaving the other kind untouched. Both the prejoin and
+/// in-call toggles go through here so the two pages cannot drift into
+/// muting the whole stream again (issue #7).
+pub fn set_track_kind_enabled(stream: &MediaStream, kind: &str, enabled: bool) {
+    for track in tracks_of(stream) {
+        if track.kind() == kind {
+            track.set_enabled(enabled);
+        }
+    }
+}
+
+/// Whether every track of `kind` in the stream is enabled. A stream with
+/// no such track reads as enabled — there is nothing muted about it — so
+/// the call view can seed its toggle buttons straight from the local
+/// stream and have a prejoin mute survive the join.
+pub fn track_kind_enabled(stream: &MediaStream, kind: &str) -> bool {
+    tracks_of(stream)
+        .into_iter()
+        .filter(|track| track.kind() == kind)
+        .all(|track| track.enabled())
+}
+
 /// Root-mean-square level above which the local audio counts as speech.
 const SPEAKING_RMS: f32 = 0.03;
 /// How often the level is sampled.

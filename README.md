@@ -8,66 +8,40 @@ huddle is an open-source video meeting application you can run as a single binar
 on your own server: one process, one SQLite file, one TURN companion. No JVM, no
 Node farm, no 40-step install guide.
 
-## Status
+See [Development](#development) for the dev loop or
+[Self-hosting](#self-hosting) for production deployment.
 
-🚧 **Phases 0–6 complete** — the foundations, the four independent tracks, the
-two-person call, n-party support, screen share + chat, scheduling with
-organizer auth, and the hardening pass (metrics, security, TURN, deploy
-artifacts) from the [implementation plan](docs/implementation-plan.md) are
-done:
+## Documentation
 
-- `protocol` — v1 signaling and REST wire messages, including speaking
-  indicators and screen-share state.
-- `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web
-  UI, `/ws` signaling sessions, a media engine thread driving one SFU room
-  per meeting over UDP, chat persistence with history replay on join,
-  magic-link login with hashed single-use tokens (lettre delivery with a log
-  fallback), signed session cookies, organizer-owned meetings, ICS export,
-  a Prometheus `/metrics` endpoint (per-room and per-peer counters, bitrates,
-  RTT, loss), per-IP rate limits on auth requests and new websocket
-  connections, a 256 KiB cap on signaling frames, and a CSP (with a
-  runtime-computed hash allowance for the trunk bootstrap script) plus
-  `nosniff` on all served UI assets.
-- `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
-  SDP answering, media forwarding, keyframe fan-out to new subscribers, track
-  recycling when participants leave, mute-gated forwarding, a screen-share
-  lifecycle (labeled `-screen` streams, reshare on the same transceiver,
-  screen tracks immune to camera mute), and per-peer `PeerStats` snapshots
-  (bytes, bitrates, RTT, loss) fed by str0m's stats events — tested with
-  synthetic in-process clients and a real-UDP loopback.
-- `web` — Leptos prejoin page (camera preview, device pickers, name), an
-  `RtcClient` signaling driver tested against a mock server, and an in-call
-  view with an adaptive tile grid, roster, speaking indicators (Web Audio RMS
-  detection), screen share with dedicated tiles, an in-call chat sidebar, and
-  mic/camera/share/leave controls — plus a login page, a meeting dashboard,
-  and a `?turn=relay` test knob that forces every ICE candidate through the
-  configured TURN relay.
-- Infra — CI (fmt, clippy native + wasm32, tests, helm lint, headless-Chrome
-  render check, a four-browser-page call e2e with join/leave churn, screen
-  share, and chat-across-reload assertions that verify media flows *through
-  the server*, a magic-link + dashboard e2e, and a TURN-relayed call e2e
-  that proves browser → coturn → SFU with relay-only ICE), multi-stage
-  Dockerfile, dev compose stack with coturn, a Helm chart, and a release
-  workflow that ships the web client baked into one static musl binary.
-
-**MVP complete.** Post-MVP backlog: OIDC/SAML identity providers, simulcast,
-per-meeting passcodes, E2EE, recording, a Cloudflare Workers port, Tauri
-desktop, RRULE support (see the [implementation plan](docs/implementation-plan.md)).
-
-- [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
-- [Implementation plan](docs/implementation-plan.md) — build order and parallelization
 - [ADRs](docs/adr/) — the decisions we've made and why
+- [Post-MVP milestone](https://github.com/aron98/huddle/milestone/1) — what's
+  next
 
-## MVP scope
+## Features
 
-| Feature | In |
-|---|---|
-| Scheduled meetings (magic-link login, ICS export, join windows) | ✅ |
-| Camera + microphone for all participants | ✅ |
-| Screen sharing | ✅ |
-| Chat (relayed + persisted per meeting) | ✅ |
-| Recording, E2EE, simulcast, calendar recurrence, OIDC/SAML | ❌ post-MVP |
+- **Multi-party video calls** — camera and microphone for every participant,
+  routed through a hand-rolled SFU on
+  [str0m](https://github.com/lookback-io/str0m): each client uploads its media
+  once (linear, not mesh), late joiners get keyframes instead of frozen tiles,
+  and muting stops forwarding at the server.
+- **Screen sharing** — dedicated tiles, immune to camera mute, with the
+  browser's own "stop sharing" handled.
+- **Chat** — relayed and persisted per meeting; history replays on join and
+  survives a reload.
+- **A modern web client in Rust** — Leptos compiled to WASM (about 300 KB
+  gzipped): a prejoin page with camera preview and device pickers, an adaptive
+  tile grid, roster, speaking indicators, and an in-call chat sidebar.
+- **Scheduled meetings** — magic-link login for organizers, a meeting
+  dashboard, ICS export for calendars, and join windows; guests join with just
+  a display name, no account.
+- **Small and observable** — one static binary with the web UI baked in (~10 MB
+  idle RSS), SQLite storage, a Prometheus `/metrics` endpoint, per-IP rate
+  limiting, and TURN via coturn for locked-down networks.
+
+**Project status:** the MVP is complete — see the
+[post-MVP milestone](https://github.com/aron98/huddle/milestone/1) for what's
+next (SSO, simulcast, passcodes, E2EE, recording, and more).
 
 ## Stack
 
