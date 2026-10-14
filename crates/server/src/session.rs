@@ -84,6 +84,8 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::MuteState { audio_muted, video_muted } => {
                         engine.mute(code.clone(), id, audio_muted, video_muted);
                     }
+                    // Wired up in the follow-up engine commit.
+                    ClientMessage::Speaking { .. } => {}
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;

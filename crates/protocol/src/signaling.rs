@@ -108,6 +108,11 @@ pub enum ClientMessage {
         audio_muted: Option<bool>,
         video_muted: Option<bool>,
     },
+    /// Self-reported voice activity (detected locally, relayed so every
+    /// participant can ring the speaker's tile).
+    Speaking {
+        speaking: bool,
+    },
     /// Graceful leave; the socket closing implies the same.
     Leave,
 }
@@ -156,6 +161,12 @@ pub enum ServerMessage {
         id: ParticipantId,
         audio_muted: bool,
         video_muted: bool,
+    },
+    /// Broadcast voice activity, including echo back to the originator so
+    /// every client has one authoritative speaker set.
+    Speaking {
+        id: ParticipantId,
+        speaking: bool,
     },
     Error {
         code: ErrorCode,
@@ -283,5 +294,24 @@ mod tests {
     fn unknown_type_is_rejected() {
         let err = serde_json::from_str::<ClientMessage>(r#"{"type": "nope"}"#);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn speaking_round_trips_both_directions() {
+        let msg = ClientMessage::Speaking { speaking: true };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "speaking", "speaking": true}));
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+
+        let msg = ServerMessage::Speaking {
+            id: Uuid::nil(),
+            speaking: false,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "speaking", "id": Uuid::nil().to_string(), "speaking": false})
+        );
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
     }
 }

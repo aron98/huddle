@@ -270,6 +270,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 }
                 Ok(())
             }
+            // Surfaced to the UI in a follow-up commit.
+            ServerMessage::Speaking { .. } => Ok(()),
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }

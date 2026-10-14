@@ -123,6 +123,8 @@ impl MockState {
                 video_muted: false,
             }],
             ClientMessage::SdpAnswer { .. } | ClientMessage::Leave => vec![],
+            // Scripted in a follow-up commit.
+            ClientMessage::Speaking { .. } => vec![],
         }
     }
 }
