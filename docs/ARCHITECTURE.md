@@ -176,12 +176,20 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 ## Security
 
 - Media is always DTLS-SRTP (handled by the stack).
-- Organizers: magic-link tokens hashed at rest, short TTL; session cookie.
+- TLS is terminated by a reverse proxy in front of the plain-HTTP server —
+  see [ADR 005](adr/005-tls-via-reverse-proxy.md) and the README's
+  Encryption / Self-hosting → HTTPS sections for the full story (what is
+  encrypted in flight, what the server inherently sees, copy-pasteable
+  proxy configs).
+- Organizers: magic-link tokens hashed at rest, short TTL; session cookie
+  (gains `Secure` when `base_url` is `https://`).
 - Meeting links are capabilities; per-meeting passcodes post-MVP.
 - Rate-limit join attempts + WS message size caps.
 - E2EE (insertable streams, à la Jitsi) is *architecturally possible* only in the
   self-hosted SFU path — a managed-media port (e.g. Cloudflare Calls) would
-  preclude it. Decide before ever promising it. Post-MVP.
+  preclude it. Decide before ever promising it. Post-MVP — tracked as
+  [#14](https://github.com/aron98/huddle/issues/14). Until then the server
+  can, like any SFU, see all media it forwards.
 
 ## Risks
 
