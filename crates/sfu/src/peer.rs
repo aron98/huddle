@@ -32,8 +32,9 @@ pub(crate) struct TrackInEntry {
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
-/// this peer should receive). Phase 1 has no m-line recycling: a track
-/// only moves forward `ToOpen -> Negotiating -> Open`.
+/// this peer should receive). Tracks move forward `ToOpen -> Negotiating ->
+/// Open`; when the origin disappears they wind down through
+/// `ToStop -> NegotiatingStop` and are dropped once the stop is answered.
 pub(crate) enum TrackOutState {
     /// Needs an SDP m-line allocated in the next renegotiation.
     ToOpen,
@@ -41,6 +42,12 @@ pub(crate) enum TrackOutState {
     Negotiating(Mid),
     /// Fully negotiated; media can be written to `Mid`.
     Open(Mid),
+    /// The origin went away; the m-line is stopped in the next
+    /// renegotiation. No media is forwarded from here on.
+    ToStop(Mid),
+    /// A stop offer has been sent; waiting for the answer to drop the
+    /// entry (a stopped m-line can never be reactivated).
+    NegotiatingStop(Mid),
 }
 
 /// An outgoing track entry on the receiving peer.
@@ -136,16 +143,18 @@ impl Peer {
     /// Accept an SDP offer from the client and produce the answer.
     ///
     /// `accept_offer` invalidates any pending offer we sent, so tracks that
-    /// were mid-negotiation are reset to `ToOpen` and renegotiated on the
-    /// next poll.
+    /// were mid-negotiation are reset to `ToOpen` (or back to `ToStop` for
+    /// in-flight stops) and renegotiated on the next poll.
     pub(crate) fn answer_sdp_offer(&mut self, sdp: &str) -> Result<String, SfuError> {
         let offer = SdpOffer::from_sdp_string(sdp)?;
         let answer = self.rtc.sdp_api().accept_offer(offer)?;
         self.pending = None;
         self.has_session = true;
         for out in &mut self.tracks_out {
-            if matches!(out.state, TrackOutState::Negotiating(_)) {
-                out.state = TrackOutState::ToOpen;
+            match out.state {
+                TrackOutState::Negotiating(_) => out.state = TrackOutState::ToOpen,
+                TrackOutState::NegotiatingStop(mid) => out.state = TrackOutState::ToStop(mid),
+                _ => {}
             }
         }
         Ok(answer.to_sdp_string())
@@ -158,9 +167,18 @@ impl Peer {
         };
         let answer = SdpAnswer::from_sdp_string(sdp)?;
         self.rtc.sdp_api().accept_answer(pending, answer)?;
+        // Stops are confirmed by the answer: the m-line is dead and the
+        // entry can go. Adds become live; if their origin vanished while
+        // the offer was in flight, wind them straight back down.
+        self.tracks_out
+            .retain(|out| !matches!(out.state, TrackOutState::NegotiatingStop(_)));
         for out in &mut self.tracks_out {
             if let TrackOutState::Negotiating(mid) = out.state {
-                out.state = TrackOutState::Open(mid);
+                out.state = if out.track_in.upgrade().is_some() {
+                    TrackOutState::Open(mid)
+                } else {
+                    TrackOutState::ToStop(mid)
+                };
             }
         }
         Ok(())
@@ -188,6 +206,16 @@ impl Peer {
         self.rtc.accepts(input)
     }
 
+    /// Number of forwardable outgoing track entries (any state).
+    pub(crate) fn tracks_out_count(&self) -> usize {
+        self.tracks_out.len()
+    }
+
+    /// Number of incoming tracks.
+    pub(crate) fn tracks_in_count(&self) -> usize {
+        self.tracks_in.len()
+    }
+
     /// All incoming tracks of this peer, for replaying to a newcomer.
     pub(crate) fn tracks_in(&self) -> impl Iterator<Item = &Arc<TrackIn>> {
         self.tracks_in.iter().map(|e| &e.track)
@@ -204,8 +232,8 @@ impl Peer {
         });
     }
 
-    /// If any tracks are waiting to be opened, bundle them into a single
-    /// renegotiation offer and return its SDP string.
+    /// If any tracks are waiting to be opened or stopped, bundle them into
+    /// a single renegotiation offer and return its SDP string.
     pub(crate) fn negotiate_if_needed(&mut self) -> Option<String> {
         if !self.has_session || self.pending.is_some() {
             return None;
@@ -213,21 +241,53 @@ impl Peer {
 
         let mut changes = self.rtc.sdp_api();
         for out in &mut self.tracks_out {
-            if matches!(out.state, TrackOutState::ToOpen) {
-                let mid = changes.add_media(
-                    out.kind,
-                    Direction::SendOnly,
-                    Some(out.origin.to_string()),
-                    None,
-                    None,
-                );
-                out.state = TrackOutState::Negotiating(mid);
+            match out.state {
+                TrackOutState::ToOpen => {
+                    let mid = changes.add_media(
+                        out.kind,
+                        Direction::SendOnly,
+                        Some(out.origin.to_string()),
+                        None,
+                        None,
+                    );
+                    out.state = TrackOutState::Negotiating(mid);
+                }
+                TrackOutState::ToStop(mid) => {
+                    changes.stop_media(mid);
+                    out.state = TrackOutState::NegotiatingStop(mid);
+                }
+                _ => {}
             }
         }
 
         let (offer, pending) = changes.apply()?;
         self.pending = Some(pending);
         Some(offer.to_sdp_string())
+    }
+
+    /// Wind down entries whose origin track is gone (its peer left).
+    ///
+    /// Un-negotiated entries are dropped outright; negotiated ones are
+    /// stopped in the next renegotiation so the browser's m-line goes
+    /// away with the departed participant.
+    pub(crate) fn reap_dead_tracks(&mut self) {
+        self.tracks_out.retain_mut(|out| {
+            if out.track_in.upgrade().is_some() {
+                return true;
+            }
+            match out.state {
+                TrackOutState::ToOpen => false,
+                TrackOutState::Open(mid) => {
+                    out.state = TrackOutState::ToStop(mid);
+                    true
+                }
+                // Already stopping; the answer completes the removal.
+                TrackOutState::ToStop(_) | TrackOutState::NegotiatingStop(_) => true,
+                // Mid-add with a dead origin: let the answer land, the
+                // post-answer sweep turns it into a stop.
+                TrackOutState::Negotiating(_) => true,
+            }
+        });
     }
 
     /// Poll one step of the underlying `Rtc` and translate it into an

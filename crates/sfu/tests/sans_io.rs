@@ -223,6 +223,141 @@ fn two_clients_exchange_media_both_ways() {
 }
 
 #[test]
+fn departed_peers_tracks_are_stopped_and_dropped() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let mut c = TestClient::new(3);
+    let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    c.join(&mut room);
+
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, clients| {
+        clients.iter().all(|x| x.connected)
+    });
+    a.send_audio(10);
+    b.send_audio(10);
+    c.send_audio(10);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |room, _| {
+        [a_id, b_id, c_id].iter().all(|&id| {
+            room.peer_stats(id)
+                .is_some_and(|s| s.rx_frames >= 5 && s.tx_frames >= 5)
+        })
+    });
+
+    // Full mesh: a forwards to both b and c.
+    let (_, a_out) = room.peer_tracks(a_id).unwrap();
+    assert_eq!(a_out, 2, "a should forward to b and c");
+
+    // c departs. The survivors must renegotiate the dead m-lines away.
+    room.remove_peer(c_id);
+    assert!(room.peer_tracks(c_id).is_none());
+
+    drive(&mut room, &mut [&mut a, &mut b], |room, _| {
+        let (_, a_out) = room.peer_tracks(a_id).unwrap();
+        let (_, b_out) = room.peer_tracks(b_id).unwrap();
+        a_out == 1 && b_out == 1
+    });
+
+    // Media still flows between the survivors.
+    let (wm_a, wm_b) = (a.media_rx, b.media_rx);
+    a.send_audio(10);
+    b.send_audio(10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients[0].media_rx > wm_a && clients[1].media_rx > wm_b
+    });
+}
+
+#[test]
+fn departure_during_negotiation_is_swept_after_the_answer_lands() {
+    // A race the room must survive: the renegotiation ADD offer for c's
+    // track is already in a's hands when c departs. The answer converts
+    // the just-added line, and the post-answer sweep must wind it back
+    // down instead of leaving a zombie forwarding entry.
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut c = TestClient::new(2);
+    let a_id = a.id;
+    a.join(&mut room);
+    c.join(&mut room);
+
+    // Drive until the room hands a the add offer, but hold it: a must
+    // not answer before c is gone. Both directions are pumped (like
+    // `step`) so ICE completes and the room sees c's track arrive.
+    let held = {
+        let mut held = None;
+        let start = Instant::now();
+        while held.is_none() && start.elapsed() < DRIVE_BUDGET {
+            let now = Instant::now();
+            for id in room.peer_ids() {
+                loop {
+                    match room.poll_output(id) {
+                        Some(SfuOutput::Transmit {
+                            destination,
+                            contents,
+                            ..
+                        }) => {
+                            for client in [&mut a, &mut c] {
+                                if client.addr == destination {
+                                    client.feed(MEDIA_ADDR, &contents);
+                                }
+                            }
+                        }
+                        Some(SfuOutput::SdpOffer { peer, sdp }) => {
+                            if peer == a_id {
+                                held = Some(sdp);
+                                break;
+                            }
+                            // The newcomer's own add offer is business as
+                            // usual: let c answer it.
+                            c.handle_server_offer(&mut room, &sdp);
+                        }
+                        Some(SfuOutput::Timeout(_)) | None => break,
+                        Some(SfuOutput::PeerConnected(_)) | Some(SfuOutput::PeerGone(_)) => {}
+                    }
+                }
+            }
+            for client in [&mut a, &mut c] {
+                loop {
+                    match client.rtc.poll_output() {
+                        Ok(Output::Transmit(t)) => {
+                            let receive =
+                                Receive::new(Protocol::Udp, client.addr, MEDIA_ADDR, &t.contents)
+                                    .unwrap();
+                            room.handle_input(Input::Receive(Instant::now(), receive));
+                        }
+                        Ok(Output::Timeout(_)) => break,
+                        Ok(Output::Event(e)) => {
+                            if let Event::Connected = e {
+                                client.connected = true;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = client.rtc.handle_input(Input::Timeout(now));
+            }
+            room.handle_timeout(now);
+        }
+        held.expect("renegotiation offer for a")
+    };
+
+    // c departs with the offer still unanswered.
+    room.remove_peer(c.id);
+
+    // Now the answer lands: the swept entry turns into a stop and is
+    // renegotiated away entirely.
+    a.handle_server_offer(&mut room, &held);
+    assert_eq!(room.peer_tracks(a_id).unwrap().1, 1, "zombie entry");
+
+    drive(&mut room, &mut [&mut a], |room, _| {
+        room.peer_tracks(a_id).unwrap().1 == 0
+    });
+    assert!(a.connected, "a must survive the churn");
+}
+
+#[test]
 fn room_api_errors() {
     let mut room = Room::new(MEDIA_ADDR);
     let id = PeerId::new_v4();

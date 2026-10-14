@@ -74,10 +74,15 @@ impl Room {
         Ok(())
     }
 
-    /// Remove a participant, disconnecting its `Rtc`.
+    /// Remove a participant, disconnecting its `Rtc`. Every remaining
+    /// peer's forwarding table is swept so tracks sourced by the departed
+    /// peer are wound down (and their m-lines stopped) in renegotiation.
     pub fn remove_peer(&mut self, id: PeerId) {
         if let Some(mut peer) = self.peers.remove(&id) {
             peer.disconnect();
+        }
+        for peer in self.peers.values_mut() {
+            peer.reap_dead_tracks();
         }
     }
 
@@ -97,6 +102,15 @@ impl Room {
             rx_frames: p.rx_frames,
             tx_frames: p.tx_frames,
         })
+    }
+
+    /// `(incoming, outgoing)` track counts for one peer — outgoing counts
+    /// every entry, including ones being torn down. For tests and the
+    /// future `/stats` endpoint.
+    pub fn peer_tracks(&self, id: PeerId) -> Option<(usize, usize)> {
+        self.peers
+            .get(&id)
+            .map(|p| (p.tracks_in_count(), p.tracks_out_count()))
     }
 
     /// Answer a peer's SDP offer.
