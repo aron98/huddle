@@ -1,10 +1,13 @@
 #!/usr/bin/env node
-// Two-person end-to-end call test.
+// N-party end-to-end call test with join/leave churn.
 //
-// Boots a real huddle server, opens the meeting in two headless Chrome
+// Boots a real huddle server, opens the meeting in headless Chrome
 // pages with fake cameras/microphones, and asserts that each page
-// receives the other's audio *and* video through the SFU (there is no
-// peer-to-peer path at all), and that mute state broadcasts propagate.
+// receives the others' audio *and* video through the SFU (there is no
+// peer-to-peer path at all), that a late joiner gets fresh media
+// rather than frozen tiles, that a departing participant's tile and
+// roster entry disappear everywhere, and that mute state broadcasts
+// propagate.
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -129,10 +132,11 @@ async function mediaProbe(page, peer) {
     const stats = await pc.getStats();
     let audioBytes = 0;
     let videoBytes = 0;
+    // One inbound-rtp report per ssrc: sum across every remote peer.
     stats.forEach((report) => {
       if (report.type === 'inbound-rtp') {
-        if (report.kind === 'audio') audioBytes = report.bytesReceived ?? 0;
-        if (report.kind === 'video') videoBytes = report.bytesReceived ?? 0;
+        if (report.kind === 'audio') audioBytes += report.bytesReceived ?? 0;
+        if (report.kind === 'video') videoBytes += report.bytesReceived ?? 0;
       }
     });
     return {
@@ -188,17 +192,18 @@ async function main() {
       ],
     });
 
-    const alice = await browser.newPage();
-    const bob = await browser.newPage();
-    for (const [page, who] of [
-      [alice, 'alice'],
-      [bob, 'bob'],
-    ]) {
+    // Every participant gets a console/pageerror relay into the job log.
+    const newClient = async (who) => {
+      const page = await browser.newPage();
       page.on('console', (m) => {
         if (m.type() !== 'warning') console.log(`[${who} console:${m.type()}]`, m.text());
       });
       page.on('pageerror', (e) => console.log(`[${who} pageerror]`, e.message));
-    }
+      return page;
+    };
+
+    const alice = await newClient('alice');
+    const bob = await newClient('bob');
 
     console.log('alice and bob join the meeting');
     await joinAs(alice, code, 'alice');
@@ -218,17 +223,81 @@ async function main() {
     await waitTile(bob, '[data-testid="tile-alice"]', 'bob');
 
     console.log('asserting media flows through the server');
-    for (const [page, peer, who] of [[alice, 'bob', 'alice'], [bob, 'alice', 'bob']]) {
-      const m = await waitFor(
+    const waitMedia = async (page, peer, who) => {
+      let probe = null;
+      await waitFor(
         `${who} receiving ${peer}'s media`,
         async () => {
-          const p = await mediaProbe(page, peer);
-          return p.hasStream && p.audioBytes > 0 && p.videoBytes > 0 ? p : null;
+          probe = await mediaProbe(page, peer);
+          return probe.hasStream && probe.audioBytes > 0 && probe.videoBytes > 0;
         },
         60_000,
-      );
-      console.log(`${who} <- ${peer}: ${JSON.stringify(m)}`);
+      ).catch(async () => {
+        await stateDump(page, who).catch(() => {});
+        fail(`${who}: no media arriving from ${peer}: ${JSON.stringify(probe)}`);
+      });
+      console.log(`${who} <- ${peer}: ${JSON.stringify(probe)}`);
+    };
+    await waitMedia(alice, 'bob', 'alice');
+    await waitMedia(bob, 'alice', 'bob');
+
+    console.log('carol joins late');
+    const carol = await newClient('carol');
+    await joinAs(carol, code, 'carol');
+
+    // A late joiner must get a live view of the existing participants,
+    // not a frozen tile: the keyframe fan-out should make their video
+    // start decoding immediately.
+    await waitTile(carol, '[data-testid="tile-alice"]', 'carol');
+    await waitTile(carol, '[data-testid="tile-bob"]', 'carol');
+    await waitTile(alice, '[data-testid="tile-carol"]', 'alice');
+    await waitTile(bob, '[data-testid="tile-carol"]', 'bob');
+    let carolProbe = null;
+    await waitFor(
+      'carol receiving existing media',
+      async () => {
+        carolProbe = await mediaProbe(carol, 'alice');
+        return carolProbe.hasStream && carolProbe.audioBytes > 0 && carolProbe.videoBytes > 0;
+      },
+      60_000,
+    ).catch(async () => {
+      await stateDump(carol, 'carol').catch(() => {});
+      fail(`carol: no media arriving from existing participants: ${JSON.stringify(carolProbe)}`);
+    });
+    console.log(`carol <- alice+bob: ${JSON.stringify(carolProbe)}`);
+
+    console.log('dave joins, is seen, then leaves');
+    const dave = await newClient('dave');
+    await joinAs(dave, code, 'dave');
+    await waitTile(alice, '[data-testid="tile-dave"]', 'alice');
+    await waitTile(bob, '[data-testid="tile-dave"]', 'bob');
+    await waitTile(carol, '[data-testid="tile-dave"]', 'carol');
+    for (const who of ['alice', 'bob', 'carol']) {
+      await waitTile(dave, `[data-testid="tile-${who}"]`, 'dave');
     }
+
+    await dave.click('[data-testid="leave-btn"]');
+    await dave.waitForFunction(
+      () => (document.querySelector('[data-testid="call-status"]')?.textContent ?? '').includes('left'),
+      { timeout: 30_000, polling: 250 },
+    );
+    // Dave's tile and roster entry must vanish on every remaining page.
+    for (const [page, who] of [
+      [alice, 'alice'],
+      [bob, 'bob'],
+      [carol, 'carol'],
+    ]) {
+      await page.waitForFunction(
+        () =>
+          !document.querySelector('[data-testid="tile-dave"]') &&
+          !document.querySelector('[data-testid="roster-dave"]'),
+        { timeout: 30_000, polling: 250 },
+      ).catch(async (e) => {
+        await stateDump(page, who).catch(() => {});
+        fail(`${who}: dave never disappeared after leaving`);
+      });
+    }
+    console.log('dave left; tiles and roster entries cleaned up everywhere');
 
     console.log('asserting mute state propagates');
     await alice.click('[data-testid="toggle-mic"]');
@@ -238,7 +307,7 @@ async function main() {
     );
     console.log('bob sees alice (mic off, cam on)');
 
-    console.log('PASS: two-person call e2e green');
+    console.log('PASS: n-party call e2e green');
   } catch (err) {
     if (!(err instanceof FailSignal)) {
       console.error(`FAIL: unexpected error: ${err?.stack ?? err}`);
