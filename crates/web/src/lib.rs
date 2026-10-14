@@ -6,6 +6,8 @@
 //! Leptos CSR app: the prejoin page and (later) the in-call UI.
 
 #[cfg(target_arch = "wasm32")]
+pub mod api;
+#[cfg(target_arch = "wasm32")]
 pub mod media;
 pub mod rtc;
 
@@ -41,7 +43,13 @@ pub fn App() -> impl IntoView {
 
     match code {
         Some(code) => view! { <Prejoin code={code.to_owned()} /> }.into_any(),
-        None => view! { <Landing /> }.into_any(),
+        None => match path.as_str() {
+            #[cfg(target_arch = "wasm32")]
+            "/login" => view! { <Login /> }.into_any(),
+            #[cfg(target_arch = "wasm32")]
+            "/meetings" => view! { <Dashboard /> }.into_any(),
+            _ => view! { <Landing /> }.into_any(),
+        },
     }
 }
 
@@ -55,6 +63,11 @@ fn Landing() -> impl IntoView {
                 "Open a meeting link like "
                 <code>"/m/H7KD-PM2X-QR4T"</code>
                 " to join."
+            </p>
+            <p>
+                <a href="/login" data-testid="nav-login">"Sign in"</a>
+                " · "
+                <a href="/meetings" data-testid="nav-meetings">"My meetings"</a>
             </p>
         </main>
     }
@@ -795,5 +808,317 @@ fn VideoTile(
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>{label}</figcaption>
         </figure>
+    }
+}
+
+/// The organizer sign-in page: request a one-time magic link by email.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn Login() -> impl IntoView {
+    let email = RwSignal::new(String::new());
+    let status = RwSignal::<Option<String>>::new(None);
+
+    let submit = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let address = email.get_untracked().trim().to_owned();
+        if address.is_empty() {
+            status.set(Some("Enter your email first.".to_owned()));
+            return;
+        }
+        status.set(Some("Sending…".to_owned()));
+        let body = serde_json::json!({ "email": address }).to_string();
+        spawn_local(async move {
+            match api::fetch_text("POST", "/api/auth/request-link", Some(body)).await {
+                Ok((200, _)) => status.set(Some(
+                    "Check your email — a sign-in link is on its way. \
+                     (Running without SMTP? The link is printed in the server log.)"
+                        .to_owned(),
+                )),
+                Ok((_, text)) => status.set(Some(format!("Could not send the link: {text}"))),
+                Err(e) => status.set(Some(format!("Could not send the link: {e}"))),
+            }
+        });
+    };
+
+    view! {
+        <main>
+            <h1>"Sign in"</h1>
+            <p>"We'll email you a one-time sign-in link. No passwords."</p>
+            <form on:submit=submit>
+                <label>
+                    "Email"
+                    <input
+                        type="email"
+                        placeholder="you@example.com"
+                        data-testid="login-email"
+                        prop:value=email
+                        on:input=move |ev| email.set(event_target_value(&ev))
+                    />
+                </label>
+                <button type="submit" data-testid="login-submit">"Email me a link"</button>
+            </form>
+            {move || {
+                status
+                    .get()
+                    .map(|s| view! { <p data-testid="login-status" role="status">{s}</p> })
+            }}
+        </main>
+    }
+}
+
+/// The organizer dashboard: list, create, and manage the meetings you own.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn Dashboard() -> impl IntoView {
+    use huddle_protocol::{CreateMeetingRequest, Joinability, MeetingResponse};
+    use time::format_description::well_known::Rfc3339;
+
+    let organizer_email = RwSignal::<Option<String>>::new(None);
+    let meetings = RwSignal::<Vec<MeetingResponse>>::new(Vec::new());
+    let signed_out = RwSignal::new(false);
+    let status = RwSignal::<Option<String>>::new(None);
+    let title = RwSignal::new(String::new());
+    let starts = RwSignal::new(String::new());
+    let ends = RwSignal::new(String::new());
+
+    // Refresh the owned-meetings list in the background.
+    fn refresh(meetings: RwSignal<Vec<MeetingResponse>>) {
+        spawn_local(async move {
+            if let Ok((200, body)) = api::fetch_text("GET", "/api/meetings/mine", None).await
+                && let Ok(list) = serde_json::from_str::<Vec<MeetingResponse>>(&body)
+            {
+                meetings.set(list);
+            }
+        });
+    }
+
+    // Initial load: session first, then the list.
+    spawn_local(async move {
+        match api::fetch_text("GET", "/api/auth/me", None).await {
+            Ok((200, body)) => {
+                if let Ok(me) = serde_json::from_str::<serde_json::Value>(&body) {
+                    organizer_email.set(me["email"].as_str().map(str::to_owned));
+                }
+            }
+            Ok((401, _)) => signed_out.set(true),
+            Ok((_, text)) => status.set(Some(format!("Could not load your session: {text}"))),
+            Err(e) => status.set(Some(format!("Could not load your session: {e}"))),
+        }
+        if !signed_out.get_untracked() {
+            refresh(meetings);
+        }
+    });
+
+    let create = move |ev: leptos::ev::SubmitEvent| {
+        ev.prevent_default();
+        let parse_time = |raw: &str| {
+            api::local_datetime_to_rfc3339(raw)
+                .and_then(|s| time::OffsetDateTime::parse(&s, &Rfc3339).ok())
+        };
+        let starts_at = match parse_time(&starts.get_untracked()) {
+            Some(v) => v,
+            None => {
+                status.set(Some("Pick a start time.".to_owned()));
+                return;
+            }
+        };
+        let ends_at = match parse_time(&ends.get_untracked()) {
+            Some(v) => v,
+            None => {
+                status.set(Some("Pick an end time.".to_owned()));
+                return;
+            }
+        };
+        let request = CreateMeetingRequest {
+            title: title.get_untracked().trim().to_owned(),
+            starts_at,
+            ends_at,
+        };
+        if let Err(message) = request.validate() {
+            status.set(Some(message.to_owned()));
+            return;
+        }
+        let Ok(body) = serde_json::to_string(&request) else {
+            status.set(Some("Could not encode the meeting.".to_owned()));
+            return;
+        };
+        status.set(Some("Creating…".to_owned()));
+        spawn_local(async move {
+            match api::fetch_text("POST", "/api/meetings", Some(body)).await {
+                Ok((201, _)) => {
+                    status.set(None);
+                    title.set(String::new());
+                    starts.set(String::new());
+                    ends.set(String::new());
+                    refresh(meetings);
+                }
+                Ok((_, text)) => status.set(Some(format!("Could not create the meeting: {text}"))),
+                Err(e) => status.set(Some(format!("Could not create the meeting: {e}"))),
+            }
+        });
+    };
+
+    // Closures that only capture `Copy` signals are themselves `Copy`, so
+    // one definition serves every row.
+    let cancel = move |code: String| {
+        spawn_local(async move {
+            match api::fetch_text("DELETE", &format!("/api/meetings/{code}"), None).await {
+                Ok((200, _)) => refresh(meetings),
+                Ok((_, text)) => status.set(Some(format!("Could not cancel: {text}"))),
+                Err(e) => status.set(Some(format!("Could not cancel: {e}"))),
+            }
+        });
+    };
+    let copy_link = move |code: String| {
+        let url = format!(
+            "{}/m/{code}",
+            window().location().origin().unwrap_or_default()
+        );
+        let _ = window().navigator().clipboard().write_text(&url);
+        status.set(Some("Join link copied.".to_owned()));
+    };
+
+    view! {
+        <main>
+            <h1>"Your meetings"</h1>
+            {move || {
+                status
+                    .get()
+                    .map(|s| view! { <p data-testid="dashboard-status" role="status">{s}</p> })
+            }}
+
+            {move || if signed_out.get() {
+                view! {
+                    <p data-testid="signed-out">
+                        "You're not signed in. "
+                        <a href="/login">"Get a sign-in link"</a>
+                    </p>
+                }
+                    .into_any()
+            } else {
+                view! {
+                    <section>
+                        <h2>"Schedule a meeting"</h2>
+                        <form on:submit=create>
+                            <label>
+                                "Title"
+                                <input
+                                    type="text"
+                                    placeholder="e.g. Weekly sync"
+                                    data-testid="create-title"
+                                    prop:value=title
+                                    on:input=move |ev| title.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <label>
+                                "Starts"
+                                <input
+                                    type="datetime-local"
+                                    data-testid="create-starts"
+                                    prop:value=starts
+                                    on:input=move |ev| starts.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <label>
+                                "Ends"
+                                <input
+                                    type="datetime-local"
+                                    data-testid="create-ends"
+                                    prop:value=ends
+                                    on:input=move |ev| ends.set(event_target_value(&ev))
+                                />
+                            </label>
+                            <button type="submit" data-testid="create-btn">"Create meeting"</button>
+                        </form>
+                    </section>
+
+                    <section>
+                        <h2>
+                            "Upcoming"
+                            {move || {
+                                organizer_email
+                                    .get()
+                                    .map(|email| format!(" — signed in as {email}"))
+                            }}
+                        </h2>
+                        <ul data-testid="mine-list">
+                            <For each={move || meetings.get()} key=|m| m.meeting.id let:m>
+                                {move || {
+                                    // Keyed-`For` children are not re-rendered
+                                    // when the key stays the same, so re-read
+                                    // the signal and find the live item (same
+                                    // pattern as the in-call roster).
+                                    let current = meetings
+                                        .get()
+                                        .into_iter()
+                                        .find(|q| q.meeting.id == m.meeting.id)
+                                        .unwrap_or_else(|| m.clone());
+                                    let code = current.meeting.code.clone();
+                                    let starts = current
+                                        .meeting
+                                        .starts_at
+                                        .format(&Rfc3339)
+                                        .unwrap_or_default();
+                                    let ends = current
+                                        .meeting
+                                        .ends_at
+                                        .format(&Rfc3339)
+                                        .unwrap_or_default();
+                                    let state = match &current.joinability {
+                                        Joinability::Open => "open".to_owned(),
+                                        Joinability::NotYet { .. } => "not yet".to_owned(),
+                                        Joinability::Ended => "ended".to_owned(),
+                                        Joinability::Cancelled => "cancelled".to_owned(),
+                                    };
+                                    // Each handler owns its own clone of the
+                                    // code: the row closure can be re-run, so
+                                    // nothing may be captured by borrow.
+                                    let copy_click = {
+                                        let code = code.clone();
+                                        move |_| copy_link(code.clone())
+                                    };
+                                    let cancel_testid = format!("cancel-{code}");
+                                    let cancel_click = {
+                                        let code = code.clone();
+                                        move |_| cancel(code.clone())
+                                    };
+                                    let row_testid = format!("meeting-row-{code}");
+                                    let summary = format!("{code} · {starts} → {ends} · {state}");
+                                    let join_href = format!("/m/{code}");
+                                    let ics_href = format!("/api/meetings/{code}/ics");
+                                    let ics_testid = format!("ics-{code}");
+                                    let copy_testid = format!("copy-link-{code}");
+                                    let cancelled = current.meeting.cancelled;
+                                    view! {
+                                        <li data-testid=row_testid>
+                                            <strong>{current.meeting.title.clone()}</strong>
+                                            <small>{summary}</small>
+                                            <a href=join_href>"Join"</a>
+                                            <a href=ics_href download data-testid=ics_testid>
+                                                ".ics"
+                                            </a>
+                                            <button data-testid=copy_testid on:click=copy_click>
+                                                "Copy link"
+                                            </button>
+                                            {(!cancelled).then(move || {
+                                                view! {
+                                                    <button
+                                                        data-testid=cancel_testid
+                                                        on:click=cancel_click
+                                                    >
+                                                        "Cancel"
+                                                    </button>
+                                                }
+                                            })}
+                                        </li>
+                                    }
+                                }}
+                            </For>
+                        </ul>
+                    </section>
+                }
+                    .into_any()
+            }}
+        </main>
     }
 }

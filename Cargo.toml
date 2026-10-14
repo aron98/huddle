@@ -32,6 +32,18 @@ str0m = "=0.24.1"
 figment = { version = "0.10", features = ["toml", "env"] }
 rust-embed = "8"
 anyhow = "1"
+sha2 = "0.11"
+hmac = "0.13"
+subtle = "2"
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "hostname",
+    "pool",
+    "rustls-tls",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls",
+] }
 
 # web (wasm)
 leptos = { version = "0.8", features = ["csr"] }
@@ -46,12 +58,14 @@ web-sys = { version = "0.3", features = [
     "AudioParam",
     "BaseAudioContext",
     "BinaryType",
+    "Clipboard",
     "GainNode",
+    "Headers",
     "HtmlMediaElement",
     "HtmlVideoElement",
     "Location",
-    "MediaDeviceKind",
     "MediaDeviceInfo",
+    "MediaDeviceKind",
     "MediaDevices",
     "MediaStream",
     "MediaStreamAudioSourceNode",
@@ -59,6 +73,9 @@ web-sys = { version = "0.3", features = [
     "MediaStreamTrack",
     "MessageEvent",
     "Navigator",
+    "Request",
+    "RequestInit",
+    "Response",
     "RtcConfiguration",
     "RtcIceCandidate",
     "RtcIceCandidateInit",
@@ -68,10 +85,10 @@ web-sys = { version = "0.3", features = [
     "RtcRtpTransceiver",
     "RtcRtpTransceiverDirection",
     "RtcRtpTransceiverInit",
-    "RtcTrackEvent",
     "RtcSdpType",
     "RtcSessionDescription",
     "RtcSessionDescriptionInit",
+    "RtcTrackEvent",
     "WebSocket",
     "Window",
 ] }

@@ -1,7 +1,7 @@
 //! HTTP router: API routes plus the embedded web UI.
 
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -13,6 +13,8 @@ use huddle_protocol::{
     ApiError, CreateMeetingRequest, ErrorCode, MeetingResponse, UpdateMeetingRequest,
 };
 
+use crate::auth;
+use crate::ics;
 use crate::meetings::{self, MeetingError};
 use crate::session;
 use crate::state::AppState;
@@ -28,12 +30,17 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/meetings", post(create_meeting))
+        .route("/api/meetings/mine", get(my_meetings))
         .route(
             "/api/meetings/{code}",
             get(get_meeting)
                 .patch(update_meeting)
                 .delete(cancel_meeting),
         )
+        .route("/api/meetings/{code}/ics", get(meeting_ics))
+        .route("/api/auth/request-link", post(auth::request_link))
+        .route("/api/auth/verify", get(auth::verify))
+        .route("/api/auth/me", get(auth::me))
         .route("/ws", get(session::ws))
         .fallback(fallback)
         .with_state(state)
@@ -45,11 +52,20 @@ async fn health() -> Json<serde_json::Value> {
 
 async fn create_meeting(
     state: State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<MeetingResponse>), ApiErr> {
-    let meeting = meetings::create(state.pool(), &req, OffsetDateTime::now_utc())
-        .await
-        .map_err(ApiErr::from_meeting_err)?;
+    // A logged-in organizer owns what they create; anonymous meetings
+    // stay open (the link is the only capability, by design).
+    let organizer = auth::session_organizer(&state, &headers);
+    let meeting = meetings::create(
+        state.pool(),
+        &req,
+        organizer.map(|o| o.id),
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .map_err(ApiErr::from_meeting_err)?;
     Ok((
         StatusCode::CREATED,
         Json(MeetingResponse {
@@ -75,9 +91,11 @@ async fn get_meeting(
 
 async fn update_meeting(
     state: State<AppState>,
+    headers: HeaderMap,
     Path(code): Path<String>,
     Json(req): Json<UpdateMeetingRequest>,
 ) -> Result<Json<MeetingResponse>, ApiErr> {
+    require_owner(&state, &headers, &code).await?;
     let meeting = meetings::update_by_code(state.pool(), &code, req)
         .await
         .map_err(ApiErr::from_meeting_err)?
@@ -90,8 +108,10 @@ async fn update_meeting(
 
 async fn cancel_meeting(
     state: State<AppState>,
+    headers: HeaderMap,
     Path(code): Path<String>,
 ) -> Result<Json<MeetingResponse>, ApiErr> {
+    require_owner(&state, &headers, &code).await?;
     let meeting = meetings::set_cancelled(state.pool(), &code, true)
         .await
         .map_err(ApiErr::internal)?
@@ -100,6 +120,71 @@ async fn cancel_meeting(
         joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
         meeting: meeting.into(),
     }))
+}
+
+/// The organizer's dashboard: every meeting they created, soonest first.
+async fn my_meetings(
+    state: State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MeetingResponse>>, ApiErr> {
+    let Some(organizer) = auth::session_organizer(&state, &headers) else {
+        return Err(ApiErr::unauthorized());
+    };
+    let meetings = meetings::list_for_organizer(state.pool(), organizer.id)
+        .await
+        .map_err(ApiErr::internal)?;
+    let now = OffsetDateTime::now_utc();
+    let responses = meetings
+        .into_iter()
+        .map(|meeting| MeetingResponse {
+            joinability: meetings::joinability(&meeting, state.config(), now),
+            meeting: meeting.into(),
+        })
+        .collect();
+    Ok(Json(responses))
+}
+
+/// Download one meeting as an iCalendar file.
+async fn meeting_ics(state: State<AppState>, Path(code): Path<String>) -> Result<Response, ApiErr> {
+    let meeting = meetings::get_by_code(state.pool(), &code)
+        .await
+        .map_err(ApiErr::internal)?
+        .ok_or_else(ApiErr::not_found)?;
+    let body = ics::build_ics(&meeting, &state.config().base_url).map_err(|e| {
+        tracing::error!(error = %e, "ics generation failure");
+        ApiErr(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError {
+                code: ErrorCode::Internal,
+                message: "internal error".into(),
+            },
+        )
+    })?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/calendar; charset=utf-8")],
+        body,
+    )
+        .into_response())
+}
+
+/// Meetings owned by a logged-in organizer can only be changed by that
+/// organizer; anonymous meetings stay open to anyone with the code.
+async fn require_owner(state: &AppState, headers: &HeaderMap, code: &str) -> Result<(), ApiErr> {
+    let Some(meeting) = meetings::get_by_code(state.pool(), code)
+        .await
+        .map_err(ApiErr::internal)?
+    else {
+        // Let the caller's own lookup produce the 404.
+        return Ok(());
+    };
+    if let Some(owner) = meeting.organizer_id {
+        let session = auth::session_organizer(state, headers);
+        if session.as_ref().map(|o| o.id) != Some(owner) {
+            return Err(ApiErr::forbidden());
+        }
+    }
+    Ok(())
 }
 
 /// The JSON error envelope all API failures use.
@@ -112,6 +197,26 @@ impl ApiErr {
             ApiError {
                 code: ErrorCode::MeetingNotFound,
                 message: "no meeting with that code".into(),
+            },
+        )
+    }
+
+    fn unauthorized() -> Self {
+        Self(
+            StatusCode::UNAUTHORIZED,
+            ApiError {
+                code: ErrorCode::Unauthorized,
+                message: "sign in first".into(),
+            },
+        )
+    }
+
+    fn forbidden() -> Self {
+        Self(
+            StatusCode::FORBIDDEN,
+            ApiError {
+                code: ErrorCode::Unauthorized,
+                message: "this meeting belongs to another organizer".into(),
             },
         )
     }
@@ -433,5 +538,282 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body).into_owned();
         assert!(text.contains("meeting_not_found"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn auth_flow_issues_session_and_reports_me() {
+        use crate::identity::IdentityProvider;
+
+        let state = test_state().await;
+        let token = state
+            .identity()
+            .start_login("route@example.com", OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/auth/verify?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("verify sets the session cookie")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.starts_with("huddle_session="), "got: {cookie}");
+        let pair = cookie.split(';').next().unwrap().to_owned();
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(header::COOKIE, pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("route@example.com"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn request_link_succeeds_for_any_email_shape() {
+        let app = router(test_state().await);
+        for email in ["someone@example.com", "not-an-email"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/request-link")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Always 200: responses must not reveal which addresses are valid.
+            assert_eq!(response.status(), StatusCode::OK, "email: {email}");
+        }
+    }
+
+    #[tokio::test]
+    async fn me_without_session_is_401() {
+        let app = router(test_state().await);
+        let response = app
+            .oneshot(Request::get("/api/auth/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("unauthorized"), "got: {text}");
+    }
+
+    // --- ownership, dashboard, ICS -----------------------------------------
+
+    /// Log `email` in (via the verify route, like a browser following the
+    /// magic link) and return its `Cookie` header value.
+    async fn session_cookie_for(state: &AppState, app: &Router, email: &str) -> String {
+        use crate::identity::IdentityProvider;
+
+        let token = state
+            .identity()
+            .start_login(email, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/auth/verify?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("verify sets the session cookie")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        cookie.split(';').next().unwrap().to_owned()
+    }
+
+    #[tokio::test]
+    async fn owned_meetings_require_their_organizer() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let bob = session_cookie_for(&state, &app, "bob@example.com").await;
+
+        // Alice creates a meeting while logged in: she owns it.
+        let now = OffsetDateTime::now_utc();
+        let meeting = serde_json::json!({
+            "title": "Alice's sync",
+            "starts_at": (now + time::Duration::minutes(10)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(70)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, &alice)
+                    .header("content-type", "application/json")
+                    .body(Body::from(meeting.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse =
+            serde_json::from_slice(&bytes).expect("create returns a meeting");
+        let code = created.meeting.code.clone();
+
+        // The dashboard lists it for Alice, but not for Bob or the anonymous
+        // request.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::COOKIE, &alice)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let mine: Vec<MeetingResponse> = serde_json::from_slice(&bytes).unwrap();
+        assert!(mine.iter().any(|m| m.meeting.code == code));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::COOKIE, &bob)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let theirs: Vec<MeetingResponse> = serde_json::from_slice(&bytes).unwrap();
+        assert!(theirs.is_empty(), "bob must not see alice's meetings");
+
+        // Only Alice may change or cancel it.
+        let patch = serde_json::json!({ "title": "Renamed by alice" });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/meetings/{code}"))
+                    .header(header::COOKIE, &alice)
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for (label, cookie) in [("anonymous", None), ("bob", Some(&bob))] {
+            let mut request = Request::patch(format!("/api/meetings/{code}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{ "title": "Hijacked" }"#))
+                .unwrap();
+            if let Some(cookie) = cookie {
+                request
+                    .headers_mut()
+                    .insert(header::COOKIE, cookie.parse().unwrap());
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{label} must not update alice's meeting"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mine_requires_a_session() {
+        let app = router(test_state().await);
+        let response = app
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn anonymous_meetings_stay_open() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        // No session at creation: the link is the only capability.
+        let (status, body) = create_meeting_via(app.clone(), "Open standup").await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let created: MeetingResponse = serde_json::from_str(&body).unwrap();
+        let code = created.meeting.code;
+
+        let patch = serde_json::json!({ "title": "Renamed anonymously" });
+        let response = app
+            .oneshot(
+                Request::patch(format!("/api/meetings/{code}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "anonymous meetings stay editable by anyone with the code"
+        );
+    }
+
+    #[tokio::test]
+    async fn meetings_export_as_ics() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let (status, body) = create_meeting_via(app, "Standup").await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let created: MeetingResponse = serde_json::from_str(&body).unwrap();
+
+        let response = router(state)
+            .oneshot(
+                Request::get(format!("/api/meetings/{}/ics", created.meeting.code))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/calendar; charset=utf-8"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let ics = String::from_utf8_lossy(&bytes);
+        assert!(ics.starts_with("BEGIN:VCALENDAR\r\n"), "got: {ics}");
+        assert!(ics.contains("SUMMARY:Standup"));
+        assert!(
+            ics.contains(&format!("/m/{}", created.meeting.code)),
+            "join link must be in the calendar: {ics}"
+        );
     }
 }

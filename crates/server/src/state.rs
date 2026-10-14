@@ -4,6 +4,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::engine::EngineHandle;
+use crate::identity::MagicLinkIdentityProvider;
 
 /// Shared application state, cheap to clone into handlers.
 #[derive(Clone)]
@@ -15,15 +16,35 @@ pub struct Inner {
     pub config: Arc<Config>,
     pub pool: SqlitePool,
     pub engine: EngineHandle,
+    pub identity: MagicLinkIdentityProvider,
+    /// HMAC key for session cookies. Random per boot unless
+    /// `session_secret` is configured.
+    pub session_key: Vec<u8>,
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>, pool: SqlitePool, engine: EngineHandle) -> Self {
+        let identity = MagicLinkIdentityProvider::new(
+            pool.clone(),
+            time::Duration::minutes(i64::from(config.login_token_ttl_min)),
+        );
+        let session_key = match &config.session_secret {
+            Some(secret) => secret.as_bytes().to_vec(),
+            None => {
+                tracing::warn!(
+                    "session secret not configured; using a random key — \
+                     sessions will not survive restarts (set HUDDLE_SESSION_SECRET)"
+                );
+                rand::random::<[u8; 32]>().to_vec()
+            }
+        };
         Self {
             inner: Arc::new(Inner {
                 config,
                 pool,
                 engine,
+                identity,
+                session_key,
             }),
         }
     }
@@ -38,5 +59,13 @@ impl AppState {
 
     pub fn engine(&self) -> &EngineHandle {
         &self.inner.engine
+    }
+
+    pub fn identity(&self) -> &MagicLinkIdentityProvider {
+        &self.inner.identity
+    }
+
+    pub fn session_key(&self) -> &[u8] {
+        &self.inner.session_key
     }
 }

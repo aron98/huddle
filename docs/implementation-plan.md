@@ -135,11 +135,17 @@ asserted on both, mute propagation asserted across pages.)*
 **Acceptance:** ✅ share a screen in a 4-tab meeting, chat persists across
 reload — enforced by the e2e (`test/e2e/e2e-call.mjs`, *Landed: 4e4d1c5*).
 
-### Phase 5 — Scheduling & identity *(~1–2 weeks; C + B, media tracks idle)*
+### Phase 5 — Scheduling & identity *(~1–2 weeks; C + B, media tracks idle)* ✅
 
 - C3: magic-link login flow, session cookies, meeting CRUD pages, ICS export,
-  join-window enforcement at the WS layer.
+  join-window enforcement at the WS layer. *(Landed: `8248637` identity provider
+  with hashed single-use tokens; `d23441c` lettre delivery with log fallback;
+  `e9ca792` signed session cookies + `/api/auth/*` routes; `57447c0`
+  organizer ownership, `/api/meetings/mine`, ICS export — join-window
+  enforcement already lived in the WS session layer.)*
 - B5: auth pages + meeting management UI (SSR-friendly pages can start here).
+  *(Landed: `6c1f362` login + dashboard pages; `5be14ba` dashboard row
+  reactivity fix.)*
 
 ### Phase 6 — Ship hardening *(~1–2 weeks; mostly serial, D-led)*
 

@@ -323,7 +323,7 @@ mod tests {
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
             };
-            let meeting = meetings::create(self.state.pool(), &req, now)
+            let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
                 .unwrap();
             meeting.code.clone()
