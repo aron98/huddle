@@ -10,26 +10,29 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Phases 0–2 complete** — the foundations, the four independent tracks, and
-the two-person call from the [implementation plan](docs/implementation-plan.md)
-are done:
+🚧 **Phases 0–3 complete** — the foundations, the four independent tracks, the
+two-person call, and n-party support from the
+[implementation plan](docs/implementation-plan.md) are done:
 
-- `protocol` — v1 signaling and REST wire messages.
+- `protocol` — v1 signaling and REST wire messages, including speaking
+  indicators.
 - `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web
   UI, `/ws` signaling sessions, and a media engine thread driving one SFU room
   per meeting over UDP.
 - `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
-  SDP answering, media forwarding, keyframe discipline; tested with synthetic
-  in-process clients and a real-UDP loopback.
+  SDP answering, media forwarding, keyframe fan-out to new subscribers, track
+  recycling when participants leave, mute-gated forwarding; tested with
+  synthetic in-process clients and a real-UDP loopback.
 - `web` — Leptos prejoin page (camera preview, device pickers, name), an
   `RtcClient` signaling driver tested against a mock server, and an in-call
-  view with tiles, roster, and mic/camera/leave controls.
+  view with an adaptive tile grid, roster, speaking indicators (Web Audio RMS
+  detection), and mic/camera/leave controls.
 - Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check,
-  and a two-browser-page call e2e that asserts media flows *through the
-  server*), multi-stage Dockerfile, dev compose stack with coturn.
+  and a four-browser-page call e2e with join/leave churn that asserts media
+  flows *through the server*), multi-stage Dockerfile, dev compose stack with
+  coturn.
 
-**Next:** phase 3 — n-party calls: renegotiation fan-out, PLI discipline, and
-a responsive tile grid.
+**Next:** phase 4 — screen share and chat fan-out.
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
