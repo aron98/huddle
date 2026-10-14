@@ -8,6 +8,10 @@
 //!
 //! Every field can be overridden: `HUDDLE_BIND="0.0.0.0:4000"`. The file path
 //! itself comes from `HUDDLE_CONFIG` (default: `./huddle.toml`, optional).
+//!
+//! `public_ip` may be omitted: the server then advertises its detected
+//! primary outbound address at startup. That is what local development
+//! wants; production deployments should set it explicitly.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -21,9 +25,13 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// HTTPS/HTTP bind address for the web + signaling server.
     pub bind: SocketAddr,
-    /// Public IP the SFU advertises in ICE candidates. On a VPS this must be
-    /// the machine's public address, not a loopback.
-    pub public_ip: IpAddr,
+    /// Public IP the SFU advertises in ICE candidates.
+    ///
+    /// `None` (the default) auto-detects the machine's primary outbound
+    /// address at startup, which is right for local development. Production
+    /// deployments should set it explicitly: a VPS's public address, or
+    /// whatever address browsers can actually reach the media socket on.
+    pub public_ip: Option<IpAddr>,
     /// Single UDP port the SFU's ICE/media socket binds to.
     pub media_port: u16,
     /// Where the SQLite database and other runtime state live.
@@ -57,7 +65,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], 3000)),
-            public_ip: IpAddr::from([127, 0, 0, 1]),
+            public_ip: None,
             media_port: 40_000,
             data_dir: PathBuf::from("./data"),
             base_url: "http://localhost:3000".into(),
@@ -99,6 +107,31 @@ impl Config {
         Ok(config)
     }
 
+    /// The IP browsers should be told to send media to.
+    ///
+    /// An explicitly configured `public_ip` wins; otherwise the machine's
+    /// primary outbound address is auto-detected. The loopback fallback at
+    /// the end of the chain only works when clients also send from
+    /// loopback — notably, macOS Chrome does not (it sources loopbound
+    /// traffic from the default interface, which fails ICE's response
+    /// source validation).
+    pub fn effective_public_ip(&self) -> IpAddr {
+        self.effective_public_ip_with(detect_public_ip())
+    }
+
+    /// Testable core of [`Config::effective_public_ip`]: the detection
+    /// result is injected so the fallback chain can be exercised without
+    /// touching the network.
+    fn effective_public_ip_with(&self, detected: Option<IpAddr>) -> IpAddr {
+        self.public_ip.or(detected).unwrap_or_else(|| {
+            tracing::warn!(
+                "could not auto-detect an outbound address; advertising \
+                 loopback (set HUDDLE_PUBLIC_IP if clients cannot connect)"
+            );
+            IpAddr::from([127, 0, 0, 1])
+        })
+    }
+
     /// Join window for a meeting: `[starts_at - lead, ends_at + grace]`.
     pub fn join_window(
         &self,
@@ -111,6 +144,30 @@ impl Config {
     }
 }
 
+/// Detect the machine's primary outbound IP by asking the kernel which
+/// source address it would pick for a public destination. Connecting a
+/// UDP socket never sends a packet — it only installs a route.
+fn detect_public_ip() -> Option<IpAddr> {
+    for (bind, probe) in [
+        ("0.0.0.0:0", "8.8.8.8:80"),
+        ("[::]:0", "[2001:4860:4860::8888]:80"),
+    ] {
+        let Ok(socket) = std::net::UdpSocket::bind(bind) else {
+            continue;
+        };
+        if socket.connect(probe).is_err() {
+            continue;
+        }
+        if let Ok(local) = socket.local_addr() {
+            let ip = local.ip();
+            if !(ip.is_loopback() || ip.is_unspecified()) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +178,7 @@ mod tests {
             .extract()
             .unwrap();
         assert_eq!(config.bind.port(), 3000);
+        assert_eq!(config.public_ip, None);
         assert_eq!(config.media_port, 40_000);
         assert_eq!(config.join_window_lead_min, 5);
         assert_eq!(config.join_window_grace_min, 15);
@@ -146,5 +204,33 @@ mod tests {
         let (opens, closes) = config.join_window(start, end);
         assert_eq!(opens, start - time::Duration::minutes(5));
         assert_eq!(closes, end + time::Duration::minutes(15));
+    }
+
+    #[test]
+    fn explicit_public_ip_wins_over_detection() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(r#"public_ip = "192.0.2.10""#))
+            .extract()
+            .unwrap();
+        let explicit: IpAddr = "192.0.2.10".parse().unwrap();
+        assert_eq!(config.effective_public_ip_with(None), explicit);
+        let detected: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(config.effective_public_ip_with(Some(detected)), explicit);
+    }
+
+    #[test]
+    fn detected_public_ip_is_used_when_unconfigured() {
+        let config = Config::default();
+        let detected: IpAddr = "203.0.113.1".parse().unwrap();
+        assert_eq!(config.effective_public_ip_with(Some(detected)), detected);
+    }
+
+    #[test]
+    fn public_ip_falls_back_to_loopback_when_undetectable() {
+        let config = Config::default();
+        assert_eq!(
+            config.effective_public_ip_with(None),
+            IpAddr::from([127, 0, 0, 1])
+        );
     }
 }

@@ -195,14 +195,14 @@ struct Engine {
 ///
 /// The socket binds to all interfaces on `config.media_port`; the port
 /// actually bound (useful when 0 was requested) ends up in the returned
-/// media address, which pairs `config.public_ip` with it.
+/// media address, which pairs the configured/detected public ip with it.
 pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
     let socket = UdpSocket::bind(SocketAddr::new(
         IpAddr::from([0, 0, 0, 0]),
         config.media_port,
     ))?;
     let bound = socket.local_addr()?;
-    let media_addr = SocketAddr::new(config.public_ip, bound.port());
+    let media_addr = SocketAddr::new(config.effective_public_ip(), bound.port());
 
     let (tx, rx) = std::sync::mpsc::channel::<EngineCommand>();
 
@@ -618,6 +618,8 @@ mod tests {
         // ends: dropping it disconnects the engine thread.
         let config = Config {
             media_port: 0,
+            // Tests talk loopback-to-loopback; detection is machine-dependent.
+            public_ip: Some(IpAddr::from([127, 0, 0, 1])),
             max_participants,
             ..Config::default()
         };

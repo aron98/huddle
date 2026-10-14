@@ -265,6 +265,8 @@ mod tests {
         async fn start() -> Self {
             let config = Config {
                 media_port: 0,
+                // Tests talk loopback-to-loopback; detection is machine-dependent.
+                public_ip: Some(IpAddr::from([127, 0, 0, 1])),
                 ..Config::default()
             };
             let pool = crate::db::test_pool().await;
