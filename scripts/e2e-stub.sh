@@ -47,7 +47,7 @@ fi
 #    DOM is dumped; the fake-media flags keep getUserMedia from blocking.
 dump() {
     "$chrome" --headless=new --no-sandbox --disable-gpu \
-        --use-fake-device-for-media-prompts --use-fake-ui-for-media-prompts \
+        --use-fake-device-for-media-stream --use-fake-ui-for-media-stream \
         --virtual-time-budget=10000 --dump-dom "$1" 2>/dev/null
 }
 

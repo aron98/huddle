@@ -10,21 +10,26 @@ Node farm, no 40-step install guide.
 
 ## Status
 
-🚧 **Phases 0–1 complete** — the foundations and the four independent tracks from
-the [implementation plan](docs/implementation-plan.md) are done:
+🚧 **Phases 0–2 complete** — the foundations, the four independent tracks, and
+the two-person call from the [implementation plan](docs/implementation-plan.md)
+are done:
 
 - `protocol` — v1 signaling and REST wire messages.
-- `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web UI.
+- `server` — meeting CRUD API with join windows, SQLite via sqlx, embedded web
+  UI, `/ws` signaling sessions, and a media engine thread driving one SFU room
+  per meeting over UDP.
 - `sfu` — sans-io SFU room on [str0m](https://github.com/lookback-io/str0m): peers,
   SDP answering, media forwarding, keyframe discipline; tested with synthetic
   in-process clients and a real-UDP loopback.
-- `web` — Leptos prejoin page (camera preview, device pickers, name) and an
-  `RtcClient` signaling driver, tested against a mock signaling server.
-- Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check),
-  multi-stage Dockerfile, dev compose stack with coturn.
+- `web` — Leptos prejoin page (camera preview, device pickers, name), an
+  `RtcClient` signaling driver tested against a mock server, and an in-call
+  view with tiles, roster, and mic/camera/leave controls.
+- Infra — CI (fmt, clippy native + wasm32, tests, headless-Chrome render check,
+  and a two-browser-page call e2e that asserts media flows *through the
+  server*), multi-stage Dockerfile, dev compose stack with coturn.
 
-**Next:** phase 2 — wire the prejoin page to the real SFU for a two-person call
-through the server.
+**Next:** phase 3 — n-party calls: renegotiation fan-out, PLI discipline, and
+a responsive tile grid.
 
 - [README](README.md) — you are here
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design

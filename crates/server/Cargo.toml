@@ -17,12 +17,15 @@ workspace = true
 anyhow.workspace = true
 axum.workspace = true
 figment.workspace = true
+futures.workspace = true
 huddle-protocol.workspace = true
+huddle-sfu.workspace = true
 rand = "0.10"
 rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+str0m.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -32,4 +35,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 http-body-util = "0.1"
+str0m.workspace = true
+tokio-tungstenite.workspace = true
 tower = { version = "0.5", features = ["util"] }

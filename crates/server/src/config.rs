@@ -40,6 +40,8 @@ pub struct Config {
     /// IceServers advertised to clients in addition to the SFU's own
     /// candidates (e.g. coturn).
     pub ice_servers: Vec<IceServerConfig>,
+    /// How many participants may be in one meeting at once.
+    pub max_participants: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -63,6 +65,7 @@ impl Default for Config {
             join_window_lead_min: 5,
             join_window_grace_min: 15,
             ice_servers: Vec::new(),
+            max_participants: 8,
         }
     }
 }
@@ -121,6 +124,7 @@ mod tests {
         assert_eq!(config.media_port, 40_000);
         assert_eq!(config.join_window_lead_min, 5);
         assert_eq!(config.join_window_grace_min, 15);
+        assert_eq!(config.max_participants, 8);
         assert_eq!(config.web_dir, None);
     }
 

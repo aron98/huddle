@@ -7,7 +7,11 @@
 #   the next browser refresh (server code changes need a container restart);
 # - `coturn` is the TURN companion from the architecture doc (dev credentials).
 #
-# coturn uses host networking (Linux only), as recommended for TURN.
+# Both `server` and `coturn` use host networking (Linux only): WebRTC media
+# is UDP from arbitrary client ports, which double NAT (docker bridge +
+# port mapping) makes flaky. With host networking the default advertised
+# address (127.0.0.1) works for same-machine browser testing; set
+# HUDDLE_PUBLIC_IP below to your LAN ip for calls from other devices.
 
 services:
   web:
@@ -27,6 +31,9 @@ services:
   server:
     image: rust:1.96-slim-bookworm
     working_dir: /workspace
+    # Host networking: the media UDP socket (default port 40000) must be
+    # directly reachable from the browser for calls to work.
+    network_mode: host
     command: cargo run -p huddle-server
     volumes:
       - .:/workspace
@@ -41,8 +48,6 @@ services:
       HUDDLE_ICE_SERVERS__0__URLS__1: turn:127.0.0.1:3478
       HUDDLE_ICE_SERVERS__0__USERNAME: huddle
       HUDDLE_ICE_SERVERS__0__CREDENTIAL: devpassword
-    ports:
-      - "3000:3000"
     depends_on:
       - web
 

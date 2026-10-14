@@ -1,0 +1,9 @@
+{
+  "name": "huddle-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Browser end-to-end tests for huddle",
+  "dependencies": {
+    "puppeteer-core": "^24.43.1"
+  }
+}

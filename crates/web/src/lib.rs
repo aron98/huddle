@@ -19,6 +19,16 @@ use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
 use rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient};
 
+/// Consume a media-play promise so a late rejection (e.g. the tile was
+/// unmounted mid-play) never surfaces as an unhandled page error.
+#[cfg(target_arch = "wasm32")]
+fn play_silently(video: &web_sys::HtmlVideoElement) {
+    if let Ok(promise) = video.play() {
+        spawn_local(async move {
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        });
+    }
+}
 /// Application root. The URL decides the page:
 /// `/` → landing, `/m/{code}` → the prejoin page for that meeting.
 #[component]
@@ -103,7 +113,7 @@ fn Prejoin(code: String) -> impl IntoView {
         };
         video.set_muted(true);
         video.set_src_object(Some(&s));
-        let _ = video.play();
+        play_silently(&video);
     });
 
     // Re-acquire media when a device is picked.
@@ -177,32 +187,27 @@ fn Prejoin(code: String) -> impl IntoView {
             .collect::<Vec<_>>()
     });
 
-    // Join: open signaling, attach media, and run the join + publish
-    // handshake. The in-call UI lands in phase 2.
+    // Join hands the meeting over to the in-call view: the button just
+    // records who we are; `CallView` opens signaling and runs the session.
     let join_code = code.clone();
+    let call = RwSignal::<Option<(String, Option<web_sys::MediaStream>)>>::new(None);
     let join = move |_| {
         if name.get().trim().is_empty() {
             status.set(Some("Enter your name first.".to_owned()));
             return;
         }
-        status.set(Some("Connecting…".to_owned()));
-        let code = join_code.clone();
-        let name = name.get_untracked();
-        let local = stream.get_untracked();
-        spawn_local(async move {
-            match join_meeting(&code, name.trim(), local.as_ref()).await {
-                Ok(()) => status.set(Some(
-                    "Connected (the in-call UI lands in phase 2).".to_owned(),
-                )),
-                Err(e) => status.set(Some(e)),
-            }
-        });
+        status.set(None);
+        call.set(Some((
+            name.get_untracked().trim().to_owned(),
+            stream.get_untracked(),
+        )));
     };
 
-    view! {
-        <main>
-            <h1>"Join meeting"</h1>
-            <p>{format!("Meeting code: {code}")}</p>
+    let prejoin_form = move || {
+        view! {
+            <>
+                <h1>"Join meeting"</h1>
+                <p>{format!("Meeting code: {code}")}</p>
 
             <video id="preview" autoplay muted playsinline></video>
 
@@ -211,6 +216,7 @@ fn Prejoin(code: String) -> impl IntoView {
                 <input
                     type="text"
                     placeholder="e.g. Alice"
+                    data-testid="name-input"
                     prop:value=name
                     on:input=move |ev| name.set(event_target_value(&ev))
                 />
@@ -255,35 +261,309 @@ fn Prejoin(code: String) -> impl IntoView {
                 </button>
             </div>
 
-            <button on:click=join>"Join"</button>
+            // A phase-2 call is media-first: until getUserMedia has
+            // produced a local stream there is nothing to publish, and
+            // an offer with zero m-lines would be rejected by the SFU.
+            <button
+                data-testid="join-btn"
+                disabled=move || stream.get().is_none()
+                on:click=join
+            >
+                {move || if stream.get().is_some() { "Join meeting" } else { "Getting camera and mic…" }}
+            </button>
 
             {move || status.get().map(|s| view! { <p role="status">{s}</p> })}
+            </>
+        }
+    };
+
+    view! {
+        <main>
+            {move || match call.get() {
+                None => prejoin_form().into_any(),
+                Some((joined_name, local)) => view! {
+                    <CallView code=join_code.clone() name=joined_name local=local />
+                }
+                .into_any(),
+            }}
         </main>
     }
 }
 
-/// Open signaling and run the join + publish handshake against `/ws`.
-/// The server-side room is phase 2; for now failures surface as status text.
+/// What the in-call controls ask the session task to do.
 #[cfg(target_arch = "wasm32")]
-async fn join_meeting(
-    code: &str,
-    name: &str,
-    local: Option<&web_sys::MediaStream>,
-) -> Result<(), String> {
-    let host = window()
-        .location()
-        .host()
-        .unwrap_or_else(|_| "localhost".to_owned());
-    let url = format!("ws://{host}/ws");
+enum UiAction {
+    Mute {
+        audio_muted: Option<bool>,
+        video_muted: Option<bool>,
+    },
+    Leave,
+}
 
-    let signaling = BrowserSignalingStream::connect(&url).map_err(|e| e.to_string())?;
-    let peer = BrowserPeerConnection::new(&[]).map_err(|e| e.to_string())?;
-    if let Some(stream) = local {
-        peer.attach_stream(stream);
+/// The in-call page: media tiles, roster, and controls. One spawned task
+/// owns the [`RtcClient`]; button clicks travel to it over a channel and
+/// server messages flow back through the signals.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> impl IntoView {
+    use futures::future::FutureExt;
+    use futures::stream::StreamExt;
+    use huddle_protocol::Participant;
+    use uuid::Uuid;
+    use web_sys::MediaStream;
+
+    let remote_streams = RwSignal::<Vec<MediaStream>>::new(Vec::new());
+    let roster = RwSignal::<Vec<Participant>>::new(Vec::new());
+    let status = RwSignal::<Option<String>>::new(Some("Connecting…".to_owned()));
+    let mic_on = RwSignal::new(true);
+    let cam_on = RwSignal::new(true);
+
+    let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
+
+    // The session task: connect, join, publish, then pump messages and UI
+    // actions until the call ends.
+    let task_code = code.clone();
+    let task_name = name.clone();
+    let task_local = local.clone();
+    spawn_local(async move {
+        let code = task_code;
+        let name = task_name;
+        let local = task_local;
+        let host = window()
+            .location()
+            .host()
+            .unwrap_or_else(|_| "localhost".to_owned());
+        let signaling = match BrowserSignalingStream::connect(&format!("ws://{host}/ws")).await {
+            Ok(s) => s,
+            Err(e) => {
+                status.set(Some(format!("Cannot reach the server: {e}")));
+                return;
+            }
+        };
+        let peer = match BrowserPeerConnection::new(&[]) {
+            Ok(p) => p,
+            Err(e) => {
+                status.set(Some(format!("WebRTC unavailable: {e}")));
+                return;
+            }
+        };
+
+        // Test hook: let e2e reach the peer connection via getStats.
+        if window()
+            .location()
+            .search()
+            .unwrap_or_default()
+            .contains("test=1")
+        {
+            let _ = js_sys::Reflect::set(
+                &window().into(),
+                &wasm_bindgen::JsValue::from_str("__huddlePc"),
+                &wasm_bindgen::JsValue::from(peer.raw()),
+            );
+        }
+
+        // The SFU labels each forwarded stream with the origin
+        // participant's id as the msid. Our own publish is answered
+        // recvonly, but Chrome still creates receivers for it — skip that
+        // self-echo so it does not render as a phantom "Guest" tile.
+        let streams = remote_streams;
+        let local_id = local.as_ref().map(|s| s.id());
+        peer.set_on_remote_stream(move |stream| {
+            if local_id.as_deref() == Some(stream.id().as_str()) {
+                return;
+            }
+            streams.update(|list| list.push(stream));
+        });
+        if let Some(local) = &local {
+            peer.attach_stream(local);
+        }
+
+        let mut client = RtcClient::new(signaling, peer);
+        if let Err(e) = client.join(&code, &name).await {
+            status.set(Some(format!("Join failed: {e}")));
+            return;
+        }
+        roster.set(client.roster().to_vec());
+        if let Err(e) = client.publish().await {
+            status.set(Some(format!("Publish failed: {e}")));
+            return;
+        }
+        status.set(None);
+
+        loop {
+            futures::select! {
+                message = client.next_server_message().fuse() => {
+                    match message {
+                        Ok(_) => roster.set(client.roster().to_vec()),
+                        Err(e) => {
+                            status.set(Some(format!("Disconnected: {e}")));
+                            break;
+                        }
+                    }
+                }
+                action = ui_rx.select_next_some() => {
+                    match action {
+                        UiAction::Mute { audio_muted, video_muted } => {
+                            if let Err(e) = client.set_mute_state(audio_muted, video_muted).await {
+                                status.set(Some(format!("Disconnected: {e}")));
+                                break;
+                            }
+                        }
+                        UiAction::Leave => {
+                            let _ = client.leave().await;
+                            status.set(Some("You left the meeting.".to_owned()));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let toggle_mic = {
+        let local = local.clone();
+        let ui_tx = ui_tx.clone();
+        move |_| {
+            mic_on.update(|v| *v = !*v);
+            let muted = !mic_on.get_untracked();
+            if let Some(s) = &local {
+                for track in media::tracks_of(s) {
+                    if track.kind() == "audio" {
+                        track.set_enabled(!muted);
+                    }
+                }
+            }
+            let _ = ui_tx.unbounded_send(UiAction::Mute {
+                audio_muted: Some(muted),
+                video_muted: None,
+            });
+        }
+    };
+    let toggle_cam = {
+        let local = local.clone();
+        let ui_tx = ui_tx.clone();
+        move |_| {
+            cam_on.update(|v| *v = !*v);
+            let muted = !cam_on.get_untracked();
+            if let Some(s) = &local {
+                for track in media::tracks_of(s) {
+                    if track.kind() == "video" {
+                        track.set_enabled(!muted);
+                    }
+                }
+            }
+            let _ = ui_tx.unbounded_send(UiAction::Mute {
+                audio_muted: None,
+                video_muted: Some(muted),
+            });
+        }
+    };
+    let leave = {
+        let ui_tx = ui_tx.clone();
+        move |_| {
+            let _ = ui_tx.unbounded_send(UiAction::Leave);
+        }
+    };
+
+    // Resolve a remote stream's origin participant from its msid.
+    fn label_for(stream: &MediaStream, roster: &[Participant]) -> String {
+        Uuid::parse_str(&stream.id())
+            .ok()
+            .and_then(|id| roster.iter().find(|p| p.id == id))
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Guest".to_owned())
     }
 
-    let mut client = RtcClient::new(signaling, peer);
-    client.join(code, name).await.map_err(|e| e.to_string())?;
-    client.publish().await.map_err(|e| e.to_string())?;
-    Ok(())
+    view! {
+        <main>
+            <h1>{format!("Meeting {code}")}</h1>
+
+            {move || status.get().map(|s| view! { <p data-testid="call-status" role="status">{s}</p> })}
+
+            <div class="tiles">
+                {local
+                    .clone()
+                    .map(|stream| {
+                        view! {
+                            <VideoTile
+                                stream=stream
+                                label="You".to_string()
+                                muted=true
+                                testid="tile-you".to_string()
+                            />
+                        }
+                    })}
+
+                <For each={move || remote_streams.get()} key=|s| s.id() let:s>
+                    {move || {
+                        let label = label_for(&s, &roster.get());
+                        let testid = format!("tile-{label}");
+                        view! {
+                            <VideoTile
+                                stream=s.clone()
+                                label=label
+                                muted=false
+                                testid=testid
+                            />
+                        }
+                    }}
+                </For>
+            </div>
+
+            <ul data-testid="roster">
+                <For each={move || roster.get()} key=|p| p.id let:p>
+                    {move || {
+                        // Re-read the participant so roster updates re-render.
+                        let current = roster
+                            .get()
+                            .into_iter()
+                            .find(|q| q.id == p.id)
+                            .unwrap_or_else(|| p.clone());
+                        let testid = format!("roster-{}", current.name);
+                        let mic = if current.audio_muted { "mic off" } else { "mic on" };
+                        let cam = if current.video_muted { "cam off" } else { "cam on" };
+                        let text = format!("{} ({mic}, {cam})", current.name);
+                        view! {
+                            <li data-testid=testid>{text}</li>
+                        }
+                    }}
+                </For>
+            </ul>
+
+            <div class="controls">
+                <button data-testid="toggle-mic" on:click=toggle_mic>
+                    {move || if mic_on.get() { "Mic on" } else { "Mic off" }}
+                </button>
+                <button data-testid="toggle-cam" on:click=toggle_cam>
+                    {move || if cam_on.get() { "Camera on" } else { "Camera off" }}
+                </button>
+                <button data-testid="leave-btn" on:click=leave>"Leave"</button>
+            </div>
+        </main>
+    }
+}
+
+/// One media tile: a `<video>` bound to `stream` with a caption.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn VideoTile(
+    stream: web_sys::MediaStream,
+    label: String,
+    muted: bool,
+    testid: String,
+) -> impl IntoView {
+    let video_ref = NodeRef::<leptos::html::Video>::new();
+    Effect::new(move |_| {
+        if let Some(video) = video_ref.get() {
+            video.set_muted(muted);
+            video.set_src_object(Some(&stream));
+            play_silently(&video);
+        }
+    });
+    view! {
+        <figure class="tile" data-testid=testid>
+            <video node_ref=video_ref autoplay muted playsinline></video>
+            <figcaption>{label}</figcaption>
+        </figure>
+    }
 }

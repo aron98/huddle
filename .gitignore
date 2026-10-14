@@ -5,6 +5,9 @@
 # Build output
 /crates/web/dist
 
+# Node
+node_modules/
+
 # Local runtime state
 /data
 *.db
