@@ -1044,18 +1044,27 @@ fn Dashboard() -> impl IntoView {
                         <ul data-testid="mine-list">
                             <For each={move || meetings.get()} key=|m| m.meeting.id let:m>
                                 {move || {
-                                    let code = m.meeting.code.clone();
-                                    let starts = m
+                                    // Keyed-`For` children are not re-rendered
+                                    // when the key stays the same, so re-read
+                                    // the signal and find the live item (same
+                                    // pattern as the in-call roster).
+                                    let current = meetings
+                                        .get()
+                                        .into_iter()
+                                        .find(|q| q.meeting.id == m.meeting.id)
+                                        .unwrap_or_else(|| m.clone());
+                                    let code = current.meeting.code.clone();
+                                    let starts = current
                                         .meeting
                                         .starts_at
                                         .format(&Rfc3339)
                                         .unwrap_or_default();
-                                    let ends = m
+                                    let ends = current
                                         .meeting
                                         .ends_at
                                         .format(&Rfc3339)
                                         .unwrap_or_default();
-                                    let state = match &m.joinability {
+                                    let state = match &current.joinability {
                                         Joinability::Open => "open".to_owned(),
                                         Joinability::NotYet { .. } => "not yet".to_owned(),
                                         Joinability::Ended => "ended".to_owned(),
@@ -1079,10 +1088,10 @@ fn Dashboard() -> impl IntoView {
                                     let ics_href = format!("/api/meetings/{code}/ics");
                                     let ics_testid = format!("ics-{code}");
                                     let copy_testid = format!("copy-link-{code}");
-                                    let cancelled = m.meeting.cancelled;
+                                    let cancelled = current.meeting.cancelled;
                                     view! {
                                         <li data-testid=row_testid>
-                                            <strong>{m.meeting.title.clone()}</strong>
+                                            <strong>{current.meeting.title.clone()}</strong>
                                             <small>{summary}</small>
                                             <a href=join_href>"Join"</a>
                                             <a href=ics_href download data-testid=ics_testid>
