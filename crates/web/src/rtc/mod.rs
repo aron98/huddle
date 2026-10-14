@@ -302,9 +302,12 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 }
                 Ok(())
             }
-            // Screen-share broadcast; wired into the roster in a
-            // follow-up commit.
-            ServerMessage::Sharing { .. } => Ok(()),
+            ServerMessage::Sharing { id, sharing } => {
+                if let Some(p) = self.roster.iter_mut().find(|p| p.id == id) {
+                    p.sharing = sharing;
+                }
+                Ok(())
+            }
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }
@@ -319,6 +322,29 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             .send(ClientMessage::Chat { body })
             .await
             .map_err(RtcError::from)
+    }
+
+    /// Start sharing the staged screen track: announce the share first (the
+    /// server labels the m-line our next offer creates as our screen), then
+    /// attach the track and renegotiate via [`RtcClient::publish`].
+    pub async fn start_screen_share(&mut self) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.signaling
+            .send(ClientMessage::Sharing { sharing: true })
+            .await?;
+        self.peer.add_screen_track().await?;
+        self.publish().await
+    }
+
+    /// Stop sharing: withdraw the track, tell the server (it winds down the
+    /// other subscribers), and renegotiate.
+    pub async fn stop_screen_share(&mut self) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.peer.remove_screen_track().await?;
+        self.signaling
+            .send(ClientMessage::Sharing { sharing: false })
+            .await?;
+        self.publish().await
     }
 
     /// Report our mute/camera state. The server broadcasts the canonical

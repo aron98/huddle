@@ -199,6 +199,65 @@ pub async fn watch_speaking(
     })
 }
 
+/// Acquire a screen-capture stream and return it with its video track.
+///
+/// The e2e harness (`?test=1`) runs on a headless display with nothing to
+/// capture, so there the fake camera stands in for a screen; real users go
+/// through the browser's `getDisplayMedia` picker.
+pub async fn request_screen() -> Result<(MediaStream, MediaStreamTrack), String> {
+    let test_mode = web_sys::window()
+        .and_then(|w| w.location().search().ok())
+        .is_some_and(|s| s.contains("test=1"));
+    let stream = if test_mode {
+        request_media(None, None).await?
+    } else {
+        let devices = media_devices()?;
+        let promise = devices
+            .get_display_media()
+            .map_err(|e| format!("cannot call getDisplayMedia: {e:?}"))?;
+        let value = JsFuture::from(promise)
+            .await
+            .map_err(|e| format!("screen capture denied or failed: {e:?}"))?;
+        value
+            .dyn_into::<MediaStream>()
+            .map_err(|e| format!("getDisplayMedia returned {e:?}"))?
+    };
+    let track = tracks_of(&stream)
+        .into_iter()
+        .find(|t| t.kind() == "video")
+        .ok_or_else(|| "screen capture has no video track".to_owned())?;
+    Ok((stream, track))
+}
+
+/// Fires `on_end` when `track` ends — the browser's own stop-sharing
+/// button ends a capture track, and the UI must wind the share down.
+pub struct TrackEndGuard {
+    track: MediaStreamTrack,
+    _on_ended: wasm_bindgen::closure::Closure<dyn FnMut()>,
+}
+
+impl Drop for TrackEndGuard {
+    fn drop(&mut self) {
+        // Detach before the closure drops: a late `ended` event firing
+        // into a dropped closure panics the wasm module.
+        self.track.set_onended(None);
+    }
+}
+
+/// Watch `track` for the browser-native end signal. Keep the returned
+/// guard alive as long as the share is live.
+pub fn watch_track_ended<F: FnMut() + 'static>(
+    track: &MediaStreamTrack,
+    on_end: F,
+) -> TrackEndGuard {
+    let closure = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(on_end);
+    track.set_onended(Some(closure.as_ref().unchecked_ref::<js_sys::Function>()));
+    TrackEndGuard {
+        track: track.clone(),
+        _on_ended: closure,
+    }
+}
+
 fn media_devices() -> Result<MediaDevices, String> {
     navigator()?
         .media_devices()
