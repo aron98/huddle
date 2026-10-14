@@ -332,6 +332,7 @@ async fn serve_asset(state: &AppState, path: &str) -> Response {
 }
 
 async fn asset_response(state: &AppState, path: &str) -> Response {
+    let csp = ui_csp(state);
     // Runtime override directory wins, then the embedded bundle.
     if let Some(dir) = &state.config().web_dir {
         let full = dir.join(path);
@@ -343,6 +344,7 @@ async fn asset_response(state: &AppState, path: &str) -> Response {
                     bytes,
                 )
                     .into_response(),
+                csp,
             );
         }
     }
@@ -355,6 +357,7 @@ async fn asset_response(state: &AppState, path: &str) -> Response {
                 file.data.into_owned(),
             )
                 .into_response(),
+            csp,
         ),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
@@ -365,17 +368,62 @@ async fn asset_response(state: &AppState, path: &str) -> Response {
 /// from the framework; media elements play `blob:` URLs created by
 /// `URL.createObjectURL` for remote streams, and signaling connects to
 /// the same origin over `ws(s):`. Everything else is locked to `self`.
-const CSP: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
-                   style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; \
-                   media-src 'self' blob:; img-src 'self' data:; font-src 'self'; \
-                   object-src 'none'; base-uri 'self'; form-action 'self'";
+///
+/// The one allowed inline script — trunk's wasm bootstrap, which embeds
+/// per-build asset names — is added by hash at runtime
+/// ([`ui_csp`]), so every other inline script stays blocked.
+///
+/// The `{}` in `script-src` receives the runtime `'sha256-…'` allowance.
+fn ui_csp(state: &AppState) -> &'static str {
+    static CSP_WITH_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP_WITH_HASH.get_or_init(|| {
+        let html = if let Some(dir) = &state.config().web_dir {
+            std::fs::read_to_string(dir.join("index.html")).ok()
+        } else {
+            Ui::get("index.html").map(|f| String::from_utf8_lossy(&f.data).into_owned())
+        };
+        let allowance = html
+            .as_deref()
+            .and_then(inline_script_hash)
+            .map(|hash| format!(" 'sha256-{hash}'"))
+            .unwrap_or_default();
+        // NOTE: inline capture (`{allowance}`) only works when the whole
+        // policy literal lives in this `format!` — a captured `const`
+        // template's braces are not re-processed as format holes.
+        format!(
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'{allowance}; \
+             style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; \
+             media-src 'self' blob:; img-src 'self' data:; font-src 'self'; \
+             object-src 'none'; base-uri 'self'; form-action 'self'"
+        )
+    })
+}
+
+/// Extract the first inline `<script>` body from `html` and return the
+/// base64 sha256 of its text — the value a CSP `script-src 'sha256-…'`
+/// allowance needs. Returns `None` when there is no inline script.
+fn inline_script_hash(html: &str) -> Option<String> {
+    let start = html.find("<script")?;
+    let open_tag_end = html[start..].find('>')? + start + 1;
+    // `src=` scripts are external, not inline.
+    if html[start..open_tag_end].contains("src=") {
+        return None;
+    }
+    let end = html[open_tag_end..].find("</script>")? + open_tag_end;
+    let body = &html[open_tag_end..end];
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    use base64::Engine;
+    Some(base64::engine::general_purpose::STANDARD.encode(digest))
+}
 
 /// Apply the security headers shared by all served UI assets.
-fn with_security_headers(mut response: Response) -> Response {
-    response.headers_mut().insert(
-        header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static(CSP),
-    );
+fn with_security_headers(mut response: Response, csp: &str) -> Response {
+    if let Ok(value) = header::HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, value);
+    }
     response.headers_mut().insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -707,6 +755,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn inline_script_hash_matches_a_plain_sha256() {
+        let html = r#"<html><script type="module">console.log(1);
+</script></html>"#;
+        let hash = inline_script_hash(html).unwrap();
+        use base64::Engine;
+        use sha2::Digest;
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(b"console.log(1);\n"));
+        assert_eq!(hash, expected);
+        // External scripts and script-less pages yield no allowance.
+        assert!(inline_script_hash(r#"<script src="a.js"></script>"#).is_none());
+        assert!(inline_script_hash("no scripts at all").is_none());
     }
 
     #[tokio::test]
