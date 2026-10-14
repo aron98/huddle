@@ -99,6 +99,106 @@ pub fn tracks_of(stream: &MediaStream) -> Vec<MediaStreamTrack> {
         .collect()
 }
 
+/// Root-mean-square level above which the local audio counts as speech.
+const SPEAKING_RMS: f32 = 0.03;
+/// How often the level is sampled.
+const SPEAKING_POLL_MS: i32 = 200;
+/// Quiet samples before speech is considered over (≈1s hangover).
+const SPEAKING_HANGOVER_TICKS: u32 = 5;
+/// Size of the analysis window; small is plenty for an RMS gate.
+const SPEAKING_WINDOW: usize = 256;
+
+/// Keeps the Web Audio graph and sampling timer alive. Dropping the guard
+/// stops the speaking detection.
+pub struct SpeakingGuard {
+    // Field order matters: the closure must drop before the nodes it
+    // borrows. Rust drops fields in declaration order, so `_nodes` last
+    // would still be fine, but the explicit order documents the intent.
+    _interval_handle: i32,
+    _callback: wasm_bindgen::closure::Closure<dyn FnMut()>,
+    _nodes: (
+        web_sys::AudioContext,
+        web_sys::MediaStreamAudioSourceNode,
+        web_sys::AnalyserNode,
+        web_sys::GainNode,
+    ),
+}
+
+impl Drop for SpeakingGuard {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            window.clear_interval_with_handle(self._interval_handle);
+        }
+    }
+}
+
+/// Watch `stream`'s audio level and call `on_change` whenever the
+/// speaking/not-speaking verdict flips. A muted track reads as silence.
+///
+/// The graph is source → analyser → zero-gain sink → destination: the sink
+/// keeps the browser pulling samples through the analyser without playing
+/// the local mic back to the user.
+pub async fn watch_speaking(
+    stream: &MediaStream,
+    mut on_change: impl FnMut(bool) + 'static,
+) -> Result<SpeakingGuard, String> {
+    let err = |e: JsValue| format!("Web Audio unavailable: {e:?}");
+    let context = web_sys::AudioContext::new().map_err(err)?;
+    // Autoplay policies may hand us a suspended context; resume is a
+    // no-op when it is already running. Best-effort: a suspended context
+    // simply never reports speech rather than failing the call.
+    if let Ok(promise) = context.resume() {
+        let _ = JsFuture::from(promise).await;
+    }
+    let source = context.create_media_stream_source(stream).map_err(err)?;
+    let analyser = context.create_analyser().map_err(err)?;
+    analyser.set_fft_size(SPEAKING_WINDOW as u32);
+    let sink = context.create_gain().map_err(err)?;
+    sink.gain().set_value(0.0);
+
+    source.connect_with_audio_node(&analyser).map_err(err)?;
+    analyser.connect_with_audio_node(&sink).map_err(err)?;
+    sink.connect_with_audio_node(&context.destination())
+        .map_err(err)?;
+
+    let mut window = vec![0f32; SPEAKING_WINDOW];
+    let mut speaking = false;
+    let mut quiet_ticks: u32 = 0;
+    let analyser_for_timer = analyser.clone();
+    let callback = wasm_bindgen::closure::Closure::<dyn FnMut()>::new(move || {
+        analyser_for_timer.get_float_time_domain_data(&mut window);
+        let sum: f32 = window.iter().map(|s| s * s).sum();
+        let rms = (sum / window.len() as f32).sqrt();
+        if rms > SPEAKING_RMS {
+            quiet_ticks = 0;
+            if !speaking {
+                speaking = true;
+                on_change(true);
+            }
+        } else {
+            quiet_ticks = quiet_ticks.saturating_add(1);
+            if speaking && quiet_ticks >= SPEAKING_HANGOVER_TICKS {
+                speaking = false;
+                on_change(false);
+            }
+        }
+    });
+
+    let window_handle = web_sys::window().ok_or_else(|| "no window".to_owned())?;
+    let interval_handle = window_handle
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref::<js_sys::Function>(),
+            SPEAKING_POLL_MS,
+        )
+        .map_err(err)?;
+
+    Ok(SpeakingGuard {
+        _interval_handle: interval_handle,
+        _callback: callback,
+        _nodes: (context, source, analyser, sink),
+    })
+}
+
 fn media_devices() -> Result<MediaDevices, String> {
     navigator()?
         .media_devices()

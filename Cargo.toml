@@ -39,7 +39,14 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
+    "AnalyserNode",
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "BaseAudioContext",
     "BinaryType",
+    "GainNode",
     "HtmlMediaElement",
     "HtmlVideoElement",
     "Location",
@@ -47,6 +54,7 @@ web-sys = { version = "0.3", features = [
     "MediaDeviceInfo",
     "MediaDevices",
     "MediaStream",
+    "MediaStreamAudioSourceNode",
     "MediaStreamConstraints",
     "MediaStreamTrack",
     "MessageEvent",

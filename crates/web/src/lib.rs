@@ -297,6 +297,7 @@ enum UiAction {
         audio_muted: Option<bool>,
         video_muted: Option<bool>,
     },
+    Speaking(bool),
     Leave,
 }
 
@@ -320,6 +321,8 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
     let cam_on = RwSignal::new(true);
 
     let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
+    // The session task reports our own speaking through the same channel.
+    let task_ui_tx = ui_tx.clone();
 
     // The session task: connect, join, publish, then pump messages and UI
     // actions until the call ends.
@@ -391,6 +394,24 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
         }
         status.set(None);
 
+        // Best-effort speaking detection: watch our own level and report
+        // flips through the session. Failure is non-fatal — the call just
+        // runs without the indicator.
+        let _speaking_watch = match local.as_ref() {
+            Some(s) => match media::watch_speaking(s, move |speaking| {
+                let _ = task_ui_tx.unbounded_send(UiAction::Speaking(speaking));
+            })
+            .await
+            {
+                Ok(guard) => Some(guard),
+                Err(e) => {
+                    leptos::logging::warn!("speaking detection off: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
         loop {
             futures::select! {
                 message = client.next_server_message().fuse() => {
@@ -414,6 +435,12 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                     match action {
                         UiAction::Mute { audio_muted, video_muted } => {
                             if let Err(e) = client.set_mute_state(audio_muted, video_muted).await {
+                                status.set(Some(format!("Disconnected: {e}")));
+                                break;
+                            }
+                        }
+                        UiAction::Speaking(speaking) => {
+                            if let Err(e) = client.set_speaking(speaking).await {
                                 status.set(Some(format!("Disconnected: {e}")));
                                 break;
                             }
