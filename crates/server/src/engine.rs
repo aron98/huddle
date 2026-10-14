@@ -79,6 +79,12 @@ pub enum EngineCommand {
         id: Uuid,
         speaking: bool,
     },
+    /// Update a participant's share state and broadcast it.
+    Sharing {
+        code: String,
+        id: Uuid,
+        sharing: bool,
+    },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
     /// A datagram arrived on the media socket.
@@ -149,6 +155,10 @@ impl EngineHandle {
 
     pub fn speaking(&self, code: String, id: Uuid, speaking: bool) {
         let _ = self.tx.send(EngineCommand::Speaking { code, id, speaking });
+    }
+
+    pub fn sharing(&self, code: String, id: Uuid, sharing: bool) {
+        let _ = self.tx.send(EngineCommand::Sharing { code, id, sharing });
     }
 
     pub fn leave(&self, code: String, id: Uuid) {
@@ -388,6 +398,9 @@ impl Engine {
             EngineCommand::Speaking { code, id, speaking } => {
                 self.relay_speaking(&code, id, speaking);
             }
+            EngineCommand::Sharing { code, id, sharing } => {
+                self.set_sharing(&code, id, sharing);
+            }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Packet { source, bytes } => self.handle_packet(source, &bytes),
             EngineCommand::Shutdown => unreachable!("handled by the run loop"),
@@ -550,6 +563,25 @@ impl Engine {
             return;
         }
         let msg = ServerMessage::Speaking { id, speaking };
+        for out in inst.outs.values() {
+            let _ = out.send(msg.clone());
+        }
+    }
+
+    /// Update a participant's share state, mirror it into the room so
+    /// the SFU stops/resumes screen forwarding, and tell everyone.
+    fn set_sharing(&mut self, code: &str, id: Uuid, sharing: bool) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        let Some(p) = inst.participants.get_mut(&id) else {
+            return;
+        };
+        p.sharing = sharing;
+        if let Err(e) = inst.room.set_sharing(id, sharing) {
+            tracing::debug!(peer = %id, "room set_sharing: {e}");
+        }
+        let msg = ServerMessage::Sharing { id, sharing };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
         }
@@ -815,6 +847,46 @@ mod tests {
                 assert_eq!(s, speaking);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn sharing_broadcasts_to_everyone_and_updates_the_roster() {
+        let (engine, _keep) = test_engine(8);
+        let (alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        next(&mut bob_rx).await; // welcome
+        next(&mut alice_rx).await; // welcome
+        next(&mut alice_rx).await; // bob joined
+
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, true);
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, false);
+
+        for sharing in [true, false] {
+            for rx in [&mut alice_rx, &mut bob_rx] {
+                let msg = next(rx).await;
+                let ServerMessage::Sharing { id, sharing: s } = msg else {
+                    panic!("expected sharing, got {msg:?}");
+                };
+                assert_eq!(id, alice);
+                assert_eq!(s, sharing);
+            }
+        }
+
+        // A late joiner's Welcome roster reflects the current share state.
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, true);
+        next(&mut alice_rx).await; // echo to alice
+        next(&mut bob_rx).await; // relay to bob
+
+        let (_carol, mut carol_rx) = join(&engine, "ABCD-EFGH-JKLM", "carol").await;
+        let welcome = next(&mut carol_rx).await;
+        let ServerMessage::Welcome { roster, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        let alice_in_roster = roster
+            .iter()
+            .find(|p| p.name == "alice")
+            .expect("alice in roster");
+        assert!(alice_in_roster.sharing);
     }
 
     #[tokio::test]

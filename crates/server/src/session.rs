@@ -87,9 +87,9 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::Speaking { speaking } => {
                         engine.speaking(code.clone(), id, speaking);
                     }
-                    // Screen-share signaling; wired into the engine in a
-                    // follow-up commit.
-                    ClientMessage::Sharing { .. } => {}
+                    ClientMessage::Sharing { sharing } => {
+                        engine.sharing(code.clone(), id, sharing);
+                    }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;
