@@ -13,6 +13,7 @@ use huddle_protocol::{
     ApiError, CreateMeetingRequest, ErrorCode, MeetingResponse, UpdateMeetingRequest,
 };
 
+use crate::auth;
 use crate::meetings::{self, MeetingError};
 use crate::session;
 use crate::state::AppState;
@@ -34,6 +35,9 @@ pub fn router(state: AppState) -> Router {
                 .patch(update_meeting)
                 .delete(cancel_meeting),
         )
+        .route("/api/auth/request-link", post(auth::request_link))
+        .route("/api/auth/verify", get(auth::verify))
+        .route("/api/auth/me", get(auth::me))
         .route("/ws", get(session::ws))
         .fallback(fallback)
         .with_state(state)
@@ -433,5 +437,82 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body).into_owned();
         assert!(text.contains("meeting_not_found"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn auth_flow_issues_session_and_reports_me() {
+        use crate::identity::IdentityProvider;
+
+        let state = test_state().await;
+        let token = state
+            .identity()
+            .start_login("route@example.com", OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+
+        let response = router(state.clone())
+            .oneshot(
+                Request::get(format!("/api/auth/verify?token={token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("verify sets the session cookie")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(cookie.starts_with("huddle_session="), "got: {cookie}");
+        let pair = cookie.split(';').next().unwrap().to_owned();
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(header::COOKIE, pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("route@example.com"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn request_link_succeeds_for_any_email_shape() {
+        let app = router(test_state().await);
+        for email in ["someone@example.com", "not-an-email"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/request-link")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Always 200: responses must not reveal which addresses are valid.
+            assert_eq!(response.status(), StatusCode::OK, "email: {email}");
+        }
+    }
+
+    #[tokio::test]
+    async fn me_without_session_is_401() {
+        let app = router(test_state().await);
+        let response = app
+            .oneshot(Request::get("/api/auth/me").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("unauthorized"), "got: {text}");
     }
 }

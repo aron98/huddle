@@ -1,5 +1,4 @@
-//! Organizer identity (ADR 003): passwordless magic links.
-//!
+//! Organizer identity (ADR 003): passwordless magic links.//!
 //! [`IdentityProvider`] is the boundary the rest of the server codes
 //! against; SSO (OIDC/SAML) will arrive as a second implementation of the
 //! trait, not a rewrite. The MVP implementation,
@@ -8,7 +7,6 @@
 //!
 //! The auth routes that call into this module land in a follow-up commit;
 //! the allowance drops when they do.
-#![allow(dead_code)]
 
 use rand::RngExt;
 use sha2::{Digest, Sha256};

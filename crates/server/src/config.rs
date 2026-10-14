@@ -52,6 +52,13 @@ pub struct Config {
     pub max_participants: usize,
     /// Minutes a magic sign-in link stays valid.
     pub login_token_ttl_min: u32,
+    /// Secret key for signing organizer session cookies. Unset (the
+    /// default) generates a random key at startup with a warning —
+    /// fine for trying huddle out, but sessions then do not survive
+    /// restarts. Production deployments should set it.
+    pub session_secret: Option<String>,
+    /// Minutes an organizer session cookie stays valid.
+    pub session_ttl_min: u32,
     /// SMTP relay for magic-link emails. `None` (the default) logs the
     /// link instead of sending it — fine for development and small
     /// self-hosted setups, and it keeps the single binary dependency-free.
@@ -103,6 +110,8 @@ impl Default for Config {
             ice_servers: Vec::new(),
             max_participants: 8,
             login_token_ttl_min: 15,
+            session_secret: None,
+            session_ttl_min: 120,
             smtp: None,
         }
     }
@@ -215,6 +224,8 @@ mod tests {
         assert_eq!(config.max_participants, 8);
         assert_eq!(config.web_dir, None);
         assert_eq!(config.login_token_ttl_min, 15);
+        assert_eq!(config.session_secret, None);
+        assert_eq!(config.session_ttl_min, 120);
         assert_eq!(config.smtp, None);
     }
 

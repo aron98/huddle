@@ -1,11 +1,7 @@
-//! Magic-link delivery: SMTP via lettre when configured, log otherwise.
-//!
+//! Magic-link delivery: SMTP via lettre when configured, log otherwise.//!
 //! Self-hosting should not require an SMTP relay to evaluate huddle, so
 //! the default mode logs the sign-in link at `info` level instead of
 //! sending mail. Setting `[smtp]` in the config switches to real email.
-
-// TODO(phase-5): drop once the auth routes call into this module.
-#![allow(dead_code)]
 
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
