@@ -299,6 +299,9 @@ enum UiAction {
     },
     Speaking(bool),
     ShareScreen(ScreenCommand),
+    Chat {
+        body: String,
+    },
     Leave,
 }
 
@@ -329,6 +332,9 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
     let sharing = RwSignal::new(false);
+    // Chat messages (live relay + history replay) shown in the sidebar.
+    let chat = RwSignal::<Vec<huddle_protocol::ChatMessage>>::new(Vec::new());
+    let chat_draft = RwSignal::new(String::new());
 
     let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
     // The session task reports our own speaking through the same channel.
@@ -463,6 +469,7 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                         }
                         roster.set(client.roster().to_vec());
                         speaking.set(client.speaking().clone());
+                        chat.set(client.chat_log().to_vec());
                     }
                     Err(e) => {
                         status.set(Some(format!("Disconnected: {e}")));
@@ -528,6 +535,12 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                                 }
                             }
                         },
+                        UiAction::Chat { body } => {
+                            if let Err(e) = client.send_chat(body).await {
+                                status.set(Some(format!("Disconnected: {e}")));
+                                break;
+                            }
+                        }
                         UiAction::Leave => {
                             let _ = client.leave().await;
                             status.set(Some("You left the meeting.".to_owned()));
@@ -592,6 +605,31 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                 ScreenCommand::Start
             };
             let _ = ui_tx.unbounded_send(UiAction::ShareScreen(command));
+        }
+    };
+
+    // Send the chat draft, shared by the button and the Enter key.
+    fn submit_chat_body(
+        chat_draft: RwSignal<String>,
+        ui_tx: &futures::channel::mpsc::UnboundedSender<UiAction>,
+    ) {
+        let body = chat_draft.get_untracked().trim().to_owned();
+        if body.is_empty() {
+            return;
+        }
+        chat_draft.set(String::new());
+        let _ = ui_tx.unbounded_send(UiAction::Chat { body });
+    }
+    let on_send_click = {
+        let ui_tx = ui_tx.clone();
+        move |_: web_sys::MouseEvent| submit_chat_body(chat_draft, &ui_tx)
+    };
+    let on_send_key = {
+        let ui_tx = ui_tx.clone();
+        move |ev: web_sys::KeyboardEvent| {
+            if ev.key() == "Enter" {
+                submit_chat_body(chat_draft, &ui_tx);
+            }
         }
     };
 
@@ -685,6 +723,32 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                     }}
                 </For>
             </ul>
+
+            <aside class="chat">
+                <h2>"Chat"</h2>
+                <ul data-testid="chat-log">
+                    <For each={move || chat.get()} key=|m| m.id let:m>
+                        {move || {
+                            view! {
+                                <li class={if m.sender_id.is_none() { "system" } else { "" }}>
+                                    <strong>{m.sender_name.clone()}</strong>
+                                    " "
+                                    {m.body.clone()}
+                                </li>
+                            }
+                        }}
+                    </For>
+                </ul>
+                <input
+                    type="text"
+                    placeholder="Message everyone"
+                    data-testid="chat-input"
+                    prop:value=chat_draft
+                    on:input=move |ev| chat_draft.set(event_target_value(&ev))
+                    on:keydown=on_send_key
+                />
+                <button data-testid="chat-send" on:click=on_send_click>"Send"</button>
+            </aside>
 
             <div class="controls">
                 <button data-testid="toggle-mic" on:click=toggle_mic>

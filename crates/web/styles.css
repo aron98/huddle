@@ -89,6 +89,61 @@ video {
   background: #242a35;
 }
 
+/* Screen-share tiles get a hint of blue, distinct from camera tiles. */
+.tile.screen {
+  outline: 3px solid #60a5fa;
+  outline-offset: -3px;
+}
+
+/* Chat sidebar: log grows, composer stays at the bottom. */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 1.25rem;
+  border: 1px solid #333a46;
+  border-radius: 10px;
+  padding: 0.75rem;
+  background: #1a1e26;
+}
+
+.chat h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.chat ul[data-testid="chat-log"] {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.6;
+}
+
+.chat ul[data-testid="chat-log"] li.system strong {
+  color: #8b93a3;
+  font-style: italic;
+}
+
+.chat input {
+  padding: 0.5rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid #333a46;
+  background: #0f1115;
+  color: #e6e8ec;
+}
+
+.chat button {
+  align-self: flex-start;
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  border: 1px solid #333a46;
+  background: #0f1115;
+  color: #e6e8ec;
+  cursor: pointer;
+}
+
 ul[data-testid="roster"] {
   margin-top: 1.25rem;
   padding-left: 1.25rem;
