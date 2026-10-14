@@ -1,0 +1,71 @@
+# Release pipeline: on a pushed v* tag, build the static musl binary
+# with the web client baked in and attach it to the GitHub release.
+#
+# The single binary is the whole app: the Leptos client is embedded via
+# rust-embed at compile time (crates/server/assets), so the tarball
+# needs nothing but a Linux/x86_64 host to run on.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: build and attach release artifacts
+    runs-on: ubuntu-24.04
+    container:
+      # Matches the rust-toolchain.toml pin; alpine gives a static musl
+      # binary that runs on any Linux/x86_64 host.
+      image: rust:1.96.0-alpine
+    steps:
+      # aws-lc-sys needs cmake + perl; build-base is gcc/musl-dev/make.
+      - name: install build deps
+        run: apk add --no-cache build-base cmake perl
+
+      - uses: actions/checkout@v5
+
+      - name: add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install trunk
+        run: |
+          curl -fsSL \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin
+          trunk --version
+
+      - name: build web client
+        run: trunk build --release
+        working-directory: crates/web
+
+      - name: bake the web bundle into the server
+        run: cp -r crates/web/dist/. crates/server/assets/
+
+      - name: build server
+        run: cargo build --release -p huddle-server
+
+      - name: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          target=x86_64-unknown-linux-musl
+          mkdir -p package
+          cp target/release/huddle package/huddle
+          tar -czf "huddle-${version}-${target}.tar.gz" -C package huddle
+          sha256sum "huddle-${version}-${target}.tar.gz" > "huddle-${version}-${target}.tar.gz.sha256"
+          ls -la huddle-*
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            huddle-*.tar.gz
+            huddle-*.tar.gz.sha256
