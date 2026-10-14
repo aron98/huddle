@@ -48,3 +48,10 @@ Build the SFU ourselves on **str0m**.
   suits an SFU better.
 - *LiveKit*: fastest to ship, but abandons the Rust-server goal and adds a huge
   surface we don't own.
+
+## Amendment (2026-10-14)
+
+- "E2EE and future simulcast remain open": both now have deciding issues in the
+  [post-MVP milestone](https://github.com/aron98/huddle/milestone/1) — E2EE
+  decision + spike in [#14](https://github.com/aron98/huddle/issues/14),
+  simulcast design in [#12](https://github.com/aron98/huddle/issues/12).
