@@ -49,6 +49,19 @@ pub trait PeerConnection {
     /// Drain locally gathered candidates so they can be trickled out.
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate>;
 
+    /// Apply TURN/STUN servers the server advertised in `Welcome`.
+    ///
+    /// The peer connection is constructed before joining, so relay
+    /// servers discovered at join time land here. The default is a
+    /// no-op so fakes (and native tests) stay simple.
+    fn update_ice_servers(
+        &mut self,
+        ice_servers: &[huddle_protocol::IceServer],
+    ) -> Result<(), PeerError> {
+        let _ = ice_servers;
+        Ok(())
+    }
+
     /// Attach the staged screen track so the next offer announces it.
     ///
     /// How a track comes to be "staged" is implementation-specific (the

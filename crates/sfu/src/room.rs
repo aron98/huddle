@@ -96,12 +96,22 @@ impl Room {
         self.peers.len()
     }
 
-    /// Per-peer media counters (testable, later exposed via `/stats`).
+    /// Per-peer media counters and link stats (testable, exposed via `/metrics`).
     pub fn peer_stats(&self, id: PeerId) -> Option<PeerStats> {
-        self.peers.get(&id).map(|p| PeerStats {
-            rx_frames: p.rx_frames,
-            tx_frames: p.tx_frames,
-            keyframes_requested: p.keyframes_requested,
+        self.peers.get(&id).map(|p| {
+            let l = p.link_stats().unwrap_or_default();
+            PeerStats {
+                rx_frames: p.rx_frames,
+                tx_frames: p.tx_frames,
+                keyframes_requested: p.keyframes_requested,
+                bytes_rx: l.bytes_rx,
+                bytes_tx: l.bytes_tx,
+                bitrate_in_bps: l.bitrate_in_bps,
+                bitrate_out_bps: l.bitrate_out_bps,
+                rtt_ms: l.rtt_ms,
+                ingress_loss_fraction: l.ingress_loss_fraction,
+                egress_loss_fraction: l.egress_loss_fraction,
+            }
         })
     }
 

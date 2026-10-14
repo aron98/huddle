@@ -25,6 +25,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+use serde::Serialize;
+
 use crate::config::Config;
 use crate::meetings::normalize_code;
 
@@ -35,6 +37,39 @@ const MAX_SLEEP: Duration = Duration::from_millis(50);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinRejected {
     pub code: ErrorCode,
+}
+
+/// Snapshot of the engine's live state, as rendered by `/metrics`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct StatsReport {
+    /// One entry per live meeting room.
+    pub rooms: Vec<RoomReport>,
+}
+
+/// One live meeting room.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoomReport {
+    /// Normalized meeting code.
+    pub code: String,
+    /// Every participant currently in the room, sorted by name.
+    pub peers: Vec<PeerReport>,
+}
+
+/// One participant's counters and link stats.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerReport {
+    pub id: Uuid,
+    pub name: String,
+    pub rx_frames: u64,
+    pub tx_frames: u64,
+    pub keyframes_requested: u64,
+    pub bytes_rx: u64,
+    pub bytes_tx: u64,
+    pub bitrate_in_bps: u64,
+    pub bitrate_out_bps: u64,
+    pub rtt_ms: Option<u64>,
+    pub ingress_loss_fraction: Option<f32>,
+    pub egress_loss_fraction: Option<f32>,
 }
 
 /// Everything an async session can ask the engine to do. Sessions are the
@@ -86,6 +121,8 @@ pub enum EngineCommand {
     },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
+    /// Collect a snapshot of rooms and peer stats (the `/metrics` pull).
+    Stats { reply: oneshot::Sender<StatsReport> },
     /// A datagram arrived on the media socket.
     Packet { source: SocketAddr, bytes: Vec<u8> },
     /// Stop the engine thread (graceful shutdown of the process).
@@ -162,6 +199,13 @@ impl EngineHandle {
 
     pub fn leave(&self, code: String, id: Uuid) {
         let _ = self.tx.send(EngineCommand::Leave { code, id });
+    }
+
+    /// Request a snapshot of rooms and peer stats from the engine.
+    pub fn stats(&self) -> oneshot::Receiver<StatsReport> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(EngineCommand::Stats { reply: reply_tx });
+        reply_rx
     }
 
     pub fn shutdown(&self) {
@@ -401,9 +445,48 @@ impl Engine {
                 self.set_sharing(&code, id, sharing);
             }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
+            EngineCommand::Stats { reply } => {
+                let _ = reply.send(self.collect_stats());
+            }
             EngineCommand::Packet { source, bytes } => self.handle_packet(source, &bytes),
             EngineCommand::Shutdown => unreachable!("handled by the run loop"),
         }
+    }
+
+    /// One pull of everything `/metrics` renders: rooms, peers, and their
+    /// counters. Sorting by code/name keeps successive scrapes readable.
+    fn collect_stats(&self) -> StatsReport {
+        let mut rooms = Vec::with_capacity(self.meetings.len());
+        for (code, inst) in &self.meetings {
+            let mut peers: Vec<PeerReport> = inst
+                .participants
+                .values()
+                .map(|p| {
+                    let s = inst.room.peer_stats(p.id).unwrap_or_default();
+                    PeerReport {
+                        id: p.id,
+                        name: p.name.clone(),
+                        rx_frames: s.rx_frames,
+                        tx_frames: s.tx_frames,
+                        keyframes_requested: s.keyframes_requested,
+                        bytes_rx: s.bytes_rx,
+                        bytes_tx: s.bytes_tx,
+                        bitrate_in_bps: s.bitrate_in_bps,
+                        bitrate_out_bps: s.bitrate_out_bps,
+                        rtt_ms: s.rtt_ms,
+                        ingress_loss_fraction: s.ingress_loss_fraction,
+                        egress_loss_fraction: s.egress_loss_fraction,
+                    }
+                })
+                .collect();
+            peers.sort_by(|a, b| a.name.cmp(&b.name));
+            rooms.push(RoomReport {
+                code: code.clone(),
+                peers,
+            });
+        }
+        rooms.sort_by(|a, b| a.code.cmp(&b.code));
+        StatsReport { rooms }
     }
 
     fn join(
@@ -923,5 +1006,34 @@ mod tests {
             .await
             .expect("timeout while waiting for channel close");
         assert!(closed.is_none(), "expected channel close, got {closed:?}");
+    }
+
+    #[tokio::test]
+    async fn stats_report_lists_rooms_and_peers() {
+        let (engine, _keep) = test_engine(8);
+        let (_alice, _alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (_bob, _bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+
+        let report = engine.stats().await.expect("engine alive");
+        assert_eq!(report.rooms.len(), 1);
+        assert_eq!(report.rooms[0].code, "ABCD-EFGH-JKLM");
+        // Peers are sorted by name for stable scrapes.
+        assert_eq!(
+            report.rooms[0]
+                .peers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alice", "bob"]
+        );
+
+        engine.leave("ABCD-EFGH-JKLM".into(), _alice);
+        engine.leave("ABCD-EFGH-JKLM".into(), _bob);
+
+        let report = engine.stats().await.expect("engine alive");
+        assert!(
+            report.rooms.is_empty(),
+            "room should be gone after everyone left: {report:?}"
+        );
     }
 }

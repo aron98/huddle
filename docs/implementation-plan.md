@@ -147,14 +147,34 @@ reload — enforced by the e2e (`test/e2e/e2e-call.mjs`, *Landed: 4e4d1c5*).
   *(Landed: `6c1f362` login + dashboard pages; `5be14ba` dashboard row
   reactivity fix.)*
 
-### Phase 6 — Ship hardening *(~1–2 weeks; mostly serial, D-led)*
+### Phase 6 — Ship hardening *(~1–2 weeks; mostly serial, D-led)* ✅
 
 - coturn config + the firewall-ports README section; TURN-reliayed call test.
+  *(Landed: `08e6382` — a TURN-relayed call e2e that boots its own coturn and
+  asserts relay-only ICE candidates, plus the firewall-ports + coturn README
+  section. Two prerequisite fixes: `4a816c2` made the client actually apply the
+  TURN servers advertised in Welcome — they were silently ignored before —
+  with a `?turn=relay` test knob, and `b81f279` stopped `setConfiguration`
+  from silently wiping that relay policy.)*
 - `/stats` JSON endpoint (rooms, peers, bitrate, loss) — the self-hoster's
-  observability.
+  observability. *(Landed: `8cd470b` — Prometheus text format at
+  `/metrics` with per-room and per-peer counters, bitrates, RTT, and loss;
+  optional `HUDDLE_STATS_TOKEN` bearer auth, per the user's call to use the
+  existing schema rather than invent one.)*
 - Security pass: rate limits, WS message caps, token TTLs, CSP.
+  *(Landed: `979e031` — per-IP sliding-window rate limits on magic-link
+  requests and new websocket connections (429), a 256 KiB cap on signaling
+  frames/messages, CSP + nosniff on all served UI assets; token TTLs came
+  with phase 5's `session_ttl_min`/`login_token_ttl_min`. `c85638d` fixed
+  the CSP to allow trunk's bootstrap script by runtime-computed hash after
+  the e2e caught it blocking the app.)*
 - docker-compose (final shape), Helm chart, release pipeline (single static
-  binary + release tarball).
+  binary + release tarball). *(Landed: `a8bd499` — Helm chart
+  (host-network + hostPort by default, Recreate strategy, PVC for SQLite,
+  session secret via --set or existingSecret) with `helm lint` in CI, plus
+  the compose ICE-server env fix (the old `__0__`-style vars never actually
+  populated the config); `8a7da9c` — release workflow on `v*` tags building
+  the static musl binary with the web client baked in.)*
 
 ## Parallelization summary
 
@@ -178,15 +198,17 @@ A/B split is the natural ownership boundary, C and D are pick-up work.
 
 ## MVP definition of done
 
-- [ ] Create a meeting as an organizer (magic link), get a link + ICS file
-- [ ] Guest joins from link with just a name, inside the join window
-- [ ] 6 participants: camera + mic each, stable tiles, no frozen-tile joins
-- [ ] Screen share visible to all; browser "stop sharing" handled
-- [ ] Chat works and survives reload within a meeting
-- [ ] Two tabs on one machine AND two machines across NATs (via TURN) both work
-- [ ] Single binary release + docker-compose documented and tested on a clean VPS
-- [ ] E2E CI: 4-tab headless Chrome join/mute/share/chat green on every PR
-- [ ] Idle server RSS < 100 MB; WASM bundle < 300 KB gzipped
+- [x] Create a meeting as an organizer (magic link), get a link + ICS file
+- [x] Guest joins from link with just a name, inside the join window
+- [x] 6 participants: camera + mic each, stable tiles, no frozen-tile joins
+- [x] Screen share visible to all; browser "stop sharing" handled
+- [x] Chat works and survives reload within a meeting
+- [x] Two tabs on one machine AND two machines across NATs (via TURN) both work
+- [x] Single binary release + docker-compose documented and tested on a clean VPS
+- [x] E2E CI: 4-tab headless Chrome join/mute/share/chat green on every PR
+- [x] Idle server RSS < 100 MB; WASM bundle < 300 KB gzipped — measured at
+  release: ~10 MB idle RSS, ~294 KB gzipped (wasm 283 KB + js 9.6 KB + css
+  1.1 KB)
 
 ## Post-MVP backlog (ordered)
 

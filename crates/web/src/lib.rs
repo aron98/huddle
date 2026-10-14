@@ -373,7 +373,20 @@ fn CallView(code: String, name: String, local: Option<web_sys::MediaStream>) -> 
                 return;
             }
         };
-        let peer = match BrowserPeerConnection::new(&[]) {
+        // Test knob: `?turn=relay` forces every candidate through the
+        // TURN relay (`iceTransportPolicy: "relay"`). The relay servers
+        // themselves arrive with the Welcome and are applied inside
+        // `RtcClient::join`.
+        let relay = window()
+            .location()
+            .search()
+            .unwrap_or_default()
+            .contains("turn=relay");
+        let peer = match if relay {
+            BrowserPeerConnection::new_relay(&[])
+        } else {
+            BrowserPeerConnection::new(&[])
+        } {
             Ok(p) => p,
             Err(e) => {
                 status.set(Some(format!("WebRTC unavailable: {e}")));

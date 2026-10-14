@@ -82,7 +82,14 @@ impl MockState {
                     meeting: meeting_dto(meeting_code),
                     // Someone else is already in the room.
                     roster: vec![participant(ALICE_ID, "alice"), you],
-                    ice_servers: vec![],
+                    // A TURN relay, as a real server configured with
+                    // coturn would advertise: the client must apply it
+                    // to its peer connection.
+                    ice_servers: vec![huddle_protocol::IceServer {
+                        urls: vec!["turn:turn.example.com:3478".into()],
+                        username: Some("huddle".into()),
+                        credential: Some("secret".into()),
+                    }],
                 }]
             }
             ClientMessage::SdpOffer { .. } => vec![
@@ -275,6 +282,7 @@ struct FakePeerConnection {
     remote_candidates: Vec<LocalCandidate>,
     pending_local_candidates: Vec<LocalCandidate>,
     screen_tracks: usize,
+    ice_server_updates: usize,
 }
 
 impl FakePeerConnection {
@@ -310,6 +318,16 @@ impl PeerConnection for FakePeerConnection {
 
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate> {
         std::mem::take(&mut self.pending_local_candidates)
+    }
+
+    fn update_ice_servers(
+        &mut self,
+        ice_servers: &[huddle_protocol::IceServer],
+    ) -> Result<(), PeerError> {
+        if !ice_servers.is_empty() {
+            self.ice_server_updates += 1;
+        }
+        Ok(())
     }
 
     async fn add_screen_track(&mut self) -> Result<(), PeerError> {
@@ -355,6 +373,13 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
     assert_eq!(
         client.meeting().map(|m| m.code.as_str()),
         Some("H7KD-PM2X-QR4T")
+    );
+    // The Welcome's TURN server was applied to the peer connection
+    // before any offer was created.
+    assert_eq!(
+        client.peer_mut().ice_server_updates,
+        1,
+        "welcome ice servers applied at join"
     );
 
     // --- Publish: offer out, answer back, candidate applied ------------------

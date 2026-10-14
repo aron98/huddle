@@ -1,0 +1,20 @@
+huddle is deployed.
+
+With hostNetwork (default), the pod serves the node's ports directly:
+
+  web + signaling:  http://<node-ip>:{{ .Values.service.port }}
+  media (UDP):      {{ .Values.server.mediaPort }}
+
+The web app expects to be reachable at:
+
+  HUDDLE_BASE_URL:  {{ .Values.server.baseUrl }}
+
+Set baseUrl to a real externally reachable URL (https://meet.example.com)
+in production — magic links, ICS exports, and join URLs are built from it.
+If media cannot connect from browsers, check that {{ .Values.server.mediaPort }}/udp
+is open on the node's firewall and that publicIp matches the address
+browsers can reach.
+
+Check readiness with:
+
+  kubectl get pods -l app={{ include "huddle.fullname" . }}

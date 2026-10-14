@@ -37,6 +37,14 @@ jobs:
           cargo check -p huddle-web --target wasm32-unknown-unknown
           cargo clippy -p huddle-web --target wasm32-unknown-unknown -- -D warnings
 
+      - name: install helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint
+        run: helm lint deploy/helm/huddle
+
   e2e-stub:
     name: headless chrome render check
     runs-on: ubuntu-24.04
@@ -150,4 +158,55 @@ jobs:
 
       - name: e2e auth
         run: node e2e-auth.mjs
+        working-directory: test/e2e
+
+  e2e-turn:
+    name: turn-relayed call over coturn
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install trunk
+        run: |
+          curl -fsSL \
+            https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C /usr/local/bin
+          trunk --version
+
+      - name: build web client
+        run: trunk build
+        working-directory: crates/web
+
+      - name: build server
+        run: cargo build -q -p huddle-server
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: test/e2e/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+        working-directory: test/e2e
+
+      # Same headless-shell pin and rationale as the e2e-call job.
+      - name: install chrome-headless-shell
+        run: |
+          npx --yes @puppeteer/browsers install chrome-headless-shell@155.0.8059.39 --path "$HOME/chrome"
+          echo "CHROME_BIN=$(find "$HOME/chrome" -type f -name chrome-headless-shell)" >> "$GITHUB_ENV"
+
+      # coturn provides the TURN relay the test asserts against; the
+      # e2e spawns its own turnserver instance (config file, port 3479)
+      # so a distribution's default service can never conflict.
+      - name: install coturn
+        run: sudo apt-get update && sudo apt-get install -y coturn
+
+      - name: e2e turn
+        run: node e2e-turn.mjs
         working-directory: test/e2e

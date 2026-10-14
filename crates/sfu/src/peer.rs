@@ -154,6 +154,23 @@ pub(crate) struct Peer {
     /// peer. The wire form is SRTCP, invisible to outside observers, so
     /// tests assert on this counter instead of sniffing datagrams.
     pub keyframes_requested: u64,
+    /// Link stats from the latest str0m snapshot (~1s once connected).
+    stats: Option<LinkStats>,
+    /// `(bytes_rx, bytes_tx, timestamp)` of the previous snapshot,
+    /// kept to turn byte counters into per-window bitrates.
+    stats_prev: Option<(u64, u64, Instant)>,
+}
+
+/// Link-level stats captured from str0m's periodic `PeerStats` events.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LinkStats {
+    pub(crate) bytes_rx: u64,
+    pub(crate) bytes_tx: u64,
+    pub(crate) bitrate_in_bps: u64,
+    pub(crate) bitrate_out_bps: u64,
+    pub(crate) rtt_ms: Option<u64>,
+    pub(crate) ingress_loss_fraction: Option<f32>,
+    pub(crate) egress_loss_fraction: Option<f32>,
 }
 
 impl Peer {
@@ -165,6 +182,8 @@ impl Peer {
             .clear_codecs()
             .enable_opus(true, false)
             .enable_vp8(true)
+            // Periodic stats events (bytes, loss, RTT) feed /metrics.
+            .set_stats_interval(Some(Duration::from_secs(1)))
             .build(Instant::now());
 
         let mut peer = Peer {
@@ -180,6 +199,8 @@ impl Peer {
             rx_frames: 0,
             tx_frames: 0,
             keyframes_requested: 0,
+            stats: None,
+            stats_prev: None,
         };
 
         let candidate = Candidate::host(media_addr, "udp")
@@ -570,8 +591,46 @@ impl Peer {
             // reused transceiver never surfacing the event).
             Event::MediaData(data) => PollOutcome::Media(data),
             Event::KeyframeRequest(req) => PollOutcome::KeyframeRequested(req),
+            Event::PeerStats(s) => {
+                self.record_peer_stats(s);
+                PollOutcome::Ignored
+            }
             _ => PollOutcome::Ignored,
         }
+    }
+
+    /// Capture one str0m stats snapshot, turning the byte counters into
+    /// per-window bitrates using the previous snapshot's timestamp.
+    fn record_peer_stats(&mut self, s: str0m::stats::PeerStats) {
+        let (bitrate_in_bps, bitrate_out_bps) = match self.stats_prev {
+            Some((prev_rx, prev_tx, at)) => {
+                let elapsed = s.timestamp.saturating_duration_since(at).as_secs_f64();
+                if elapsed > 0.0 {
+                    (
+                        ((s.bytes_rx.saturating_sub(prev_rx)) as f64 * 8.0 / elapsed) as u64,
+                        ((s.bytes_tx.saturating_sub(prev_tx)) as f64 * 8.0 / elapsed) as u64,
+                    )
+                } else {
+                    (0, 0)
+                }
+            }
+            None => (0, 0),
+        };
+        self.stats = Some(LinkStats {
+            bytes_rx: s.bytes_rx,
+            bytes_tx: s.bytes_tx,
+            bitrate_in_bps,
+            bitrate_out_bps,
+            rtt_ms: s.rtt.map(|d| d.as_millis() as u64),
+            ingress_loss_fraction: s.ingress_loss_fraction,
+            egress_loss_fraction: s.egress_loss_fraction,
+        });
+        self.stats_prev = Some((s.bytes_rx, s.bytes_tx, s.timestamp));
+    }
+
+    /// The latest link stats snapshot, if one has arrived yet.
+    pub(crate) fn link_stats(&self) -> Option<LinkStats> {
+        self.stats
     }
 
     /// The outgoing `Mid` this peer uses for `origin`'s track `mid_in`,

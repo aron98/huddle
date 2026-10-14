@@ -63,6 +63,18 @@ pub struct Config {
     /// link instead of sending it — fine for development and small
     /// self-hosted setups, and it keeps the single binary dependency-free.
     pub smtp: Option<SmtpConfig>,
+    /// Optional bearer token protecting `GET /metrics`. `None` (the
+    /// default) leaves the endpoint open, matching Prometheus's
+    /// pull model: deployments are expected to gate it at the network
+    /// layer (firewall, reverse proxy, or a Prometheus/Grafana sidecar
+    /// that is the only thing with network access). Set it to require
+    /// `Authorization: Bearer <token>` on every scrape.
+    pub stats_token: Option<String>,
+    /// Per-IP rate limit (events per minute) on magic-link requests and
+    /// new websocket connections. `30` (the default) is generous for
+    /// humans and throttles credential-stuffing and connection floods;
+    /// `0` disables the limiter entirely.
+    pub rate_limit_per_min: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -113,6 +125,8 @@ impl Default for Config {
             session_secret: None,
             session_ttl_min: 120,
             smtp: None,
+            stats_token: None,
+            rate_limit_per_min: 30,
         }
     }
 }
@@ -227,6 +241,8 @@ mod tests {
         assert_eq!(config.session_secret, None);
         assert_eq!(config.session_ttl_min, 120);
         assert_eq!(config.smtp, None);
+        assert_eq!(config.stats_token, None);
+        assert_eq!(config.rate_limit_per_min, 30);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: huddle
+description: "Self-hosted video meetings: a single Rust binary serving web, signaling, and SFU"
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/aron98/huddle
+sources:
+  - https://github.com/aron98/huddle

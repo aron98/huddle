@@ -16,6 +16,7 @@ use huddle_protocol::{
 use crate::auth;
 use crate::ics;
 use crate::meetings::{self, MeetingError};
+use crate::metrics;
 use crate::session;
 use crate::state::AppState;
 
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/request-link", post(auth::request_link))
         .route("/api/auth/verify", get(auth::verify))
         .route("/api/auth/me", get(auth::me))
+        .route("/metrics", get(metrics_scrape))
         .route("/ws", get(session::ws))
         .fallback(fallback)
         .with_state(state)
@@ -142,6 +144,44 @@ async fn my_meetings(
         })
         .collect();
     Ok(Json(responses))
+}
+
+/// Prometheus scrape endpoint: live rooms, peers, bitrates, loss, RTT.
+///
+/// Open by default (Prometheus cannot send cookies, and deployments
+/// gate scrapes at the network layer); `stats_token` opts into a
+/// bearer-token check for setups where the endpoint is more exposed.
+async fn metrics_scrape(state: State<AppState>, headers: HeaderMap) -> Result<Response, ApiErr> {
+    if let Some(expected) = state.config().stats_token.as_deref() {
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if !provided.is_some_and(|p| token_matches(p, expected)) {
+            return Err(ApiErr::unauthorized());
+        }
+    }
+    let report = state.engine().stats().await.map_err(|_| {
+        tracing::error!("engine went away while serving /metrics");
+        ApiErr(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError {
+                code: ErrorCode::Internal,
+                message: "internal error".into(),
+            },
+        )
+    })?;
+    Ok((
+        [(header::CONTENT_TYPE, metrics::CONTENT_TYPE)],
+        metrics::render(&report),
+    )
+        .into_response())
+}
+
+/// Constant-time bearer-token comparison (same discipline as cookies).
+fn token_matches(provided: &str, expected: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    provided.len() == expected.len() && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()))
 }
 
 /// Download one meeting as an iCalendar file.
@@ -292,28 +332,103 @@ async fn serve_asset(state: &AppState, path: &str) -> Response {
 }
 
 async fn asset_response(state: &AppState, path: &str) -> Response {
+    let csp = ui_csp(state);
     // Runtime override directory wins, then the embedded bundle.
     if let Some(dir) = &state.config().web_dir {
         let full = dir.join(path);
         if let Ok(bytes) = tokio::fs::read(&full).await {
-            return (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type(path))],
-                bytes,
-            )
-                .into_response();
+            return with_security_headers(
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, content_type(path))],
+                    bytes,
+                )
+                    .into_response(),
+                csp,
+            );
         }
     }
 
     match Ui::get(path) {
-        Some(file) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type(path))],
-            file.data.into_owned(),
-        )
-            .into_response(),
+        Some(file) => with_security_headers(
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, content_type(path))],
+                file.data.into_owned(),
+            )
+                .into_response(),
+            csp,
+        ),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
+}
+
+/// Content-Security-Policy for the shipped UI. Leptos CSR needs
+/// `wasm-unsafe-eval` for the WebAssembly module and inline styles come
+/// from the framework; media elements play `blob:` URLs created by
+/// `URL.createObjectURL` for remote streams, and signaling connects to
+/// the same origin over `ws(s):`. Everything else is locked to `self`.
+///
+/// The one allowed inline script — trunk's wasm bootstrap, which embeds
+/// per-build asset names — is added by hash at runtime
+/// ([`ui_csp`]), so every other inline script stays blocked.
+///
+/// The `{}` in `script-src` receives the runtime `'sha256-…'` allowance.
+fn ui_csp(state: &AppState) -> &'static str {
+    static CSP_WITH_HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CSP_WITH_HASH.get_or_init(|| {
+        let html = if let Some(dir) = &state.config().web_dir {
+            std::fs::read_to_string(dir.join("index.html")).ok()
+        } else {
+            Ui::get("index.html").map(|f| String::from_utf8_lossy(&f.data).into_owned())
+        };
+        let allowance = html
+            .as_deref()
+            .and_then(inline_script_hash)
+            .map(|hash| format!(" 'sha256-{hash}'"))
+            .unwrap_or_default();
+        // NOTE: inline capture (`{allowance}`) only works when the whole
+        // policy literal lives in this `format!` — a captured `const`
+        // template's braces are not re-processed as format holes.
+        format!(
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'{allowance}; \
+             style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; \
+             media-src 'self' blob:; img-src 'self' data:; font-src 'self'; \
+             object-src 'none'; base-uri 'self'; form-action 'self'"
+        )
+    })
+}
+
+/// Extract the first inline `<script>` body from `html` and return the
+/// base64 sha256 of its text — the value a CSP `script-src 'sha256-…'`
+/// allowance needs. Returns `None` when there is no inline script.
+fn inline_script_hash(html: &str) -> Option<String> {
+    let start = html.find("<script")?;
+    let open_tag_end = html[start..].find('>')? + start + 1;
+    // `src=` scripts are external, not inline.
+    if html[start..open_tag_end].contains("src=") {
+        return None;
+    }
+    let end = html[open_tag_end..].find("</script>")? + open_tag_end;
+    let body = &html[open_tag_end..end];
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    use base64::Engine;
+    Some(base64::engine::general_purpose::STANDARD.encode(digest))
+}
+
+/// Apply the security headers shared by all served UI assets.
+fn with_security_headers(mut response: Response, csp: &str) -> Response {
+    if let Ok(value) = header::HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, value);
+    }
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -337,8 +452,10 @@ fn content_type(path: &str) -> &'static str {
 mod tests {
     use super::*;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -588,12 +705,16 @@ mod tests {
     #[tokio::test]
     async fn request_link_succeeds_for_any_email_shape() {
         let app = router(test_state().await);
-        for email in ["someone@example.com", "not-an-email"] {
+        for (i, email) in ["someone@example.com", "not-an-email"].iter().enumerate() {
             let response = app
                 .clone()
                 .oneshot(
                     Request::post("/api/auth/request-link")
                         .header("content-type", "application/json")
+                        .extension(ConnectInfo(SocketAddr::from((
+                            [127, 0, 0, 1],
+                            4444 + i as u16,
+                        ))))
                         .body(Body::from(format!(r#"{{"email":"{email}"}}"#)))
                         .unwrap(),
                 )
@@ -602,6 +723,79 @@ mod tests {
             // Always 200: responses must not reveal which addresses are valid.
             assert_eq!(response.status(), StatusCode::OK, "email: {email}");
         }
+    }
+
+    #[tokio::test]
+    async fn magic_link_requests_are_rate_limited() {
+        // Default limiter: 30 events/min per IP. The 31st is refused.
+        let app = router(test_state().await);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 4711));
+        for i in 0..30 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/auth/request-link")
+                        .header("content-type", "application/json")
+                        .extension(ConnectInfo(addr))
+                        .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "request {i}");
+        }
+        let response = app
+            .oneshot(
+                Request::post("/api/auth/request-link")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(addr))
+                    .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn inline_script_hash_matches_a_plain_sha256() {
+        let html = r#"<html><script type="module">console.log(1);
+</script></html>"#;
+        let hash = inline_script_hash(html).unwrap();
+        use base64::Engine;
+        use sha2::Digest;
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(b"console.log(1);\n"));
+        assert_eq!(hash, expected);
+        // External scripts and script-less pages yield no allowance.
+        assert!(inline_script_hash(r#"<script src="a.js"></script>"#).is_none());
+        assert!(inline_script_hash("no scripts at all").is_none());
+    }
+
+    #[tokio::test]
+    async fn security_headers_on_ui_assets() {
+        let app = router(test_state().await);
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            csp.contains("default-src 'self'") && csp.contains("wasm-unsafe-eval"),
+            "csp: {csp}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .and_then(|v| v.to_str().ok()),
+            Some("nosniff")
+        );
     }
 
     #[tokio::test]
@@ -815,5 +1009,71 @@ mod tests {
             ics.contains(&format!("/m/{}", created.meeting.code)),
             "join link must be in the calendar: {ics}"
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_scrape_is_prometheus_text() {
+        let response = router(test_state().await)
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(
+            content_type.starts_with("text/plain"),
+            "got: {content_type}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("# TYPE huddle_rooms gauge"));
+        assert!(text.contains("huddle_rooms 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_token_is_enforced_when_configured() {
+        let config = Arc::new(crate::config::Config {
+            media_port: 0,
+            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            stats_token: Some("secret-token".into()),
+            ..crate::config::Config::default()
+        });
+        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+        let state = AppState::new(config, crate::db::test_pool().await, engine);
+        let app = router(state);
+
+        let denied = app
+            .clone()
+            .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = app
+            .clone()
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let allowed = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("authorization", "Bearer secret-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 }

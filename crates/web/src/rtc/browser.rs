@@ -14,9 +14,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcIceCandidate, RtcIceCandidateInit,
-    RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender, RtcRtpTransceiverDirection,
-    RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescription, RtcSessionDescriptionInit,
-    RtcTrackEvent, WebSocket,
+    RtcIceTransportPolicy, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender,
+    RtcRtpTransceiverDirection, RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescription,
+    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket,
 };
 
 use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
@@ -182,6 +182,10 @@ impl SignalingStream for BrowserSignalingStream {
 /// A [`PeerConnection`] over the browser's `RTCPeerConnection`.
 pub struct BrowserPeerConnection {
     pc: RtcPeerConnection,
+    /// Whether this connection was built with the `?turn=relay` knob;
+    /// `setConfiguration` re-asserts it (a fresh RTCConfiguration would
+    /// otherwise reset the policy to "all").
+    relay: bool,
     local_candidates: Rc<RefCell<Vec<LocalCandidate>>>,
     on_remote_stream: RemoteStreamCallback,
     /// Screen-share state shared with the [`ScreenShareHandle`] the UI
@@ -227,12 +231,30 @@ impl ScreenShareHandle {
 
 impl BrowserPeerConnection {
     pub fn new(ice_servers: &[IceServer]) -> Result<Self, PeerError> {
+        Self::build(ice_servers, false)
+    }
+
+    /// Test knob (`?turn=relay`): route every candidate through the
+    /// configured TURN relay by setting `iceTransportPolicy: "relay"`.
+    ///
+    /// The TURN servers themselves are not known yet — they arrive in
+    /// the `Welcome` and are applied via
+    /// [`PeerConnection::update_ice_servers`] before any offer is
+    /// created.
+    pub fn new_relay(ice_servers: &[IceServer]) -> Result<Self, PeerError> {
+        Self::build(ice_servers, true)
+    }
+
+    fn build(ice_servers: &[IceServer], relay: bool) -> Result<Self, PeerError> {
         let configuration = RtcConfiguration::new();
         let servers = js_sys::Array::new();
         for server in ice_servers {
             servers.push(&ice_server_to_js(server)?);
         }
         configuration.set_ice_servers(&servers);
+        if relay {
+            configuration.set_ice_transport_policy(RtcIceTransportPolicy::Relay);
+        }
 
         let pc = RtcPeerConnection::new_with_configuration(&configuration).map_err(js_error)?;
 
@@ -292,6 +314,7 @@ impl BrowserPeerConnection {
 
         Ok(Self {
             pc,
+            relay,
             local_candidates,
             on_remote_stream,
             screen: Rc::new(RefCell::new(ScreenState::default())),
@@ -403,6 +426,28 @@ impl PeerConnection for BrowserPeerConnection {
 
     fn take_local_candidates(&mut self) -> Vec<LocalCandidate> {
         std::mem::take(&mut *self.local_candidates.borrow_mut())
+    }
+
+    fn update_ice_servers(&mut self, ice_servers: &[IceServer]) -> Result<(), PeerError> {
+        if ice_servers.is_empty() {
+            return Ok(());
+        }
+        let configuration = RtcConfiguration::new();
+        let servers = js_sys::Array::new();
+        for server in ice_servers {
+            servers.push(&ice_server_to_js(server)?);
+        }
+        configuration.set_ice_servers(&servers);
+        // A freshly-built RTCConfiguration carries the default
+        // `iceTransportPolicy: "all"`, and Chrome's setConfiguration
+        // treats every present field as authoritative — so it would
+        // silently reset the relay knob. Re-assert our own policy.
+        if self.relay {
+            configuration.set_ice_transport_policy(RtcIceTransportPolicy::Relay);
+        }
+        self.pc
+            .set_configuration_with_configuration(&configuration)
+            .map_err(js_error)
     }
 
     async fn add_screen_track(&mut self) -> Result<(), PeerError> {

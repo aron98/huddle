@@ -1,0 +1,50 @@
+# Default values for huddle.
+#
+# WebRTC realities drive the shape of this chart:
+#  * The SFU's media socket must be reachable from browsers on the
+#    advertised IP:port — no k8s Service can proxy that correctly for
+#    ICE (the advertised candidate is the pod host's, not the LB's).
+#    Default is therefore hostNetwork + hostPort for the media port;
+#    set `hostNetwork: false` only if you front media some other way.
+#  * One replica per node: the SFU keeps meeting state in memory, and
+#    meetings are not sharded across pods. Scale out = more replicas,
+#    each a separate island (a load-balanced join URL per island).
+
+image:
+  repository: ghcr.io/aron98/huddle
+  tag: "" # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+hostNetwork: true
+
+service:
+  type: ClusterIP
+  port: 3000
+
+server:
+  # Address browsers use to reach the web app (join links, magic links,
+  # ICS URLs). Must be set to a real externally reachable URL in
+  # production, e.g. https://meet.example.com
+  baseUrl: http://localhost:3000
+  # The IP advertised in ICE candidates. With hostNetwork the pod can
+  # auto-detect the node IP; set it explicitly to skip detection.
+  publicIp: ""
+  mediaPort: 40000
+  # ICE servers advertised to clients in addition to the SFU itself —
+  # point this at your coturn.
+  iceServers: ""
+  sessionSecret: "" # set via --set or an existingSecret; random per boot otherwise
+
+# Provide `name` of an existing Secret with a HUDDLE_SESSION_SECRET key
+# to avoid putting the session secret in values.
+existingSecret: ""
+
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+
+resources: {}
+  # limits:
+  #   cpu: 500m
+  #   memory: 256Mi

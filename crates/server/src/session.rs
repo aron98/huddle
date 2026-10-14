@@ -9,12 +9,14 @@
 //! participant from the engine, which is what fans `ParticipantLeft` out
 //! to everyone else.
 
+use axum::extract::ConnectInfo;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use huddle_protocol::{ChatMessage, ClientMessage, ErrorCode, Joinability, ServerMessage};
+use std::net::SocketAddr;
 use time::OffsetDateTime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use uuid::Uuid;
@@ -23,9 +25,28 @@ use crate::chat;
 use crate::meetings::{self, normalize_code};
 use crate::state::AppState;
 
+/// Cap for a single inbound signaling frame/message. Signaling payloads
+/// are small JSON (the big blobs — SDP — are a few tens of KB); 64 MiB
+/// defaults would let one connection hold hundreds of MB hostage.
+const MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
 /// Entry point for the `/ws` route.
-pub async fn ws(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| run_session(socket, state))
+pub async fn ws(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if !state.rate_limiter().allow(addr.ip()) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "too many connections",
+        )
+            .into_response();
+    }
+    upgrade
+        .max_frame_size(MAX_MESSAGE_BYTES)
+        .max_message_size(MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| run_session(socket, state))
 }
 
 async fn run_session(socket: WebSocket, state: AppState) {
@@ -294,12 +315,15 @@ mod tests {
 
     impl TestServer {
         async fn start() -> Self {
-            let config = Config {
-                media_port: 0,
-                // Tests talk loopback-to-loopback; detection is machine-dependent.
-                public_ip: Some(IpAddr::from([127, 0, 0, 1])),
-                ..Config::default()
-            };
+            Self::start_with(Config::default()).await
+        }
+
+        /// Start a server with caller-supplied config overrides
+        /// (media_port and public_ip are forced to test values).
+        async fn start_with(mut config: Config) -> Self {
+            config.media_port = 0;
+            // Tests talk loopback-to-loopback; detection is machine-dependent.
+            config.public_ip = Some(IpAddr::from([127, 0, 0, 1]));
             let pool = crate::db::test_pool().await;
             let (engine, media_addr) = crate::engine::spawn(&config).unwrap();
             let state = AppState::new(Arc::new(config), pool, engine);
@@ -307,7 +331,12 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
             });
             Self {
                 base: format!("ws://{addr}"),
@@ -898,6 +927,31 @@ mod tests {
             assert_eq!(id, expected);
             assert!(speaking);
         }
+
+        alice.pump.stop();
+        bob.pump.stop();
+    }
+
+    #[tokio::test]
+    async fn ws_connections_are_rate_limited() {
+        let server = TestServer::start_with(Config {
+            rate_limit_per_min: 2,
+            ..Config::default()
+        })
+        .await;
+        let code = server.create_meeting(0, 60).await;
+
+        // Two connections from this IP are fine...
+        let alice = TestClient::connect(&server, &code, "alice").await;
+        let bob = TestClient::connect(&server, &code, "bob").await;
+
+        // ...the third inside the window is refused before the upgrade.
+        let request = format!("{}/ws", server.base).into_client_request().unwrap();
+        let refused = tokio_tungstenite::connect_async(request).await;
+        assert!(
+            refused.is_err(),
+            "third ws connection within the window should be refused"
+        );
 
         alice.pump.stop();
         bob.pump.stop();

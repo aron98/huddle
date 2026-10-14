@@ -42,12 +42,11 @@ services:
       HUDDLE_BIND: 0.0.0.0:3000
       HUDDLE_WEB_DIR: /workspace/crates/web/dist
       HUDDLE_DATA_DIR: /workspace/data
-      # Point the advertised ICE servers at the dev TURN companion. Nested
-      # env vars use figment's `__` indexing: ICE_SERVERS[0] with urls[0..2].
-      HUDDLE_ICE_SERVERS__0__URLS__0: stun:127.0.0.1:3478
-      HUDDLE_ICE_SERVERS__0__URLS__1: turn:127.0.0.1:3478
-      HUDDLE_ICE_SERVERS__0__USERNAME: huddle
-      HUDDLE_ICE_SERVERS__0__CREDENTIAL: devpassword
+      # Point the advertised ICE servers at the dev TURN companion.
+      # figment parses array-of-dicts *values* (TOML-ish `key=value`
+      # pairs inside `[...]`, not JSON colons) — `__0__`-style key
+      # nesting produces dicts that never reach a Vec field.
+      HUDDLE_ICE_SERVERS: '[{urls=["stun:127.0.0.1:3478","turn:127.0.0.1:3478"],username="huddle",credential="devpassword"}]'
     depends_on:
       - web
 

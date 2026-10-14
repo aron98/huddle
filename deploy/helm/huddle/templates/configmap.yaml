@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "huddle.fullname" . }}
+  labels:
+    app: {{ include "huddle.fullname" . }}
+data:
+  HUDDLE_BIND: "0.0.0.0:{{ .Values.service.port }}"
+  HUDDLE_BASE_URL: {{ .Values.server.baseUrl | quote }}
+  HUDDLE_MEDIA_PORT: {{ .Values.server.mediaPort | quote }}
+  {{- with .Values.server.publicIp }}
+  HUDDLE_PUBLIC_IP: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.server.iceServers }}
+  HUDDLE_ICE_SERVERS: {{ . | quote }}
+  {{- end }}

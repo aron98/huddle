@@ -4,7 +4,16 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>huddle</title>
-    <link data-trunk rel="rust" href="Cargo.toml" data-bin="huddle-web" />
+    <!-- data-wasm-opt-params: trunk's pinned wasm-opt (binaryen 123)
+         predates bulk-memory-as-standard, so it rejects the memory.copy
+         calls the release wasm contains without this flag. -->
+    <link
+      data-trunk
+      rel="rust"
+      href="Cargo.toml"
+      data-bin="huddle-web"
+      data-wasm-opt-params="--enable-bulk-memory-opt"
+    />
     <link data-trunk rel="css" href="styles.css" />
   </head>
   <body></body>
