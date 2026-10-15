@@ -19,7 +19,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use huddle_protocol::{ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage};
+use huddle_protocol::{
+    ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage, VideoLayer,
+};
 use huddle_sfu::{Room, SfuOutput};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -119,6 +121,14 @@ pub enum EngineCommand {
         id: Uuid,
         sharing: bool,
     },
+    /// Set the simulcast layer a receiver wants from another
+    /// participant's camera track.
+    LayerPreference {
+        code: String,
+        id: Uuid,
+        origin: Uuid,
+        layer: VideoLayer,
+    },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
     /// Collect a snapshot of rooms and peer stats (the `/metrics` pull).
@@ -195,6 +205,15 @@ impl EngineHandle {
 
     pub fn sharing(&self, code: String, id: Uuid, sharing: bool) {
         let _ = self.tx.send(EngineCommand::Sharing { code, id, sharing });
+    }
+
+    pub fn layer_preference(&self, code: String, id: Uuid, origin: Uuid, layer: VideoLayer) {
+        let _ = self.tx.send(EngineCommand::LayerPreference {
+            code,
+            id,
+            origin,
+            layer,
+        });
     }
 
     pub fn leave(&self, code: String, id: Uuid) {
@@ -444,6 +463,14 @@ impl Engine {
             EngineCommand::Sharing { code, id, sharing } => {
                 self.set_sharing(&code, id, sharing);
             }
+            EngineCommand::LayerPreference {
+                code,
+                id,
+                origin,
+                layer,
+            } => {
+                self.set_layer_preference(&code, id, origin, layer);
+            }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Stats { reply } => {
                 let _ = reply.send(self.collect_stats());
@@ -629,6 +656,22 @@ impl Engine {
         };
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
+        }
+    }
+
+    /// Apply a receiver's simulcast layer preference at the SFU. Layer
+    /// choice is per-receiver, so there is nothing to broadcast: the
+    /// media plane starts forwarding the chosen rid (plus a throttled
+    /// keyframe request on the switched-to layer) on the next frames.
+    fn set_layer_preference(&mut self, code: &str, id: Uuid, origin: Uuid, layer: VideoLayer) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        if !inst.participants.contains_key(&id) {
+            return;
+        }
+        if let Err(e) = inst.room.set_layer_preference(id, origin, layer) {
+            tracing::debug!(peer = %id, "room set_layer_preference: {e}");
         }
     }
 
