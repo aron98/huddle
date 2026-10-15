@@ -317,6 +317,21 @@ async function main() {
       () => (document.querySelector('[data-testid="call-status"]')?.textContent ?? '').includes('left'),
       { timeout: 30_000, polling: 250 },
     );
+    // Leaving must land on the designed post-leave page (issue #5):
+    // a rejoin button, the meeting info, and a way back to the dashboard.
+    await dave.waitForFunction(
+      () => !!document.querySelector('[data-testid="rejoin-btn"]'),
+      { timeout: 10_000, polling: 250 },
+    );
+    const daveEndInfo = await dave.evaluate(
+      () => document.querySelector('.end-info')?.textContent ?? '',
+    );
+    if (!daveEndInfo.includes(code)) {
+      fail(`dave: post-leave view is missing meeting info (code ${code}): ${daveEndInfo}`);
+    }
+    if (!(await dave.evaluate(() => !!document.querySelector('a[href="/meetings"]')))) {
+      fail('dave: post-leave view is missing the back-to-dashboard link');
+    }
     // Dave's tile and roster entry must vanish on every remaining page.
     for (const [page, who] of [
       [alice, 'alice'],

@@ -1,61 +1,722 @@
+/* ============================================================
+   huddle — design system
+   Direction: a small broadcast studio. The meeting room is treated
+   as a stage: deep blue-charcoal surfaces, one amber "on air" lamp
+   color for everything live (the brand dot, the speaking ring, the
+   in-call badge, focus), a geometric display face for signage, and
+   a quiet body face for everything else. Boldness is spent once —
+   in the display typography; every other surface stays disciplined.
+   ============================================================ */
+
 :root {
-  color-scheme: light dark;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: dark;
+
+  /* Surfaces */
+  --stage: #10131a;      /* page background */
+  --panel: #1a1f2b;      /* raised surfaces */
+  --panel-raise: #232a3a;
+  --well: #0b0e14;       /* recessed: inputs, video mats */
+  --line: #2c3547;      /* hairlines and borders */
+
+  /* Ink */
+  --text: #e9edf5;
+  --muted: #97a0b5;
+
+  /* The one accent: the on-air lamp */
+  --on-air: #ffb454;
+  --on-air-dim: rgba(255, 180, 84, 0.16);
+  --danger: #f2636a;
+
+  /* Type */
+  --font-display: "Futura", "Avenir Next", "Century Gothic",
+    "Trebuchet MS", "DejaVu Sans", sans-serif;
+  --font-body: "Avenir Next", "Segoe UI", "Helvetica Neue", Arial,
+    "DejaVu Sans", sans-serif;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.875rem;
+  --fs-base: 1rem;
+  --fs-lg: 1.25rem;
+  --fs-xl: 1.5rem;
+  --fs-hero: clamp(2.5rem, 6vw, 4.25rem);
+
+  /* Spacing (4px base) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-7: 48px;
+
+  /* Shape */
+  --r-s: 8px;
+  --r-m: 14px;
+  --r-pill: 999px;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
-  background: #0f1115;
-  color: #e6e8ec;
+  background: var(--stage);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--fs-base);
+  line-height: 1.5;
 }
 
-main {
-  max-width: 960px;
+/* One focus treatment everywhere: the on-air lamp outline. */
+:focus-visible {
+  outline: 2px solid var(--on-air);
+  outline-offset: 2px;
+  border-radius: var(--r-s);
+}
+
+::selection {
+  background: var(--on-air-dim);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---------- shared utilities ---------- */
+
+.muted {
+  color: var(--muted);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.page {
+  max-width: 1100px;
   margin: 0 auto;
-  padding: 2rem 1rem;
+  padding: var(--sp-5) var(--sp-4) var(--sp-7);
 }
 
-video {
+.page.center {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: var(--sp-4);
+}
+
+.page-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  line-height: 1.15;
+  margin: 0 0 var(--sp-3);
+  letter-spacing: 0.01em;
+}
+
+.section-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  margin: 0 0 var(--sp-4);
+}
+
+/* The on-air dot: the brand mark, the live indicator. */
+.on-air-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--on-air);
+  margin-right: var(--sp-2);
+  vertical-align: baseline;
+}
+
+.wordmark {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-lg);
+  color: var(--text);
+  text-decoration: none;
+  letter-spacing: 0.02em;
+}
+
+/* Buttons: pill controls, like studio hardware. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-5);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-base);
+  cursor: pointer;
+  text-decoration: none;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.btn:hover {
+  background: var(--panel-raise);
+  border-color: var(--muted);
+}
+
+.btn.primary {
+  background: var(--on-air);
+  border-color: transparent;
+  color: #17120a;
+  font-weight: 600;
+}
+
+.btn.primary:hover {
+  background: #ffc26e;
+}
+
+.btn.danger {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: transparent;
+}
+
+.btn.danger:hover {
+  background: rgba(242, 99, 106, 0.12);
+}
+
+.btn.small {
+  padding: var(--sp-1) var(--sp-4);
+  font-size: var(--fs-sm);
+}
+
+.btn.large {
+  padding: var(--sp-3) var(--sp-6);
+  font-size: var(--fs-lg);
+}
+
+/* Toggles show their off state: dimmed, dashed — clearly "muted". */
+.btn.toggle.is-off {
+  border-style: dashed;
+  color: var(--muted);
+  background: transparent;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Status chips (meeting state, schedule hints). */
+.chip {
+  display: inline-block;
+  padding: var(--sp-1) var(--sp-3);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.chip-open {
+  color: var(--on-air);
+  border-color: var(--on-air);
+  background: var(--on-air-dim);
+}
+
+.chip-not-yet {
+  color: var(--text);
+}
+
+.chip-ended,
+.chip-cancelled {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* Fields */
+.field {
+  display: block;
+  margin-bottom: var(--sp-4);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.field input,
+.field select {
+  display: block;
   width: 100%;
-  background: #000;
-  border-radius: 8px;
+  margin-top: var(--sp-2);
+  padding: var(--sp-3);
+  border-radius: var(--r-s);
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-base);
+  font-weight: 400;
 }
 
-/* The prejoin preview starts empty and only receives its first frame
-   once getUserMedia resolves. Reserve the playback box up front so
-   the page does not reflow (and shove the join button out from under
-   a pointer) when the frame's intrinsic size finally lands. */
-#preview {
+.field-error {
+  margin: calc(-1 * var(--sp-2)) 0 var(--sp-4);
+  color: var(--danger);
+  font-size: var(--fs-sm);
+}
+
+/* Banners: a refusal with a way forward. */
+.banner {
+  margin-top: var(--sp-5);
+  padding: var(--sp-4) var(--sp-5);
+  border-radius: var(--r-m);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--on-air);
+  background: var(--panel);
+}
+
+.banner-title {
+  margin: 0 0 var(--sp-2);
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.banner-detail {
+  margin: 0 0 var(--sp-4);
+  color: var(--muted);
+}
+
+.banner-actions {
+  display: flex;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+/* Cards */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  padding: var(--sp-6) var(--sp-5);
+  max-width: 560px;
+  width: 100%;
+}
+
+/* Spinner */
+.spinner {
+  display: inline-block;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--line);
+  border-top-color: var(--on-air);
+  animation: spin 0.9s linear infinite;
+}
+
+.spinner.large {
+  width: 32px;
+  height: 32px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------- site chrome ---------- */
+
+.site-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+  margin-bottom: var(--sp-6);
+  flex-wrap: wrap;
+}
+
+.site-links {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+}
+
+.site-links a {
+  color: var(--text);
+  text-decoration: none;
+  padding-bottom: 2px;
+  border-bottom: 1px solid transparent;
+}
+
+.site-links a:hover {
+  border-bottom-color: var(--on-air);
+}
+
+/* ---------- landing ---------- */
+
+.hero {
+  padding: var(--sp-7) 0 var(--sp-6);
+  max-width: 640px;
+}
+
+.hero-title {
+  font-family: var(--font-display);
+  font-size: var(--fs-hero);
+  font-weight: 700;
+  line-height: 1.04;
+  letter-spacing: -0.01em;
+  margin: 0 0 var(--sp-5);
+}
+
+.hero-lede {
+  font-size: var(--fs-lg);
+  line-height: 1.45;
+  color: var(--muted);
+  margin: 0 0 var(--sp-6);
+}
+
+.hero-actions {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.join-strip {
+  max-width: 640px;
+  padding: var(--sp-5) 0;
+  border-top: 1px solid var(--line);
+}
+
+.join-strip h2 {
+  font-family: var(--font-display);
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  margin: 0 0 var(--sp-4);
+}
+
+.join-form {
+  display: flex;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.join-form input {
+  flex: 1 1 240px;
+  padding: var(--sp-3);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-base);
+}
+
+.site-foot {
+  margin-top: var(--sp-6);
+  padding-top: var(--sp-4);
+  border-top: 1px solid var(--line);
+}
+
+/* ---------- auth ---------- */
+
+.auth .site-nav {
+  margin-bottom: var(--sp-4);
+}
+
+.auth-card {
+  margin: 0 auto;
+}
+
+.auth-card form {
+  margin-top: var(--sp-4);
+}
+
+.auth-card .btn {
+  width: 100%;
+}
+
+/* ---------- dashboard ---------- */
+
+.dashboard .panel {
+  margin-top: var(--sp-5);
+}
+
+.create-form {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  align-items: end;
+}
+
+.create-form .field {
+  flex: 1 1 180px;
+  margin-bottom: var(--sp-4);
+}
+
+.meeting-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.meeting-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  padding: var(--sp-4) 0;
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+
+.meeting-row-main {
+  min-width: 220px;
+  flex: 1 1 220px;
+}
+
+.meeting-title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.meeting-when {
+  margin: var(--sp-1) 0;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.meeting-code-line {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.meeting-row-actions {
+  display: flex;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+/* ---------- prejoin ---------- */
+
+.prejoin {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(300px, 2fr);
+  gap: var(--sp-6);
+  align-items: start;
+}
+
+.schedule-hint {
+  color: var(--muted);
+  margin: 0 0 var(--sp-4);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.schedule-hint code {
+  font-size: var(--fs-sm);
+  background: var(--well);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-s);
+}
+
+.preview-frame {
+  position: relative;
   aspect-ratio: 16 / 9;
+  border-radius: var(--r-m);
+  border: 1px solid var(--line);
+  background: var(--well);
+  overflow: hidden;
+}
+
+#preview {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
 }
 
-/* Adaptive tile grid: fits 1-on-1 side by side, reflows for N parties. */
+.preview-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  text-align: center;
+  padding: var(--sp-4);
+  background: rgba(11, 14, 20, 0.82);
+}
+
+.overlay-title {
+  margin: 0;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+}
+
+.overlay-detail {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  max-width: 46ch;
+}
+
+.prejoin-toggles {
+  display: flex;
+  gap: var(--sp-3);
+  margin-top: var(--sp-4);
+  flex-wrap: wrap;
+}
+
+.prejoin-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  padding: var(--sp-5);
+}
+
+.prejoin-panel .join {
+  width: 100%;
+  margin-top: var(--sp-2);
+}
+
+/* ---------- the call ---------- */
+
+.call {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100dvh;
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: var(--sp-3) var(--sp-4);
+  gap: var(--sp-3);
+}
+
+.call-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  min-height: 44px;
+}
+
+/* The in-call badge: an "ON AIR" lamp, the one loud element. */
+.on-air {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--on-air);
+  border: 1px solid var(--on-air);
+  border-radius: var(--r-pill);
+  padding: var(--sp-1) var(--sp-3);
+  animation: lamp 2.6s ease-in-out infinite;
+}
+
+.on-air .on-air-dot {
+  margin: 0;
+}
+
+@keyframes lamp {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.75;
+  }
+}
+
+.call-title {
+  margin: 0;
+  font-size: var(--fs-base);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.call-header [data-testid="call-status"] {
+  margin: 0;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--fs-sm);
+}
+
+.call-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 340px);
+  gap: var(--sp-4);
+  min-height: 0;
+}
+
+.stage {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+}
+
+/* Adaptive tile grid. `--cols` is set from the tile count in Rust;
+   rows share the stage and scroll once the room is big. */
 .tiles {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 1rem;
-  align-items: stretch;
+  flex: 1;
+  grid-template-columns: repeat(var(--cols, 2), minmax(0, 1fr));
+  grid-auto-rows: minmax(180px, 1fr);
+  gap: var(--sp-3);
+  align-content: start;
 }
 
 .tile {
   margin: 0;
   position: relative;
-  border-radius: 10px;
+  border-radius: var(--r-m);
   overflow: hidden;
-  background: #1a1e26;
+  background: var(--panel);
+  min-width: 0;
+  min-height: 0;
 }
 
 .tile video {
-  border-radius: 0;
-  aspect-ratio: 16 / 9;
+  display: block;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
+  background: var(--well);
 }
 
-/* Speaking indicator: green ring while the participant is talking. */
+/* Speaking = your lamp is on: the amber ring. */
 .tile.speaking {
-  outline: 3px solid #4ade80;
+  outline: 3px solid var(--on-air);
+  outline-offset: -3px;
+}
+
+/* Screen tiles stay quiet but distinct: a thin cool line. */
+.tile.screen {
+  outline: 3px solid var(--line);
   outline-offset: -3px;
 }
 
@@ -64,88 +725,220 @@ video {
   left: 0;
   right: 0;
   bottom: 0;
-  padding: 0.35rem 0.6rem;
-  background: rgba(0, 0, 0, 0.55);
-  font-size: 0.9rem;
+  padding: var(--sp-2) var(--sp-3);
+  background: rgba(11, 14, 20, 0.72);
+  font-size: var(--fs-sm);
 }
 
-.controls {
-  display: flex;
-  gap: 0.5rem;
-  flex-wrap: wrap;
-  margin-top: 1.25rem;
-}
-
-.controls button {
-  padding: 0.5rem 1rem;
-  border-radius: 8px;
-  border: 1px solid #333a46;
-  background: #1a1e26;
-  color: #e6e8ec;
-  cursor: pointer;
-}
-
-.controls button:hover {
-  background: #242a35;
-}
-
-/* Screen-share tiles get a hint of blue, distinct from camera tiles. */
-.tile.screen {
-  outline: 3px solid #60a5fa;
-  outline-offset: -3px;
-}
-
-/* Chat sidebar: log grows, composer stays at the bottom. */
-.chat {
+/* Sidebar: who's here, then chat. */
+.side {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
-  margin-top: 1.25rem;
-  border: 1px solid #333a46;
-  border-radius: 10px;
-  padding: 0.75rem;
-  background: #1a1e26;
+  gap: var(--sp-4);
+  min-height: 0;
 }
 
-.chat h2 {
+.side h2 {
+  font-family: var(--font-display);
+  font-size: var(--fs-base);
+  font-weight: 600;
+  margin: 0 0 var(--sp-3);
+}
+
+.roster-block {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  padding: var(--sp-4);
+}
+
+ul[data-testid="roster"] {
   margin: 0;
-  font-size: 1rem;
+  padding: 0;
+  list-style: none;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+ul[data-testid="roster"] li {
+  padding: var(--sp-1) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+ul[data-testid="roster"] li:last-child {
+  border-bottom: none;
+}
+
+.chat {
+  flex: 1 1 160px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  padding: var(--sp-4);
 }
 
 .chat ul[data-testid="chat-log"] {
   margin: 0;
   padding: 0;
   list-style: none;
-  max-height: 220px;
+  flex: 1;
+  min-height: 80px;
   overflow-y: auto;
   line-height: 1.6;
+  font-size: var(--fs-sm);
+}
+
+.chat ul[data-testid="chat-log"] li {
+  padding: var(--sp-1) 0;
+  overflow-wrap: anywhere;
 }
 
 .chat ul[data-testid="chat-log"] li.system strong {
-  color: #8b93a3;
+  color: var(--muted);
   font-style: italic;
+  font-weight: 400;
 }
 
-.chat input {
-  padding: 0.5rem 0.6rem;
-  border-radius: 8px;
-  border: 1px solid #333a46;
-  background: #0f1115;
-  color: #e6e8ec;
+.chat-composer {
+  display: flex;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
 }
 
-.chat button {
-  align-self: flex-start;
-  padding: 0.5rem 1rem;
-  border-radius: 8px;
-  border: 1px solid #333a46;
-  background: #0f1115;
-  color: #e6e8ec;
-  cursor: pointer;
+.chat-composer input {
+  flex: 1;
+  min-width: 0;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--well);
+  color: var(--text);
+  font-family: inherit;
+  font-size: var(--fs-sm);
 }
 
-ul[data-testid="roster"] {
-  margin-top: 1.25rem;
-  padding-left: 1.25rem;
-  line-height: 1.6;
+.chat-composer .btn {
+  padding: var(--sp-2) var(--sp-4);
+  font-size: var(--fs-sm);
+}
+
+/* The control deck. */
+.call-controls {
+  display: flex;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  align-items: center;
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  justify-self: center;
+}
+
+.call-controls .danger {
+  margin-left: auto;
+}
+
+/* ---------- end views (left / disconnected) ---------- */
+
+.end-card {
+  text-align: left;
+}
+
+.end-card.disconnected {
+  border-left: 3px solid var(--danger);
+}
+
+.end-card [data-testid="call-status"] {
+  margin: 0 0 var(--sp-5);
+  color: var(--muted);
+}
+
+.end-info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--sp-2) var(--sp-5);
+  margin: 0 0 var(--sp-5);
+  padding: var(--sp-4) var(--sp-5);
+  background: var(--well);
+  border-radius: var(--r-m);
+  font-size: var(--fs-sm);
+}
+
+.end-info dt {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.end-info dd {
+  margin: 0;
+}
+
+.end-actions {
+  display: flex;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+
+.end-card > .muted {
+  font-size: var(--fs-sm);
+}
+
+.center-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--sp-3);
+}
+
+.center-card .page-title {
+  margin: 0;
+}
+
+/* ---------- mobile portrait ---------- */
+
+@media (max-width: 720px) {
+  .page {
+    padding: var(--sp-4) var(--sp-3) var(--sp-6);
+  }
+
+  .prejoin {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--sp-4);
+  }
+
+  .call {
+    height: auto;
+    min-height: 100dvh;
+    grid-template-rows: auto auto auto;
+  }
+
+  .call-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .stage {
+    min-height: 52vh;
+  }
+
+  /* At most two tiles across on a phone, however many people join. */
+  .tiles {
+    grid-template-columns: repeat(min(var(--cols, 2), 2), minmax(0, 1fr));
+    grid-auto-rows: minmax(140px, 1fr);
+  }
+
+  .call-controls {
+    position: sticky;
+    bottom: var(--sp-2);
+    justify-self: stretch;
+    overflow-x: auto;
+  }
 }
