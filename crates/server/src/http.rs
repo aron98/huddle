@@ -7,16 +7,22 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde_json::json;
+use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use huddle_protocol::{
-    ApiError, CreateMeetingRequest, ErrorCode, MeetingResponse, UpdateMeetingRequest,
+    ApiError, ChatMessage, CreateMeetingRequest, ErrorCode, MeetingResponse, RecordingDto,
+    UpdateMeetingRequest,
 };
 
 use crate::auth;
+use crate::chat;
 use crate::ics;
 use crate::meetings::{self, MeetingError};
 use crate::metrics;
+use crate::recording;
 use crate::session;
 use crate::state::AppState;
 
@@ -39,6 +45,12 @@ pub fn router(state: AppState) -> Router {
                 .delete(cancel_meeting),
         )
         .route("/api/meetings/{code}/ics", get(meeting_ics))
+        .route(
+            "/api/meetings/{code}/recording",
+            get(recording_status)
+                .post(start_recording)
+                .delete(stop_recording),
+        )
         .route("/api/auth/request-link", post(auth::request_link))
         .route("/api/auth/verify", get(auth::verify))
         .route("/api/auth/me", get(auth::me))
@@ -208,6 +220,189 @@ async fn meeting_ics(state: State<AppState>, Path(code): Path<String>) -> Result
         body,
     )
         .into_response())
+}
+
+// --- recording (issue 15) ------------------------------------------------
+
+/// A storage failure from the recordings metadata: the recording
+/// artifacts and files never block the meeting, but the REST request
+/// cannot be served.
+fn recordings_storage_err() -> ApiErr {
+    ApiErr(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiError {
+            code: ErrorCode::Internal,
+            message: "internal error".into(),
+        },
+    )
+}
+
+/// 404 for a meeting that exists but was never recorded.
+fn no_recording_err() -> ApiErr {
+    ApiErr(
+        StatusCode::NOT_FOUND,
+        ApiError {
+            code: ErrorCode::MeetingNotFound,
+            message: "no recording for this meeting".into(),
+        },
+    )
+}
+
+/// Post a system chat entry (no sender) about the recording state. This
+/// is the consent side of the feature: guests are never silently
+/// recorded. Persisted like any other message so late joiners see it
+/// in the history replay.
+async fn system_chat(state: &AppState, meeting_id: Uuid, code: &str, body: &str) {
+    let message = ChatMessage {
+        id: Uuid::new_v4(),
+        sender_id: None,
+        sender_name: "huddle".into(),
+        body: body.into(),
+        sent_at: OffsetDateTime::now_utc(),
+    };
+    chat::persist(state.pool(), meeting_id, &message).await;
+    state.engine().chat(code.to_owned(), message);
+}
+
+/// Start recording a meeting (owner only). The row is inserted before
+/// the engine is asked, so a refused start rolls back cleanly; the
+/// recorder itself writes per-track RTP under
+/// `{data_dir}/recordings/{meeting_id}/{recording_id}/` and finalizes
+/// the row when the sink is dropped (explicit stop, or the meeting
+/// emptying).
+async fn start_recording(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<(StatusCode, Json<RecordingDto>), ApiErr> {
+    require_owner(&state, &headers, &code).await?;
+    let meeting = meetings::get_by_code(state.pool(), &code)
+        .await
+        .map_err(ApiErr::internal)?
+        .ok_or_else(ApiErr::not_found)?;
+    let organizer = auth::session_organizer(&state, &headers);
+    let started_by = organizer.map(|o| o.id);
+
+    let recording_id = Uuid::new_v4();
+    recording::insert_row(state.pool(), recording_id, meeting.id, started_by)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "recording insert failed");
+            recordings_storage_err()
+        })?;
+
+    // Fail-open sink: if the writer thread dies the meeting continues.
+    let recorder = Arc::new(recording::start(
+        &state.config().data_dir,
+        meeting.id,
+        recording_id,
+        state.pool().clone(),
+    ));
+    let result = match state
+        .engine()
+        .start_recording(meeting.code.clone(), recorder)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::error!("engine went away while starting a recording");
+            return Err(recordings_storage_err());
+        }
+    };
+    match result {
+        Ok(()) => {
+            system_chat(&state, meeting.id, &meeting.code, "Recording started").await;
+            Ok((
+                StatusCode::CREATED,
+                Json(RecordingDto {
+                    id: recording_id,
+                    meeting_id: meeting.id,
+                    started_by,
+                    started_at: OffsetDateTime::now_utc(),
+                    stopped_at: None,
+                    size_bytes: None,
+                    active: true,
+                }),
+            ))
+        }
+        Err(code) => {
+            // Take the row back out; the writer's finalize is guarded
+            // by `stopped_at IS NULL` and cannot resurrect it.
+            recording::delete_row(state.pool(), recording_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "recording rollback failed");
+                    recordings_storage_err()
+                })?;
+            let message = match code {
+                ErrorCode::RecordingActive => "a recording is already active",
+                ErrorCode::MeetingNotLive => "the meeting has no live participants to record",
+                _ => "cannot start recording",
+            };
+            tracing::debug!("recording start refused: {code:?}");
+            Err(ApiErr(
+                StatusCode::CONFLICT,
+                ApiError {
+                    code,
+                    message: message.into(),
+                },
+            ))
+        }
+    }
+}
+
+/// Stop the recording (owner only). Idempotent: if the meeting is no
+/// longer live the recorder was already torn down by the empty-meeting
+/// lifecycle, which is still a success here.
+async fn stop_recording(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<Json<RecordingDto>, ApiErr> {
+    require_owner(&state, &headers, &code).await?;
+    let meeting = meetings::get_by_code(state.pool(), &code)
+        .await
+        .map_err(ApiErr::internal)?
+        .ok_or_else(ApiErr::not_found)?;
+
+    // Any refusal only means the engine has no live room for the code —
+    // i.e. the recording already ended on its own when the room emptied.
+    if let Ok(result) = state.engine().stop_recording(meeting.code.clone()).await {
+        let _ = result;
+    }
+    // The writer finalizes asynchronously when its sink drops; wait
+    // briefly for the row to reflect it before answering.
+    let row = recording::await_stopped(state.pool(), meeting.id, Duration::from_secs(2))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "recording lookup failed");
+            recordings_storage_err()
+        })?
+        .ok_or_else(no_recording_err)?;
+
+    system_chat(&state, meeting.id, &meeting.code, "Recording stopped").await;
+    Ok(Json(row.dto()))
+}
+
+/// The recording status: the latest metadata row for the meeting.
+async fn recording_status(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Path(code): Path<String>,
+) -> Result<Json<RecordingDto>, ApiErr> {
+    require_owner(&state, &headers, &code).await?;
+    let meeting = meetings::get_by_code(state.pool(), &code)
+        .await
+        .map_err(ApiErr::internal)?
+        .ok_or_else(ApiErr::not_found)?;
+    let row = recording::latest_row(state.pool(), meeting.id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "recording lookup failed");
+            recordings_storage_err()
+        })?
+        .ok_or_else(no_recording_err)?;
+    Ok(Json(row.dto()))
 }
 
 /// Meetings owned by a logged-in organizer can only be changed by that
@@ -1298,5 +1493,177 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    // --- recording API (issue 15) -----------------------------------------
+
+    /// Like [`test_state`], but with a caller-supplied `data_dir` so
+    /// recording artifacts land somewhere throwaway.
+    async fn recording_test_state(data_dir: std::path::PathBuf) -> AppState {
+        let config = Arc::new(crate::config::Config {
+            media_port: 0,
+            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            data_dir,
+            ..crate::config::Config::default()
+        });
+        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+        AppState::new(config, crate::db::test_pool().await, engine).unwrap()
+    }
+
+    async fn create_owned_meeting(app: &Router, cookie: &str) -> huddle_protocol::MeetingDto {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Recording sync",
+            "starts_at": (now).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(60)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        created.meeting
+    }
+
+    async fn request_recording(
+        app: &Router,
+        method: &str,
+        code: &str,
+        cookie: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(format!("/api/meetings/{code}/recording"));
+        if let Some(cookie) = cookie {
+            request = request.header(header::COOKIE, cookie);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let text = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&text).into_owned())
+    }
+
+    #[tokio::test]
+    async fn recording_endpoints_enforce_ownership_and_lookup() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let bob = session_cookie_for(&state, &app, "bob@example.com").await;
+        let meeting = create_owned_meeting(&app, &alice).await;
+        let code = meeting.code.clone();
+
+        // Only the owner may touch the recording of an owned meeting.
+        for (label, cookie) in [
+            ("anonymous", None),
+            ("another organizer", Some(bob.as_str())),
+        ] {
+            let (status, body) = request_recording(&app, "POST", &code, cookie).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label}: {body}");
+        }
+
+        // Unknown meeting: 404, not 403 or 409.
+        let (status, _) = request_recording(&app, "POST", "ZZZZ-ZZZZ-ZZZZ", Some(&alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recording_lifecycle_round_trip() {
+        let dir = std::env::temp_dir().join(format!("huddle-http-rec-{}", Uuid::new_v4()));
+        let state = recording_test_state(dir.clone()).await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let meeting = create_owned_meeting(&app, &alice).await;
+        let code = meeting.code.clone();
+
+        // Nobody has joined: a recording cannot start.
+        let (status, body) = request_recording(&app, "POST", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert!(body.contains("meeting_not_live"), "body: {body}");
+
+        // Put a live session in the room, the way the WS handler does.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .engine()
+            .join(Uuid::new_v4(), "alice".into(), meeting.clone(), out_tx)
+            .await
+            .expect("engine alive")
+            .expect("join accepted");
+
+        // Start: 201, active, started by the requesting organizer.
+        let (status, body) = request_recording(&app, "POST", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let dto: RecordingDto = serde_json::from_str(&body).unwrap();
+        assert!(dto.active);
+        assert!(dto.stopped_at.is_none());
+        assert!(dto.started_by.is_some(), "owner is recorded");
+        assert_eq!(dto.meeting_id, meeting.id);
+        let recording_id = dto.id;
+
+        // One recording at a time.
+        let (status, body) = request_recording(&app, "POST", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert!(body.contains("recording_active"), "body: {body}");
+
+        // Status shows the live recording.
+        let (status, body) = request_recording(&app, "GET", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::OK);
+        let dto: RecordingDto = serde_json::from_str(&body).unwrap();
+        assert!(dto.active);
+
+        // Consent landed as persisted system chat, sender-less.
+        let history = crate::chat::history(state.pool(), meeting.id)
+            .await
+            .unwrap();
+        let started = history
+            .iter()
+            .find(|m| m.body == "Recording started")
+            .expect("system chat entry persisted");
+        assert!(started.sender_id.is_none());
+
+        // Stop: 200, finalized (stopped_at), inactive.
+        let (status, body) = request_recording(&app, "DELETE", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let dto: RecordingDto = serde_json::from_str(&body).unwrap();
+        assert!(!dto.active);
+        assert!(dto.stopped_at.is_some(), "body: {body}");
+
+        // And the stop consent message joined the history.
+        let history = crate::chat::history(state.pool(), meeting.id)
+            .await
+            .unwrap();
+        assert!(
+            history.iter().any(|m| m.body == "Recording stopped"),
+            "history: {history:?}"
+        );
+
+        // The ffmpeg sidecar's manifest exists next to any track files.
+        let manifest = std::fs::read_to_string(
+            dir.join("recordings")
+                .join(meeting.id.to_string())
+                .join(recording_id.to_string())
+                .join("session.sdp"),
+        )
+        .expect("session.sdp written on finalize");
+        assert!(manifest.contains("v=0"));
+
+        // A meeting that was never recorded still 404s on status.
+        let fresh = create_owned_meeting(&app, &alice).await;
+        let (status, _) = request_recording(&app, "GET", &fresh.code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

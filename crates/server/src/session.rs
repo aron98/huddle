@@ -544,6 +544,9 @@ mod tests {
         pump: PumpHandle,
         you: Uuid,
         roster: Vec<huddle_protocol::Participant>,
+        /// Recording flag from this client's own Welcome: a late joiner
+        /// must never be silently recorded.
+        recording: bool,
     }
 
     impl TestClient {
@@ -569,12 +572,14 @@ mod tests {
                 pump,
                 you: Uuid::nil(),
                 roster: Vec::new(),
+                recording: false,
             };
             let msg = client.next_server_message().await;
             let ServerMessage::Welcome {
                 you,
                 roster,
                 protocol_version,
+                recording,
                 ..
             } = msg
             else {
@@ -583,6 +588,7 @@ mod tests {
             assert_eq!(protocol_version, huddle_protocol::PROTOCOL_VERSION);
             client.you = you.id;
             client.roster = roster;
+            client.recording = recording;
             client
         }
 
@@ -930,6 +936,152 @@ mod tests {
 
         alice.pump.stop();
         bob.pump.stop();
+    }
+
+    // ------------------------------------------------------------------
+    // Recording (issue 15).
+    // ------------------------------------------------------------------
+
+    /// Drive a full recording cycle against the real engine: media
+    /// flows, the sink taps it, the state broadcasts, a late joiner is
+    /// told the meeting is recorded, and the stop finalizes files plus
+    /// the metadata row.
+    #[tokio::test]
+    async fn recording_taps_media_and_finalizes_files_and_row() {
+        let dir = std::env::temp_dir().join(format!("huddle-rec-{}", Uuid::new_v4()));
+        let server = TestServer::start_with(Config {
+            data_dir: dir.clone(),
+            ..Config::default()
+        })
+        .await;
+        let code = server.create_meeting(0, 60).await;
+        let meeting = crate::meetings::get_by_code(server.state.pool(), &code)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut alice = TestClient::connect(&server, &code, "alice").await;
+        let mut bob = TestClient::connect(&server, &code, "bob").await;
+        let msg = alice.next_server_message().await; // bob joined
+        assert!(matches!(msg, ServerMessage::ParticipantJoined { .. }));
+        alice.publish().await;
+        bob.publish().await;
+
+        // Let the call settle so real media flows before recording.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let settled = alice.pump.connected()
+                && bob.pump.connected()
+                && alice.pump.media_rx() > 0
+                && bob.pump.media_rx() > 0;
+            if settled {
+                break;
+            }
+            assert!(Instant::now() < deadline, "call did not settle");
+            alice.drain(Duration::from_millis(20)).await;
+            bob.drain(Duration::from_millis(20)).await;
+        }
+        alice.drain(Duration::from_millis(100)).await;
+        bob.drain(Duration::from_millis(100)).await;
+
+        // Start recording exactly the way the REST handler does: row
+        // first, then the sink, then the engine.
+        let recording_id = Uuid::new_v4();
+        crate::recording::insert_row(server.state.pool(), recording_id, meeting.id, None)
+            .await
+            .unwrap();
+        let recorder = Arc::new(crate::recording::start(
+            &dir,
+            meeting.id,
+            recording_id,
+            server.state.pool().clone(),
+        ));
+        server
+            .state
+            .engine()
+            .start_recording(code.clone(), recorder)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Both participants are told at once.
+        for client in [&mut alice, &mut bob] {
+            let msg = client.next_server_message().await;
+            let ServerMessage::Recording { active } = msg else {
+                panic!("expected recording state, got {msg:?}")
+            };
+            assert!(active);
+        }
+
+        // Media keeps flowing into the tap for a while.
+        alice.drain(Duration::from_millis(500)).await;
+        bob.drain(Duration::from_millis(500)).await;
+
+        // A late joiner is never silently recorded: the Welcome says so.
+        let mut carol = TestClient::connect(&server, &code, "carol").await;
+        assert!(carol.recording, "late joiner must see the recording flag");
+        alice.drain(Duration::from_millis(100)).await;
+        bob.drain(Duration::from_millis(100)).await;
+
+        // Stop: everyone still in the room is told.
+        server
+            .state
+            .engine()
+            .stop_recording(code.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        for client in [&mut alice, &mut bob, &mut carol] {
+            let msg = client.next_server_message().await;
+            let ServerMessage::Recording { active } = msg else {
+                panic!("expected recording state, got {msg:?}")
+            };
+            assert!(!active);
+        }
+
+        // The writer thread finalizes asynchronously: flush, manifest,
+        // and the metadata row with a real byte count.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let row = loop {
+            let row = crate::recording::latest_row(server.state.pool(), meeting.id)
+                .await
+                .unwrap()
+                .expect("row exists");
+            if row.stopped_at.is_some() {
+                break row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recorder did not finalize the row"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let recorded_bytes = row.size_bytes.expect("finalize records a size");
+        assert!(recorded_bytes > 0, "tapped media must land on disk");
+
+        // Artifacts on disk: per-track .rtp files plus the manifest the
+        // ffmpeg sidecar muxes from.
+        let rec_dir = dir
+            .join("recordings")
+            .join(meeting.id.to_string())
+            .join(recording_id.to_string());
+        let manifest =
+            std::fs::read_to_string(rec_dir.join("session.sdp")).expect("session.sdp manifest");
+        assert!(manifest.contains("m=audio"), "manifest: {manifest}");
+        let rtp_files: Vec<_> = std::fs::read_dir(&rec_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".rtp"))
+            .collect();
+        assert!(
+            rtp_files.iter().any(|e| e.metadata().unwrap().len() > 0),
+            "at least one non-empty track file"
+        );
+
+        alice.pump.stop();
+        bob.pump.stop();
+        carol.pump.stop();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
