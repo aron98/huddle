@@ -720,6 +720,21 @@ button:disabled {
   outline-offset: -3px;
 }
 
+/* The focused camera tile takes more room and wears the amber ring so
+   the selection (and the high simulcast layer it triggers) is visible. */
+.tile.focused {
+  grid-column: span 2;
+  grid-row: span 2;
+  outline: 3px solid var(--on-air);
+  outline-offset: -3px;
+  cursor: pointer;
+}
+
+/* Camera tiles are clickable to focus. */
+.tile:not(.screen):not(.focused) {
+  cursor: pointer;
+}
+
 .tile figcaption {
   position: absolute;
   left: 0;

@@ -14,9 +14,9 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     MediaStream, MediaStreamTrack, RtcConfiguration, RtcIceCandidate, RtcIceCandidateInit,
-    RtcIceTransportPolicy, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpSender,
-    RtcRtpTransceiverDirection, RtcRtpTransceiverInit, RtcSdpType, RtcSessionDescription,
-    RtcSessionDescriptionInit, RtcTrackEvent, WebSocket,
+    RtcIceTransportPolicy, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcRtpEncodingParameters,
+    RtcRtpSender, RtcRtpTransceiverDirection, RtcRtpTransceiverInit, RtcSdpType,
+    RtcSessionDescription, RtcSessionDescriptionInit, RtcTrackEvent, WebSocket,
 };
 
 use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
@@ -340,14 +340,49 @@ impl BrowserPeerConnection {
         self.pc.clone()
     }
 
-    /// Add every track of `stream` to the peer connection (as sender),
-    /// so the next offer announces our camera and microphone.
-    pub fn attach_stream(&self, stream: &MediaStream) {
+    /// Add every track of `stream` to the peer connection (as sender), so
+    /// the next offer announces our camera and microphone. Video senders
+    /// get three simulcast encodings (high quality first) via
+    /// `setParameters`, so the SFU can switch each subscriber between
+    /// layers.
+    pub async fn attach_stream(&self, stream: &MediaStream) {
         let tracks = stream.get_tracks();
         for i in 0..tracks.length() {
             if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
-                self.pc.add_track_0(&track, stream);
+                let sender = self.pc.add_track_0(&track, stream);
+                if track.kind() == "video" {
+                    self.configure_simulcast(&sender).await;
+                }
             }
+        }
+    }
+
+    /// Give a camera sender three simulcast encodings: full resolution
+    /// (the 1280x720 class), half (640x360) and a quarter (320x180),
+    /// rids ordered high → low to mirror the SFU's layer convention.
+    /// Screen shares never go through here — they stay single-layer.
+    ///
+    /// A rejection is non-fatal: the camera falls back to single-layer
+    /// and the SFU simply forwards everything.
+    async fn configure_simulcast(&self, sender: &RtcRtpSender) {
+        let params = sender.get_parameters();
+        let encodings = js_sys::Array::new();
+        for (rid, scale, max_bitrate) in [
+            ("high", 1.0_f32, 1_200_000_u32),
+            ("mid", 2.0, 500_000),
+            ("low", 4.0, 150_000),
+        ] {
+            let encoding = RtcRtpEncodingParameters::new();
+            encoding.set_rid(rid);
+            encoding.set_active(true);
+            encoding.set_scale_resolution_down_by(scale);
+            encoding.set_max_bitrate(max_bitrate);
+            encodings.push(&encoding);
+        }
+        params.set_encodings(&encodings);
+        let promise = sender.set_parameters_with_parameters(&params);
+        if let Err(e) = JsFuture::from(promise).await {
+            leptos::logging::warn!("simulcast setParameters rejected: {e:?}");
         }
     }
 

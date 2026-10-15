@@ -20,7 +20,7 @@ pub use transport::{SignalingError, SignalingStream};
 
 use huddle_protocol::{
     ChatMessage, ClientMessage, ErrorCode, MeetingDto, PROTOCOL_VERSION, Participant,
-    ParticipantId, ServerMessage,
+    ParticipantId, ServerMessage, VideoLayer,
 };
 use std::collections::HashSet;
 
@@ -376,6 +376,21 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         self.require_in_call()?;
         self.signaling
             .send(ClientMessage::Speaking { speaking })
+            .await
+            .map_err(RtcError::from)
+    }
+
+    /// Tell the SFU which simulcast layer we want from `origin`'s camera
+    /// (focused tile → high, unfocused → low). The SFU ignores it for
+    /// audio and single-layer screen shares.
+    pub async fn set_layer_preference(
+        &mut self,
+        origin: ParticipantId,
+        layer: VideoLayer,
+    ) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.signaling
+            .send(ClientMessage::LayerPreference { origin, layer })
             .await
             .map_err(RtcError::from)
     }

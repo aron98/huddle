@@ -141,7 +141,12 @@ impl MockState {
                 id: ALICE_ID,
                 sharing: *sharing,
             }],
-            ClientMessage::SdpAnswer { .. } | ClientMessage::Leave => vec![],
+            // Layer preferences are consumed by the SFU with no reply.
+            ClientMessage::LayerPreference { .. }
+            // SDP answers and leaves close out flows that already got
+            // their replies elsewhere.
+            | ClientMessage::SdpAnswer { .. }
+            | ClientMessage::Leave => vec![],
         }
     }
 }
