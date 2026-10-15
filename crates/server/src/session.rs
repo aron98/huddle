@@ -326,7 +326,7 @@ mod tests {
             config.public_ip = Some(IpAddr::from([127, 0, 0, 1]));
             let pool = crate::db::test_pool().await;
             let (engine, media_addr) = crate::engine::spawn(&config).unwrap();
-            let state = AppState::new(Arc::new(config), pool, engine);
+            let state = AppState::new(Arc::new(config), pool, engine).unwrap();
             let app = crate::http::router(state.clone());
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

@@ -11,6 +11,8 @@ mod identity;
 mod mailer;
 mod meetings;
 mod metrics;
+#[cfg(test)]
+mod oidc_test_idp;
 mod ratelimit;
 mod session;
 mod state;
@@ -48,7 +50,9 @@ async fn run() -> anyhow::Result<()> {
     let (engine, media_addr) = engine::spawn(&config).context("starting media engine")?;
     info!(media = %media_addr, "media engine ready");
 
-    let app = http::router(state::AppState::new(config.clone(), pool, engine.clone()));
+    let state = state::AppState::new(config.clone(), pool, engine.clone())
+        .context("building application state")?;
+    let app = http::router(state);
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

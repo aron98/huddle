@@ -20,12 +20,17 @@ use uuid::Uuid;
 
 use huddle_protocol::{ApiError, ErrorCode};
 
-use crate::identity::{IdentityError, IdentityProvider, Organizer};
+use crate::identity::{Identity, IdentityError, IdentityProvider, Organizer};
 use crate::mailer;
 use crate::state::AppState;
 
 /// The browser-visible session cookie name.
 pub const COOKIE_NAME: &str = "huddle_session";
+
+/// The browser-binding cookie for an in-flight OIDC login: the callback
+/// only accepts a `state` that this browser (and no other) was issued.
+/// Short-lived; cleared implicitly when it lapses.
+pub const OIDC_LOGIN_COOKIE: &str = "huddle_oidc_login";
 
 // ---------------------------------------------------------------------------
 // Cookie format
@@ -85,15 +90,21 @@ fn authenticate_cookie(key: &[u8], value: &str, now: OffsetDateTime) -> Option<O
     valid.then_some(Organizer { id, email })
 }
 
-/// The signed-in organizer for a request, if any.
-pub fn session_organizer(state: &AppState, headers: &HeaderMap) -> Option<Organizer> {
+/// The value of cookie `name` in `headers`, if present.
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    let prefix = format!("{COOKIE_NAME}=");
-    let value = cookies
+    let prefix = format!("{name}=");
+    cookies
         .split(';')
         .map(str::trim)
-        .find_map(|part| part.strip_prefix(&prefix))?;
-    authenticate_cookie(state.session_key(), value, OffsetDateTime::now_utc())
+        .find_map(|part| part.strip_prefix(&prefix))
+        .map(str::to_owned)
+}
+
+/// The signed-in organizer for a request, if any.
+pub fn session_organizer(state: &AppState, headers: &HeaderMap) -> Option<Organizer> {
+    let value = cookie_value(headers, COOKIE_NAME)?;
+    authenticate_cookie(state.session_key(), &value, OffsetDateTime::now_utc())
 }
 
 // ---------------------------------------------------------------------------
@@ -111,16 +122,31 @@ pub struct RequestLinkBody {
 /// an address is valid or known. Delivery failures are logged
 /// server-side. One exception: per-IP rate limiting answers `429` so
 /// the endpoint cannot be used to flood mailboxes (or mine the log).
+///
+/// When SSO is configured this endpoint is replaced by OIDC and answers
+/// `409` pointing at the login route — magic links and SSO are two
+/// flavors of one flow, never simultaneous.
 pub async fn request_link(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<RequestLinkBody>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
+    if state.identity().is_oidc() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "oidc_configured",
+                "login": "/api/auth/oidc/login",
+            })),
+        )
+            .into_response();
+    }
     if !state.rate_limiter().allow(addr.ip()) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({ "status": "rate_limited" })),
-        );
+        )
+            .into_response();
     }
     match state
         .identity()
@@ -141,7 +167,7 @@ pub async fn request_link(
         }
         Err(e) => tracing::warn!("cannot start login: {e}"),
     }
-    (StatusCode::OK, Json(json!({ "status": "sent" })))
+    (StatusCode::OK, Json(json!({ "status": "sent" }))).into_response()
 }
 
 #[derive(Deserialize)]
@@ -154,13 +180,18 @@ pub struct VerifyQuery {
 pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQuery>) -> Response {
     let organizer = match state
         .identity()
-        .verify(&query.token, OffsetDateTime::now_utc())
+        .verify(&query.token, None, OffsetDateTime::now_utc())
         .await
     {
         Ok(organizer) => organizer,
         Err(_) => return unauthorized("the sign-in link is invalid or has expired"),
     };
+    land_with_session(&state, organizer)
+}
 
+/// Issue the session cookie for `organizer` and land on the dashboard —
+/// the shared tail of every successful login, magic link or SSO.
+fn land_with_session(state: &AppState, organizer: Organizer) -> Response {
     let config = state.config();
     let expires_at =
         OffsetDateTime::now_utc() + time::Duration::minutes(i64::from(config.session_ttl_min));
@@ -182,6 +213,114 @@ pub async fn verify(State(state): State<AppState>, Query(query): Query<VerifyQue
             .insert(header::SET_COOKIE, header_value);
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// OIDC single sign-on (issue #11)
+// ---------------------------------------------------------------------------
+
+/// GET /api/auth/oidc/login — redirect the browser to the IdP's
+/// authorization endpoint with a freshly minted state, PKCE challenge,
+/// and nonce. `404` when SSO is not configured: the route does not
+/// exist in that deployment.
+pub async fn oidc_login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    let Identity::Oidc(provider) = state.identity() else {
+        return oidc_not_configured();
+    };
+    // Each login mints a database row; keep the minting rate-limited
+    // like magic links.
+    if !state.rate_limiter().allow(addr.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "status": "rate_limited" })),
+        )
+            .into_response();
+    }
+    match provider.begin_login(OffsetDateTime::now_utc()).await {
+        Ok((url, login_state)) => {
+            let secure = if state.config().base_url.starts_with("https://") {
+                "; Secure"
+            } else {
+                ""
+            };
+            // Bind this login to this browser: the callback refuses any
+            // state that was not issued to the same cookie jar. This is
+            // the login-CSRF defense; the state itself doubles as the
+            // CSRF token toward the IdP.
+            let cookie = format!(
+                "{OIDC_LOGIN_COOKIE}={login_state}; Path=/api/auth; Max-Age=600; HttpOnly; SameSite=Lax{secure}"
+            );
+            let mut response = Redirect::to(&url).into_response();
+            if let Ok(header_value) = header::HeaderValue::from_str(&cookie) {
+                response
+                    .headers_mut()
+                    .insert(header::SET_COOKIE, header_value);
+            }
+            response
+        }
+        Err(e) => {
+            tracing::warn!("cannot start OIDC login: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    code: ErrorCode::Internal,
+                    message: "the identity provider is unreachable or misconfigured".into(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OidcCallbackQuery {
+    code: String,
+    state: String,
+}
+
+/// GET /api/auth/oidc/callback?code=…&state=… — the IdP's redirect
+/// target. Verifies the authorization code (PKCE, state, nonce, ID
+/// token signature) and, on success, issues exactly the session cookie
+/// the magic-link flow does and lands on the same dashboard.
+pub async fn oidc_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<OidcCallbackQuery>,
+) -> Response {
+    if !state.identity().is_oidc() {
+        return oidc_not_configured();
+    }
+    // The state must match the one this browser was issued at /login.
+    // States are 256-bit random values, so a plain comparison leaks
+    // nothing.
+    if cookie_value(&headers, OIDC_LOGIN_COOKIE).as_deref() != Some(query.state.as_str()) {
+        return unauthorized("OIDC sign-in failed or has expired");
+    }
+    match state
+        .identity()
+        .verify(&query.code, Some(&query.state), OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(organizer) => land_with_session(&state, organizer),
+        Err(e) => {
+            tracing::warn!("OIDC callback rejected: {e}");
+            unauthorized("OIDC sign-in failed or has expired")
+        }
+    }
+}
+
+fn oidc_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ApiError {
+            code: ErrorCode::InvalidMessage,
+            message: "SSO is not configured on this server".into(),
+        }),
+    )
+        .into_response()
 }
 
 /// GET /api/auth/me — the signed-in organizer, or 401.

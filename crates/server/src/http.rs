@@ -42,6 +42,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/request-link", post(auth::request_link))
         .route("/api/auth/verify", get(auth::verify))
         .route("/api/auth/me", get(auth::me))
+        .route("/api/auth/oidc/login", get(auth::oidc_login))
+        .route("/api/auth/oidc/callback", get(auth::oidc_callback))
         .route("/metrics", get(metrics_scrape))
         .route("/ws", get(session::ws))
         .fallback(fallback)
@@ -467,7 +469,7 @@ mod tests {
             ..crate::config::Config::default()
         });
         let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
-        AppState::new(config, crate::db::test_pool().await, engine)
+        AppState::new(config, crate::db::test_pool().await, engine).unwrap()
     }
 
     #[tokio::test]
@@ -811,6 +813,227 @@ mod tests {
         assert!(text.contains("unauthorized"), "got: {text}");
     }
 
+    // --- OIDC routes -------------------------------------------------------
+
+    use crate::oidc_test_idp::FakeIdp;
+
+    async fn oidc_test_state() -> (AppState, FakeIdp) {
+        let idp = FakeIdp::start("e2e-client", "e2e-secret", "sso@example.com")
+            .await
+            .unwrap();
+        let config = Arc::new(crate::config::Config {
+            media_port: 0,
+            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            base_url: "http://127.0.0.1:3134".into(),
+            oidc: Some(crate::config::OidcConfig {
+                issuer_url: idp.base_url.clone(),
+                client_id: "e2e-client".into(),
+                client_secret: "e2e-secret".into(),
+            }),
+            ..crate::config::Config::default()
+        });
+        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+        let state = AppState::new(config, crate::db::test_pool().await, engine).unwrap();
+        (state, idp)
+    }
+
+    fn query_params(url: &str) -> Vec<(String, String)> {
+        url.split('?')
+            .nth(1)
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|p| p.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn oidc_routes_are_404_when_sso_is_not_configured() {
+        let app = router(test_state().await);
+        for (i, uri) in [
+            "/api/auth/oidc/login",
+            "/api/auth/oidc/callback?code=x&state=y",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        // The ConnectInfo extractor runs before the
+                        // handler's not-configured branch.
+                        .extension(ConnectInfo(SocketAddr::from((
+                            [127, 0, 0, 1],
+                            5200 + i as u16,
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "uri: {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_link_conflicts_when_oidc_is_configured() {
+        let (state, _idp) = oidc_test_state().await;
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::post("/api/auth/request-link")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5100))))
+                    .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_configured"), "got: {text}");
+        assert!(text.contains("/api/auth/oidc/login"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn oidc_login_redirects_to_the_idp_and_binds_the_state() {
+        let (state, idp) = oidc_test_state().await;
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/oidc/login")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5101))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        assert!(location.starts_with(&idp.base_url), "location: {location}");
+        assert!(location.contains("/authorize?"), "location: {location}");
+        for key in [
+            "response_type=code",
+            "client_id=e2e-client",
+            "code_challenge_method=S256",
+        ] {
+            assert!(location.contains(key), "location missing {key}: {location}");
+        }
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(cookie.starts_with("huddle_oidc_login="), "cookie: {cookie}");
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_lands_with_the_same_session_as_magic_links() {
+        let (state, idp) = oidc_test_state().await;
+        let app = router(state);
+
+        // Login: parse the state and nonce out of the redirect.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/oidc/login")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5102))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let params: std::collections::HashMap<String, String> =
+            query_params(&location).into_iter().collect();
+        let state_param = params["state"].clone();
+        let binding_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        idp.set_nonce(&params["nonce"]);
+
+        // Callback without the binding cookie: refused.
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/auth/oidc/callback?code=x&state={state_param}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        // Callback with it: session cookie, /meetings, same as magic links.
+        let landed = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/auth/oidc/callback?code=x&state={state_param}"
+                ))
+                .header(header::COOKIE, &binding_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(landed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            landed
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/meetings")
+        );
+        let session = landed
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(session.starts_with("huddle_session="), "cookie: {session}");
+
+        // The session works on /me — the exact cookie the magic-link
+        // flow issues.
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(header::COOKIE, session)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("sso@example.com"), "got: {text}");
+    }
+
     // --- ownership, dashboard, ICS -----------------------------------------
 
     /// Log `email` in (via the verify route, like a browser following the
@@ -1043,7 +1266,7 @@ mod tests {
             ..crate::config::Config::default()
         });
         let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
-        let state = AppState::new(config, crate::db::test_pool().await, engine);
+        let state = AppState::new(config, crate::db::test_pool().await, engine).unwrap();
         let app = router(state);
 
         let denied = app
