@@ -262,4 +262,8 @@ client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
 
 ## License
 
-[MIT](LICENSE)
+Licensed under the [Apache License, Version 2.0](LICENSE). Unless required by
+applicable law or agreed to in writing, software distributed under the License
+is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied. See the License for the specific language
+governing permissions and limitations under the License.

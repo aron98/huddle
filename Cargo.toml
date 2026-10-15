@@ -5,7 +5,7 @@ members = ["crates/protocol", "crates/sfu", "crates/server", "crates/web"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/aron98/huddle"
 
 [workspace.dependencies]
