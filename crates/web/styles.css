@@ -648,6 +648,42 @@ button:disabled {
   }
 }
 
+/* The recording badge: consent signage, red to read as "capturing". */
+.recording-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--danger);
+  border: 1px solid var(--danger);
+  border-radius: var(--r-pill);
+  padding: var(--sp-1) var(--sp-3);
+  animation: lamp 2.6s ease-in-out infinite;
+}
+
+.recording-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  margin: 0;
+  animation: rec-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes rec-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
 .call-title {
   margin: 0;
   font-size: var(--fs-base);
