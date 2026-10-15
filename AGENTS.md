@@ -9,7 +9,7 @@ Cargo workspace, edition 2024, resolver 3, toolchain pinned in `rust-toolchain.t
 - `crates/protocol` (`huddle-protocol`) — serde wire messages, REST + WS. `PROTOCOL_VERSION = 1`; changes are **additive-only** (new enum variants with `tag="type"` snake_case serde); protocol commits land alone before dependents build on them.
 - `crates/sfu` (`huddle-sfu`) — sans-io SFU room on **str0m, pinned `=0.24.1`** (pre-1.0 API churn).
 - `crates/server` (`huddle-server`, **binary named `huddle`** — `cargo build -p huddle` fails).
-- `crates/web` (`huddle-web`) — Leptos 0.8 CSR, built with trunk to `crates/web/dist` (gitignored).
+- `crates/web` (`huddle-web`) — Leptos 0.8 CSR, built with trunk to `crates/web/dist` (gitignored). `src/lib.rs` holds landing/login/dashboard; the meeting page is `src/call.rs` (`MeetingFlow` owns the explicit flow state machine in `src/flow.rs`: prejoin → joining → in-call → left/connection-lost, incl. a designed post-leave view), `src/prejoin.rs` the prejoin page. The flow diagram is `docs/user-flow.md` and the code must match it. wasm-only modules are `#[cfg(target_arch = "wasm32")]`; the native stub render keeps `cargo clippy --all-targets` green.
 
 ## Commands
 
