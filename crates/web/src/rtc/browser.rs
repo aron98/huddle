@@ -340,49 +340,73 @@ impl BrowserPeerConnection {
         self.pc.clone()
     }
 
-    /// Add every track of `stream` to the peer connection (as sender), so
-    /// the next offer announces our camera and microphone. Video senders
-    /// get three simulcast encodings (high quality first) via
-    /// `setParameters`, so the SFU can switch each subscriber between
-    /// layers.
+    /// Publish the local microphone and camera. Camera video goes out as
+    /// three simulcast layers (high quality first), so the SFU can switch
+    /// each subscriber between layers; the microphone stays single-stream.
     pub async fn attach_stream(&self, stream: &MediaStream) {
         let tracks = stream.get_tracks();
         for i in 0..tracks.length() {
             if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
-                let sender = self.pc.add_track_0(&track, stream);
                 if track.kind() == "video" {
-                    self.configure_simulcast(&sender).await;
+                    self.publish_camera(&track, stream).await;
+                } else {
+                    self.pc.add_track_0(&track, stream);
                 }
             }
         }
     }
 
-    /// Give a camera sender three simulcast encodings: full resolution
+    /// Publish the camera with three simulcast encodings: full resolution
     /// (the 1280x720 class), half (640x360) and a quarter (320x180),
     /// rids ordered high → low to mirror the SFU's layer convention.
-    /// Screen shares never go through here — they stay single-layer.
     ///
-    /// A rejection is non-fatal: the camera falls back to single-layer
-    /// and the SFU simply forwards everything.
-    async fn configure_simulcast(&self, sender: &RtcRtpSender) {
-        let params = sender.get_parameters();
+    /// Rids are fixed at transceiver creation: `setParameters` treats
+    /// `rid` as read-only (Chrome rejects any attempt with
+    /// `InvalidModificationError`), so `addTransceiver` with
+    /// `sendEncodings` is the only way to arm them. The per-layer bitrate
+    /// budgets then go through `RtpSender::setParameters`, which is the
+    /// mutable knob. Screen shares never go through here — they stay
+    /// single-layer.
+    ///
+    /// A `setParameters` rejection is non-fatal: the layers keep their
+    /// creation-time scale factors and the SFU simply forwards whatever
+    /// arrives.
+    async fn publish_camera(&self, track: &MediaStreamTrack, stream: &MediaStream) {
         let encodings = js_sys::Array::new();
-        for (rid, scale, max_bitrate) in [
-            ("high", 1.0_f32, 1_200_000_u32),
-            ("mid", 2.0, 500_000),
-            ("low", 4.0, 150_000),
-        ] {
+        for (rid, scale) in [("high", 1.0_f32), ("mid", 2.0), ("low", 4.0)] {
             let encoding = RtcRtpEncodingParameters::new();
             encoding.set_rid(rid);
             encoding.set_active(true);
             encoding.set_scale_resolution_down_by(scale);
-            encoding.set_max_bitrate(max_bitrate);
             encodings.push(&encoding);
         }
-        params.set_encodings(&encodings);
-        let promise = sender.set_parameters_with_parameters(&params);
-        if let Err(e) = JsFuture::from(promise).await {
-            leptos::logging::warn!("simulcast setParameters rejected: {e:?}");
+        let init = RtcRtpTransceiverInit::new();
+        init.set_direction(RtcRtpTransceiverDirection::Sendrecv);
+        let streams = js_sys::Array::new();
+        streams.push(stream);
+        init.set_streams(&streams);
+        init.set_send_encodings(&encodings);
+        let transceiver = self
+            .pc
+            .add_transceiver_with_media_stream_track_and_init(track, &init);
+        let sender = transceiver.sender();
+
+        // Tune the layer budgets via setParameters: full 1.2 Mbps, half
+        // 500 kbps, quarter 150 kbps.
+        let params = sender.get_parameters();
+        if let Some(existing) = params.get_encodings() {
+            for (i, max_bitrate) in [1_200_000_u32, 500_000, 150_000].into_iter().enumerate() {
+                if let Ok(encoding) = existing
+                    .get(i as u32)
+                    .dyn_into::<RtcRtpEncodingParameters>()
+                {
+                    encoding.set_max_bitrate(max_bitrate);
+                }
+            }
+            let promise = sender.set_parameters_with_parameters(&params);
+            if let Err(e) = JsFuture::from(promise).await {
+                leptos::logging::warn!("simulcast setParameters rejected: {e:?}");
+            }
         }
     }
 
