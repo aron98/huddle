@@ -63,6 +63,10 @@ pub struct Config {
     /// link instead of sending it — fine for development and small
     /// self-hosted setups, and it keeps the single binary dependency-free.
     pub smtp: Option<SmtpConfig>,
+    /// OIDC identity provider for SSO (issue #11). `None` (the default)
+    /// keeps magic links as the organizer sign-in flow; when set, SSO
+    /// replaces them. See [`OidcConfig`].
+    pub oidc: Option<OidcConfig>,
     /// Optional bearer token protecting `GET /metrics`. `None` (the
     /// default) leaves the endpoint open, matching Prometheus's
     /// pull model: deployments are expected to gate it at the network
@@ -108,6 +112,27 @@ pub struct SmtpConfig {
     pub from: Option<String>,
 }
 
+/// OIDC single sign-on, as configured in `huddle.toml`:
+///
+/// ```toml
+/// [oidc]
+/// issuer_url = "https://accounts.example.com"
+/// client_id = "huddle"
+/// client_secret = "…"
+/// ```
+///
+/// Or per-field via `HUDDLE_OIDC_ISSUER_URL`, `HUDDLE_OIDC_CLIENT_ID`,
+/// `HUDDLE_OIDC_CLIENT_SECRET`. The redirect URI registered with the IdP
+/// must be `<base_url>/api/auth/oidc/callback`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OidcConfig {
+    /// The issuer identifier; discovery lives at
+    /// `<issuer_url>/.well-known/openid-configuration`.
+    pub issuer_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -125,6 +150,7 @@ impl Default for Config {
             session_secret: None,
             session_ttl_min: 120,
             smtp: None,
+            oidc: None,
             stats_token: None,
             rate_limit_per_min: 30,
         }
@@ -157,7 +183,71 @@ impl Config {
         }
 
         let config: Self = figment.merge(Env::prefixed("HUDDLE_")).extract()?;
+
+        // Figment's flat `HUDDLE_*` env keys cannot reach a nested
+        // `[oidc]` section, so the three OIDC variables are applied
+        // explicitly after extraction.
+        let env_oidc = (
+            std::env::var_os("HUDDLE_OIDC_ISSUER_URL"),
+            std::env::var_os("HUDDLE_OIDC_CLIENT_ID"),
+            std::env::var_os("HUDDLE_OIDC_CLIENT_SECRET"),
+        );
+        let env_oidc = (
+            env_oidc.0.map(|v| v.to_string_lossy().into_owned()),
+            env_oidc.1.map(|v| v.to_string_lossy().into_owned()),
+            env_oidc.2.map(|v| v.to_string_lossy().into_owned()),
+        );
+        let (issuer, client_id, secret) = env_oidc;
+        let mut config = config;
+        Self::apply_oidc_env_with(&mut config, issuer, client_id, secret)?;
         Ok(config)
+    }
+
+    /// Testable core of the `HUDDLE_OIDC_*` env handling: each of the
+    /// three values, when set and non-empty, overrides the matching
+    /// `[oidc]` TOML field. If any is set, all three must end up
+    /// non-empty — a half-configured IdP would silently break sign-in.
+    fn apply_oidc_env_with(
+        config: &mut Self,
+        issuer_url: Option<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+    ) -> anyhow::Result<()> {
+        let any_set = issuer_url.is_some() || client_id.is_some() || client_secret.is_some();
+        if !any_set {
+            return Ok(());
+        }
+        let mut oidc = config.oidc.clone().unwrap_or(OidcConfig {
+            issuer_url: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+        });
+        if let Some(v) = issuer_url.filter(|v| !v.trim().is_empty()) {
+            oidc.issuer_url = v;
+        }
+        if let Some(v) = client_id.filter(|v| !v.trim().is_empty()) {
+            oidc.client_id = v;
+        }
+        if let Some(v) = client_secret.filter(|v| !v.trim().is_empty()) {
+            oidc.client_secret = v;
+        }
+        if oidc.issuer_url.trim().is_empty() {
+            anyhow::bail!(
+                "HUDDLE_OIDC_ISSUER_URL is required when any HUDDLE_OIDC_* variable is set"
+            );
+        }
+        if oidc.client_id.trim().is_empty() {
+            anyhow::bail!(
+                "HUDDLE_OIDC_CLIENT_ID is required when any HUDDLE_OIDC_* variable is set"
+            );
+        }
+        if oidc.client_secret.trim().is_empty() {
+            anyhow::bail!(
+                "HUDDLE_OIDC_CLIENT_SECRET is required when any HUDDLE_OIDC_* variable is set"
+            );
+        }
+        config.oidc = Some(oidc);
+        Ok(())
     }
 
     /// The IP browsers should be told to send media to.
@@ -241,6 +331,7 @@ mod tests {
         assert_eq!(config.session_secret, None);
         assert_eq!(config.session_ttl_min, 120);
         assert_eq!(config.smtp, None);
+        assert_eq!(config.oidc, None);
         assert_eq!(config.stats_token, None);
         assert_eq!(config.rate_limit_per_min, 30);
     }
@@ -314,5 +405,91 @@ mod tests {
         assert_eq!(smtp.from, None);
         // Untouched defaults survive alongside the section.
         assert_eq!(config.login_token_ttl_min, 15);
+    }
+
+    #[test]
+    fn oidc_section_parses() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [oidc]
+                issuer_url = "https://accounts.example.com"
+                client_id = "huddle"
+                client_secret = "s3cret"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        let oidc = config.oidc.expect("oidc section");
+        assert_eq!(oidc.issuer_url, "https://accounts.example.com");
+        assert_eq!(oidc.client_id, "huddle");
+        assert_eq!(oidc.client_secret, "s3cret");
+        // Magic links stay the default elsewhere.
+        assert_eq!(config.login_token_ttl_min, 15);
+    }
+
+    #[test]
+    fn partial_oidc_env_fails() {
+        let mut config = Config::default();
+        let err = Config::apply_oidc_env_with(
+            &mut config,
+            Some("https://accounts.example.com".into()),
+            None,
+            None,
+        );
+        assert!(err.is_err(), "half-configured OIDC must not pass");
+        // An empty string counts as unset and still fails validation.
+        let mut config = Config::default();
+        let err = Config::apply_oidc_env_with(
+            &mut config,
+            Some("https://accounts.example.com".into()),
+            Some("".into()),
+            Some("secret".into()),
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn full_oidc_env_configures() {
+        let mut config = Config::default();
+        Config::apply_oidc_env_with(
+            &mut config,
+            Some("https://accounts.example.com".into()),
+            Some("huddle".into()),
+            Some("s3cret".into()),
+        )
+        .unwrap();
+        let oidc = config.oidc.expect("oidc configured");
+        assert_eq!(oidc.issuer_url, "https://accounts.example.com");
+        assert_eq!(oidc.client_id, "huddle");
+        assert_eq!(oidc.client_secret, "s3cret");
+    }
+
+    #[test]
+    fn oidc_env_overrides_toml_per_field() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [oidc]
+                issuer_url = "https://toml.example.com"
+                client_id = "toml-client"
+                client_secret = "toml-secret"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        let mut config = config;
+        // Env overrides client_id only; the TOML issuer and secret stay.
+        Config::apply_oidc_env_with(
+            &mut config,
+            None,
+            Some("env-client".into()),
+            Some("env-secret".into()),
+        )
+        .unwrap();
+        let oidc = config.oidc.unwrap();
+        assert_eq!(oidc.issuer_url, "https://toml.example.com");
+        assert_eq!(oidc.client_id, "env-client");
+        assert_eq!(oidc.client_secret, "env-secret");
     }
 }

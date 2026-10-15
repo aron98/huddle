@@ -109,7 +109,8 @@ interface, and the mismatched reply source fails ICE validation). With
 auto-detection you do not need to care about this on any platform.
 
 Deployment (Docker, compose, Helm, release tarballs, coturn, firewall
-ports) is covered in [Self-hosting](#self-hosting) below.
+ports) is covered in [Self-hosting](#self-hosting) below, along with optional
+[Single sign-on (OIDC)](#single-sign-on-oidc) for the login flow.
 
 ## Observability
 
@@ -206,6 +207,40 @@ Production checklist: real credentials (not the dev pair), TLS on 5349 for
 clients that split-tunnel TCP, and — unless you are building an internal
 setup — do **not** copy `allow-loopback-peers` from the e2e configs; coturn
 refuses loopback peers by default for good reason.
+
+### Single sign-on (OIDC)
+
+Huddle signs organizers in with passwordless magic links by default. To
+delegate authentication to an external identity provider instead, configure
+OIDC — either `HUDDLE_OIDC_*` environment variables or an `[oidc]` section in
+`huddle.toml`:
+
+```toml
+[oidc]
+issuer_url = "https://sso.example.com/realms/main"
+client_id = "huddle"
+client_secret = "…"
+```
+
+The issuer must publish OpenID Connect discovery at
+`<issuer_url>/.well-known/openid-configuration`; huddle reads the
+authorization, token, and JWKS endpoints from it. Register the redirect URI
+`<HUDDLE_BASE_URL>/api/auth/oidc/callback` with the provider.
+
+While OIDC is configured, `GET /api/auth/oidc/login` starts the redirect flow
+and `GET /api/auth/oidc/callback` completes it, landing the user on `/meetings`
+with the same signed session cookie a magic link issues — organizers are keyed
+by email, so the two flows share accounts and are interchangeable per user.
+Magic-link login is replaced while SSO is active (`POST /api/auth/request-link`
+answers `409` with the SSO login URL); sessions themselves are
+provider-independent, so `/api/auth/me` keeps working the same way. Unset the
+OIDC config and magic links return as the default flow.
+
+Two things to check on the provider side: the ID token must carry an `email`
+claim with `email_verified: true` (huddle is strict about this, since organizer
+identity is the email), and the provider must support the authorization-code
+flow — huddle always sends a PKCE `S256` challenge and a `nonce`, and only
+accepts asymmetric signature algorithms (RS/ES/PS families) from its JWKS.
 
 ### Docker / Kubernetes
 

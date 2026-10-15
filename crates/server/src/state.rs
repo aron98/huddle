@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 
 use crate::config::Config;
 use crate::engine::EngineHandle;
-use crate::identity::MagicLinkIdentityProvider;
+use crate::identity::{Identity, MagicLinkIdentityProvider, OidcIdentityProvider};
 use crate::ratelimit::RateLimiter;
 
 /// Shared application state, cheap to clone into handlers.
@@ -18,7 +18,10 @@ pub struct Inner {
     pub config: Arc<Config>,
     pub pool: SqlitePool,
     pub engine: EngineHandle,
-    pub identity: MagicLinkIdentityProvider,
+    /// The configured identity flow: magic links by default, OIDC SSO
+    /// when `[oidc]` is set. Concrete enum, not a trait object — the
+    /// `IdentityProvider` trait is async-fn-in-trait and not dyn-safe.
+    pub identity: Identity,
     /// HMAC key for session cookies. Random per boot unless
     /// `session_secret` is configured.
     pub session_key: Vec<u8>,
@@ -28,11 +31,25 @@ pub struct Inner {
 }
 
 impl AppState {
-    pub fn new(config: Arc<Config>, pool: SqlitePool, engine: EngineHandle) -> Self {
-        let identity = MagicLinkIdentityProvider::new(
-            pool.clone(),
-            time::Duration::minutes(i64::from(config.login_token_ttl_min)),
-        );
+    pub fn new(
+        config: Arc<Config>,
+        pool: SqlitePool,
+        engine: EngineHandle,
+    ) -> anyhow::Result<Self> {
+        // Magic-link TTL doubles as the OIDC login-state TTL: both are
+        // the "how long may this sign-in attempt live" knob.
+        let identity = match &config.oidc {
+            Some(oidc) => Identity::Oidc(Box::new(OidcIdentityProvider::new(
+                pool.clone(),
+                oidc,
+                &config.base_url,
+                time::Duration::minutes(i64::from(config.login_token_ttl_min)),
+            )?)),
+            None => Identity::MagicLinks(MagicLinkIdentityProvider::new(
+                pool.clone(),
+                time::Duration::minutes(i64::from(config.login_token_ttl_min)),
+            )),
+        };
         let session_key = match &config.session_secret {
             Some(secret) => secret.as_bytes().to_vec(),
             None => {
@@ -44,7 +61,7 @@ impl AppState {
             }
         };
         let rate_limiter = RateLimiter::new(config.rate_limit_per_min, Duration::from_secs(60));
-        Self {
+        Ok(Self {
             inner: Arc::new(Inner {
                 config,
                 pool,
@@ -53,7 +70,7 @@ impl AppState {
                 session_key,
                 rate_limiter,
             }),
-        }
+        })
     }
 
     pub fn config(&self) -> &Config {
@@ -68,7 +85,7 @@ impl AppState {
         &self.inner.engine
     }
 
-    pub fn identity(&self) -> &MagicLinkIdentityProvider {
+    pub fn identity(&self) -> &Identity {
         &self.inner.identity
     }
 
