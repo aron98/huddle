@@ -60,6 +60,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
     let sharing = RwSignal::new(false);
+    // Consent UX: true while the organizer records the meeting, told to
+    // us by the Welcome (late joiners) and Recording messages.
+    let recording = RwSignal::new(false);
     // Transient in-call notices (e.g. a denied screen-share picker).
     let status = RwSignal::<Option<String>>::new(None);
     // The live session's action inbox, present only between a
@@ -77,6 +80,7 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
             mic_on,
             cam_on,
             sharing,
+            recording,
             status,
             ui_tx_slot,
         };
@@ -112,6 +116,7 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
                         mic_on=mic_on
                         cam_on=cam_on
                         sharing=sharing
+                        recording=recording
                         status=status
                         ui_tx_slot=ui_tx_slot
                     />
@@ -139,6 +144,7 @@ struct SessionSignals {
     mic_on: RwSignal<bool>,
     cam_on: RwSignal<bool>,
     sharing: RwSignal<bool>,
+    recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
 }
@@ -258,6 +264,8 @@ async fn run_session(
         return;
     }
     signals.roster.set(client.roster().to_vec());
+    // The Welcome says whether the meeting is already being recorded.
+    signals.recording.set(client.recording());
     if let Some(meeting) = client.meeting() {
         signals.prejoin.meeting.set(Some(meeting.clone()));
     }
@@ -364,6 +372,7 @@ async fn run_session(
                     signals.roster.set(client.roster().to_vec());
                     signals.speaking.set(client.speaking().clone());
                     signals.chat.set(client.chat_log().to_vec());
+                    signals.recording.set(client.recording());
                 }
                 Err(e) => {
                     signals.connection_lost(e.to_string());
@@ -522,6 +531,7 @@ fn CallView(
     mic_on: RwSignal<bool>,
     cam_on: RwSignal<bool>,
     sharing: RwSignal<bool>,
+    recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
 ) -> impl IntoView {
@@ -617,6 +627,19 @@ fn CallView(
                     <span class="on-air-dot" aria-hidden="true"></span>
                     "ON AIR"
                 </span>
+                {move || recording.get().then(|| view! {
+                    // Consent UX: a visible badge the whole time the
+                    // organizer records, so nobody is silently recorded.
+                    <span
+                        class="recording-indicator"
+                        data-testid="recording-indicator"
+                        role="status"
+                        title="This meeting is being recorded"
+                    >
+                        <span class="recording-dot" aria-hidden="true"></span>
+                        "REC"
+                    </span>
+                })}
                 <p class="call-title">{meeting_title}</p>
                 {move || {
                     status
