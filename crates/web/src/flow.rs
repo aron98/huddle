@@ -82,9 +82,11 @@ impl JoinError {
                 ErrorCode::MeetingCancelled => JoinError::Cancelled,
                 ErrorCode::NameTaken => JoinError::NameTaken,
                 ErrorCode::CapacityReached => JoinError::Full,
-                ErrorCode::InvalidMessage | ErrorCode::Internal | ErrorCode::Unauthorized => {
-                    JoinError::Server(server.message.clone())
-                }
+                ErrorCode::InvalidMessage
+                | ErrorCode::Internal
+                | ErrorCode::Unauthorized
+                | ErrorCode::RecordingActive
+                | ErrorCode::MeetingNotLive => JoinError::Server(server.message.clone()),
             },
             // A transport error before the Welcome means the handshake
             // never completed: the server is unreachable from here.

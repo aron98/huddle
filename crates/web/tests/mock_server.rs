@@ -90,6 +90,7 @@ impl MockState {
                         username: Some("huddle".into()),
                         credential: Some("secret".into()),
                     }],
+                    recording: false,
                 }]
             }
             ClientMessage::SdpOffer { .. } => vec![
