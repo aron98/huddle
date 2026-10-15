@@ -20,6 +20,15 @@ pub enum TrackKind {
     Screen,
 }
 
+/// A simulcast layer a receiver wants for a camera track. The focused tile
+/// subscribes to the highest layer; everything else takes the low one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoLayer {
+    Low,
+    High,
+}
+
 /// A participant as shown in the roster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
@@ -118,6 +127,13 @@ pub enum ClientMessage {
     /// incoming screen m-line apart from the camera one.
     Sharing {
         sharing: bool,
+    },
+    /// Pick the simulcast layer to receive for another participant's camera
+    /// track (focused tile → high, unfocused → low). Ignored for audio and
+    /// single-layer screen shares.
+    LayerPreference {
+        origin: ParticipantId,
+        layer: VideoLayer,
     },
     /// Graceful leave; the socket closing implies the same.
     Leave,
@@ -301,6 +317,32 @@ mod tests {
         assert_eq!(v, json!({"type": "sdp_offer", "sdp": "v=0 offer"}));
         let back: ServerMessage = serde_json::from_value(v).unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn layer_preference_round_trips() {
+        let msg = ClientMessage::LayerPreference {
+            origin: Uuid::nil(),
+            layer: VideoLayer::High,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "layer_preference",
+                "origin": Uuid::nil().to_string(),
+                "layer": "high",
+            })
+        );
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+
+        let msg = ClientMessage::LayerPreference {
+            origin: Uuid::nil(),
+            layer: VideoLayer::Low,
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["layer"], "low");
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
     }
 
     #[test]
