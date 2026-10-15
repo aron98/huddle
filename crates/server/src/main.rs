@@ -14,6 +14,7 @@ mod metrics;
 #[cfg(test)]
 mod oidc_test_idp;
 mod ratelimit;
+mod recording;
 mod session;
 mod state;
 
