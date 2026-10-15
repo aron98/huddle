@@ -4,13 +4,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
+use huddle_protocol::VideoLayer;
 use huddle_sfu::{PeerId, Room, SfuError, SfuOutput};
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
-use str0m::media::{Direction, MediaKind, MediaTime};
+use str0m::media::{Direction, MediaKind, MediaTime, Rid, Simulcast, SimulcastLayer};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
@@ -31,6 +33,10 @@ struct TestClient {
     mid: str0m::media::Mid,
     connected: bool,
     media_rx: usize,
+    /// Frames received, keyed by the first payload byte. Simulcast tests
+    /// tag each layer's frames with a distinct marker byte to assert
+    /// per-subscriber routing.
+    media_rx_markers: HashMap<u8, usize>,
     /// Every renegotiation offer the room sent us (for msid assertions).
     server_offers: Vec<String>,
 }
@@ -58,6 +64,7 @@ impl TestClient {
             mid,
             connected: false,
             media_rx: 0,
+            media_rx_markers: HashMap::new(),
             server_offers: Vec::new(),
         }
     }
@@ -92,6 +99,54 @@ impl TestClient {
         let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
         self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
         mid
+    }
+
+    /// Add a simulcast camera m-line with three send layers ("high",
+    /// "mid", "low" in the sender's encoding order, highest quality
+    /// first) and offer it to the room, as a browser configured with
+    /// RtpSender encodings does.
+    fn publish_simulcast_camera(&mut self, room: &mut Room) -> str0m::media::Mid {
+        let mut simulcast = Simulcast::new();
+        simulcast.add_send_layer(SimulcastLayer::new("high"));
+        simulcast.add_send_layer(SimulcastLayer::new("mid"));
+        simulcast.add_send_layer(SimulcastLayer::new("low"));
+        let mut changes = self.rtc.sdp_api();
+        let mid = changes.add_media(
+            MediaKind::Video,
+            Direction::SendRecv,
+            None,
+            None,
+            Some(simulcast),
+        );
+        let (offer, pending) = changes.apply().unwrap();
+        let answer = room
+            .answer_sdp_offer(self.id, &offer.to_sdp_string())
+            .unwrap();
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        mid
+    }
+
+    /// Send `n` vp8 frames on one simulcast layer (`rid`), every payload
+    /// starting with `marker` so the receiver can tell layers apart.
+    fn send_simulcast_frames(&mut self, mid: str0m::media::Mid, rid: &str, marker: u8, n: usize) {
+        let pt = self
+            .rtc
+            .codec_config()
+            .iter()
+            .find(|p| p.spec().codec == Codec::Vp8)
+            .unwrap()
+            .pt();
+        for i in 0..n {
+            let time = MediaTime::from_millis(20 * i as u64);
+            let data = vec![marker; 120];
+            self.rtc
+                .writer(mid)
+                .unwrap()
+                .rid(Rid::from(rid))
+                .write(pt, Instant::now(), time, data)
+                .unwrap();
+        }
     }
 
     /// Flip the screen m-line's direction, as removeTrack (stop) and a
@@ -171,6 +226,18 @@ fn drive(
     panic!("drive loop timed out after {DRIVE_BUDGET:?}");
 }
 
+/// Pump for a fixed wall-clock window. str0m paces RTP emission against
+/// real time, so frames written now only surface over time — strict
+/// count assertions need a settled window. Windows over one second also
+/// age the SFU's 1s keyframe-request throttle, making layer-switch
+/// keyframe counts deterministic.
+fn drain(room: &mut Room, clients: &mut [&mut TestClient], window: Duration) {
+    let start = Instant::now();
+    while start.elapsed() < window {
+        step(room, clients);
+    }
+}
+
 /// One iteration: poll the room, wire its outputs to clients, poll the
 /// clients, wire their outputs back, advance time everywhere.
 fn step(room: &mut Room, clients: &mut [&mut TestClient]) {
@@ -212,7 +279,12 @@ fn step(room: &mut Room, clients: &mut [&mut TestClient]) {
                 Ok(Output::Timeout(_)) => break,
                 Ok(Output::Event(e)) => match e {
                     Event::Connected => client.connected = true,
-                    Event::MediaData(_) => client.media_rx += 1,
+                    Event::MediaData(d) => {
+                        client.media_rx += 1;
+                        if let Some(&marker) = d.data.first() {
+                            *client.media_rx_markers.entry(marker).or_insert(0) += 1;
+                        }
+                    }
                     _ => {}
                 },
                 Err(_) => break,
@@ -666,4 +738,193 @@ fn stopping_a_share_winds_down_subscribers_and_reshare_reopens() {
     drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, cs| {
         cs[1].media_rx > before
     });
+}
+
+/// Simulcast markers: one byte per layer, first payload byte on the wire.
+const HIGH: u8 = 0xC1;
+const MID: u8 = 0xC2;
+const LOW: u8 = 0xC3;
+/// Long enough for frames written now to surface and for the SFU's 1s
+/// keyframe-request throttle to age out.
+const SETTLE: Duration = Duration::from_millis(1200);
+
+#[test]
+fn simulcast_routes_the_subscribers_chosen_layer() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+
+    // b gets two outgoing tracks: a's audio and a's simulcast camera.
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+
+    // All three layers flow; a subscriber on the default (low) layer
+    // only sees the low rid.
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "mid", MID, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(b.media_rx_markers.get(&LOW).is_some_and(|n| *n > 0));
+    assert!(!b.media_rx_markers.contains_key(&HIGH), "high layer leaked");
+    assert!(!b.media_rx_markers.contains_key(&MID), "mid layer leaked");
+
+    // A layer switch asks the origin for a keyframe on the newly chosen
+    // rid, throttled per layer: the request lands once, an immediate
+    // repeat is a no-op.
+    let before = room.peer_stats(a_id).unwrap().keyframes_requested;
+    room.set_layer_preference(b_id, a_id, VideoLayer::High)
+        .unwrap();
+    let after_switch = room.peer_stats(a_id).unwrap().keyframes_requested;
+    assert_eq!(
+        after_switch,
+        before + 1,
+        "no keyframe on the switched-to layer"
+    );
+    room.set_layer_preference(b_id, a_id, VideoLayer::High)
+        .unwrap();
+    assert_eq!(
+        room.peer_stats(a_id).unwrap().keyframes_requested,
+        after_switch,
+        "repeat preference was not throttled"
+    );
+
+    // b now receives the high layer instead of the low one.
+    let (low_before, high_before) = (
+        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
+        b.media_rx_markers.get(&HIGH).copied().unwrap_or(0),
+    );
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers
+            .get(&HIGH)
+            .is_some_and(|n| *n > high_before),
+        "high layer did not flow after the switch"
+    );
+    assert_eq!(
+        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
+        low_before,
+        "low layer still flowed after switching away"
+    );
+
+    // Switching back to low fires on the low rid's own throttle bucket.
+    let before = room.peer_stats(a_id).unwrap().keyframes_requested;
+    room.set_layer_preference(b_id, a_id, VideoLayer::Low)
+        .unwrap();
+    assert_eq!(
+        room.peer_stats(a_id).unwrap().keyframes_requested,
+        before + 1,
+        "switching to low did not request a keyframe"
+    );
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers
+            .get(&LOW)
+            .is_some_and(|n| *n > low_before + 1),
+        "low layer did not flow after switching back"
+    );
+}
+
+#[test]
+fn late_joiners_start_on_the_low_layer() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (_a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+
+    // c joins after the camera is already flowing. It replays every
+    // existing track: a's audio and camera plus b's audio.
+    let mut c = TestClient::new(3);
+    c.join(&mut room);
+    let c_id = c.id;
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, cs| {
+        cs[2].connected && r.peer_tracks(c_id) == Some((1, 3))
+    });
+
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "mid", MID, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b, &mut c], SETTLE);
+    assert!(c.media_rx_markers.get(&LOW).is_some_and(|n| *n > 0));
+    assert!(
+        !c.media_rx_markers.contains_key(&HIGH),
+        "late joiner received the high layer"
+    );
+    assert!(
+        !c.media_rx_markers.contains_key(&MID),
+        "late joiner received the mid layer"
+    );
+}
+
+#[test]
+fn screen_shares_ignore_layer_preferences() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    // Let the camera m-line surface on the SFU before arming the share:
+    // MediaAdded fires on poll, and the screen_pending heuristic tags the
+    // *next* remote video m-line — without this drive the camera would be
+    // misclassified as the screen (in production the camera always lands
+    // in the initial offer, long before any Sharing announcement).
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(a_id).is_some_and(|(i, _)| i == 2)
+    });
+    room.set_sharing(a_id, true).unwrap();
+    let screen = a.share_screen(&mut room);
+
+    // b's outgoing tracks: a's audio, camera and screen.
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 3))
+    });
+
+    // Screen frames flow regardless of the camera's layer preference.
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    a.send_screen_frames(screen, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    let (screen_before, low_before) = (
+        b.media_rx_markers.get(&0x22).copied().unwrap_or(0),
+        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
+    );
+    assert!(screen_before > 0, "screen frames did not flow");
+
+    // Focusing (high layer) must not touch the single-layer screen.
+    room.set_layer_preference(b_id, a_id, VideoLayer::High)
+        .unwrap();
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    a.send_screen_frames(screen, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers.get(&HIGH).is_some_and(|n| *n > 0),
+        "high layer did not flow after the preference"
+    );
+    assert!(
+        b.media_rx_markers
+            .get(&0x22)
+            .is_some_and(|n| *n > screen_before),
+        "screen frames were affected by the layer preference"
+    );
+    assert_eq!(
+        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
+        low_before,
+        "low layer still flowed after switching away"
+    );
 }
