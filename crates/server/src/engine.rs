@@ -15,12 +15,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use huddle_protocol::{ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage};
-use huddle_sfu::{Room, SfuOutput};
+use huddle_sfu::{RecorderSink, Room, SfuOutput};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -119,6 +120,20 @@ pub enum EngineCommand {
         id: Uuid,
         sharing: bool,
     },
+    /// Begin recording a meeting with the given sink. Fails with
+    /// [`ErrorCode::MeetingNotLive`] when nobody is in the room and
+    /// [`ErrorCode::RecordingActive`] when a recording is running.
+    StartRecording {
+        code: String,
+        recorder: Arc<dyn RecorderSink>,
+        reply: oneshot::Sender<Result<(), ErrorCode>>,
+    },
+    /// Stop the recording on a meeting (idempotent; a second stop is
+    /// `Ok`). Dropping the sink is what finalizes the files.
+    StopRecording {
+        code: String,
+        reply: oneshot::Sender<Result<(), ErrorCode>>,
+    },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
     /// Collect a snapshot of rooms and peer stats (the `/metrics` pull).
@@ -197,6 +212,31 @@ impl EngineHandle {
         let _ = self.tx.send(EngineCommand::Sharing { code, id, sharing });
     }
 
+    /// Install a recording sink on the meeting's live room.
+    pub fn start_recording(
+        &self,
+        code: String,
+        recorder: Arc<dyn RecorderSink>,
+    ) -> oneshot::Receiver<Result<(), ErrorCode>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(EngineCommand::StartRecording {
+            code,
+            recorder,
+            reply: reply_tx,
+        });
+        reply_rx
+    }
+
+    /// Stop the meeting's recording, finalizing the sink's files.
+    pub fn stop_recording(&self, code: String) -> oneshot::Receiver<Result<(), ErrorCode>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self.tx.send(EngineCommand::StopRecording {
+            code,
+            reply: reply_tx,
+        });
+        reply_rx
+    }
+
     pub fn leave(&self, code: String, id: Uuid) {
         let _ = self.tx.send(EngineCommand::Leave { code, id });
     }
@@ -220,6 +260,11 @@ struct MeetingInstance {
     participants: HashMap<Uuid, Participant>,
     outs: HashMap<Uuid, UnboundedSender<ServerMessage>>,
     names: HashSet<String>,
+    /// The recording sink, when a recording is running. Held here AND
+    /// inside the room: when the instance is dropped (last leave, or
+    /// explicit stop clears it) the last `Arc` goes away, which is
+    /// what tears the writer thread down and finalizes the files.
+    recorder: Option<Arc<dyn RecorderSink>>,
 }
 
 impl MeetingInstance {
@@ -229,7 +274,12 @@ impl MeetingInstance {
             participants: HashMap::new(),
             outs: HashMap::new(),
             names: HashSet::new(),
+            recorder: None,
         }
+    }
+
+    fn recording(&self) -> bool {
+        self.recorder.is_some()
     }
 }
 
@@ -444,6 +494,16 @@ impl Engine {
             EngineCommand::Sharing { code, id, sharing } => {
                 self.set_sharing(&code, id, sharing);
             }
+            EngineCommand::StartRecording {
+                code,
+                recorder,
+                reply,
+            } => {
+                self.start_recording(&code, recorder, reply);
+            }
+            EngineCommand::StopRecording { code, reply } => {
+                self.stop_recording(&code, reply);
+            }
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Stats { reply } => {
                 let _ = reply.send(self.collect_stats());
@@ -541,6 +601,7 @@ impl Engine {
             meeting,
             roster,
             ice_servers: self.ice_servers.clone(),
+            recording: inst.recording(),
         });
 
         let joined = ServerMessage::ParticipantJoined { participant };
@@ -664,6 +725,56 @@ impl Engine {
         for out in inst.outs.values() {
             let _ = out.send(msg.clone());
         }
+    }
+
+    /// Install a recording sink on a live room and announce it. Nobody
+    /// in the room yet → [`ErrorCode::MeetingNotLive`]; already
+    /// recording → [`ErrorCode::RecordingActive`]. The sink lives in
+    /// the meeting instance (and the room): when the last participant
+    /// leaves, the instance — and with it the sink — is dropped, which
+    /// stops the recording without anybody asking. Fail-open: nothing
+    /// in the media path ever depends on the sink behaving.
+    fn start_recording(
+        &mut self,
+        code: &str,
+        recorder: Arc<dyn RecorderSink>,
+        reply: oneshot::Sender<Result<(), ErrorCode>>,
+    ) {
+        let code = normalize_code(code);
+        let Some(inst) = self.meetings.get_mut(&code) else {
+            let _ = reply.send(Err(ErrorCode::MeetingNotLive));
+            return;
+        };
+        if inst.recorder.is_some() {
+            let _ = reply.send(Err(ErrorCode::RecordingActive));
+            return;
+        }
+        inst.room.set_recorder(Some(recorder.clone()));
+        inst.recorder = Some(recorder);
+        let msg = ServerMessage::Recording { active: true };
+        for out in inst.outs.values() {
+            let _ = out.send(msg.clone());
+        }
+        let _ = reply.send(Ok(()));
+    }
+
+    /// Stop the recording on a live room and announce it. Idempotent:
+    /// stopping an unrecorded room is still `Ok`. Stopping a room that
+    /// is not live is [`ErrorCode::MeetingNotLive`] — the empty-room
+    /// lifecycle already tore the recorder down in that case.
+    fn stop_recording(&mut self, code: &str, reply: oneshot::Sender<Result<(), ErrorCode>>) {
+        let code = normalize_code(code);
+        let Some(inst) = self.meetings.get_mut(&code) else {
+            let _ = reply.send(Err(ErrorCode::MeetingNotLive));
+            return;
+        };
+        inst.room.set_recorder(None);
+        inst.recorder = None; // dropping the Arc tears down the writer
+        let msg = ServerMessage::Recording { active: false };
+        for out in inst.outs.values() {
+            let _ = out.send(msg.clone());
+        }
+        let _ = reply.send(Ok(()));
     }
 
     /// Remove a participant: from the room, the roster, and the session
@@ -1035,5 +1146,131 @@ mod tests {
             report.rooms.is_empty(),
             "room should be gone after everyone left: {report:?}"
         );
+    }
+
+    // --- recording lifecycle ----------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use huddle_sfu::{RecordedFrame, RecorderSink};
+
+    /// A sink that only reports when its last reference went away —
+    /// which is exactly the auto-stop-on-empty signal.
+    #[derive(Default)]
+    struct DropSpy {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl RecorderSink for DropSpy {
+        fn record(&self, _frame: RecordedFrame) {}
+    }
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn recording_broadcasts_state_and_late_joiner_sees_the_flag() {
+        let (engine, _keep) = test_engine(8);
+        let (_alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        next(&mut alice_rx).await; // alice welcome
+        next(&mut bob_rx).await; // bob welcome
+        next(&mut alice_rx).await; // bob joined
+
+        // Start: everyone in the room is told at once.
+        engine
+            .start_recording("ABCD-EFGH-JKLM".into(), Arc::new(DropSpy::default()))
+            .await
+            .expect("engine alive")
+            .expect("start accepted");
+        for rx in [&mut alice_rx, &mut bob_rx] {
+            let msg = next(rx).await;
+            let ServerMessage::Recording { active } = msg else {
+                panic!("expected recording, got {msg:?}");
+            };
+            assert!(active);
+        }
+
+        // One recording at a time.
+        let second = engine
+            .start_recording("ABCD-EFGH-JKLM".into(), Arc::new(DropSpy::default()))
+            .await
+            .expect("engine alive");
+        assert_eq!(second.unwrap_err(), ErrorCode::RecordingActive);
+
+        // A late joiner's Welcome announces the recording.
+        let (_carol, mut carol_rx) = join(&engine, "ABCD-EFGH-JKLM", "carol").await;
+        let welcome = next(&mut carol_rx).await;
+        let ServerMessage::Welcome { recording, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        assert!(recording, "late joiner must know the meeting is recorded");
+        next(&mut alice_rx).await; // carol joined
+        next(&mut bob_rx).await; // carol joined
+
+        // Stop: the state is broadcast to everyone, including carol.
+        engine
+            .stop_recording("ABCD-EFGH-JKLM".into())
+            .await
+            .expect("engine alive")
+            .expect("stop accepted");
+        for rx in [&mut alice_rx, &mut bob_rx, &mut carol_rx] {
+            let msg = next(rx).await;
+            let ServerMessage::Recording { active } = msg else {
+                panic!("expected recording, got {msg:?}");
+            };
+            assert!(!active);
+        }
+
+        // Stopping again is fine (idempotent); stopping a meeting that
+        // is not live is a `MeetingNotLive` refusal.
+        engine
+            .stop_recording("ABCD-EFGH-JKLM".into())
+            .await
+            .expect("engine alive")
+            .expect("second stop accepted");
+        let refused = engine
+            .stop_recording("ZZZZ-ZZZZ-ZZZZ".into())
+            .await
+            .expect("engine alive");
+        assert_eq!(refused.unwrap_err(), ErrorCode::MeetingNotLive);
+    }
+
+    #[tokio::test]
+    async fn recording_stops_when_the_meeting_empties() {
+        let (engine, _keep) = test_engine(8);
+        let (alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        next(&mut alice_rx).await; // welcome
+
+        let spy = Arc::new(DropSpy::default());
+        let dropped = spy.dropped.clone();
+        engine
+            .start_recording("ABCD-EFGH-JKLM".into(), spy)
+            .await
+            .expect("engine alive")
+            .expect("start accepted");
+        next(&mut alice_rx).await; // recording started
+
+        // The last leave must tear the recorder down all by itself.
+        engine.leave("ABCD-EFGH-JKLM".into(), alice);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !dropped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the sink must be dropped when the room empties"
+        );
+
+        // The room is gone; recording it again is refused.
+        let refused = engine
+            .start_recording("ABCD-EFGH-JKLM".into(), Arc::new(DropSpy::default()))
+            .await
+            .expect("engine alive");
+        assert_eq!(refused.unwrap_err(), ErrorCode::MeetingNotLive);
     }
 }

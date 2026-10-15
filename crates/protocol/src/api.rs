@@ -69,6 +69,31 @@ pub struct MeetingResponse {
     pub joinability: Joinability,
 }
 
+/// A recording of one meeting, as tracked by the scheduling API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RecordingDto {
+    pub id: Uuid,
+    pub meeting_id: Uuid,
+    /// The organizer who started the recording; `None` for meetings without
+    /// an organizer (anonymous owner path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<Uuid>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub stopped_at: Option<OffsetDateTime>,
+    /// Total bytes written to disk once finalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// True between start and stop.
+    pub active: bool,
+}
+
 /// Error envelope for all REST endpoints: `{"error": {"code", "message"}}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
