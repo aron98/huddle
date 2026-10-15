@@ -541,6 +541,7 @@ impl Engine {
             meeting,
             roster,
             ice_servers: self.ice_servers.clone(),
+            recording: false,
         });
 
         let joined = ServerMessage::ParticipantJoined { participant };

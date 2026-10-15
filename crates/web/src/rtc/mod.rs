@@ -73,6 +73,8 @@ pub struct RtcClient<S, P> {
     chat_log: Vec<ChatMessage>,
     /// Participants the server last reported as speaking.
     speaking: HashSet<ParticipantId>,
+    /// Whether the meeting is currently being recorded (consent indicator).
+    recording: bool,
 }
 
 impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
@@ -86,6 +88,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             meeting: None,
             chat_log: Vec::new(),
             speaking: HashSet::new(),
+            recording: false,
         }
     }
 
@@ -113,6 +116,11 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
     /// Participants the server currently reports as speaking.
     pub fn speaking(&self) -> &HashSet<ParticipantId> {
         &self.speaking
+    }
+
+    /// Whether the meeting is currently being recorded.
+    pub fn recording(&self) -> bool {
+        self.recording
     }
 
     /// Mutable access to the peer connection, e.g. to attach local media
@@ -147,6 +155,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     meeting,
                     roster,
                     ice_servers,
+                    recording,
                 } => {
                     if protocol_version != PROTOCOL_VERSION {
                         self.state = SessionState::Closed;
@@ -160,6 +169,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     self.you = Some(you);
                     self.meeting = Some(meeting);
                     self.roster = roster;
+                    self.recording = recording;
                     self.state = SessionState::InCall;
                     return Ok(());
                 }
@@ -311,6 +321,10 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 if let Some(p) = self.roster.iter_mut().find(|p| p.id == id) {
                     p.sharing = sharing;
                 }
+                Ok(())
+            }
+            ServerMessage::Recording { active } => {
+                self.recording = active;
                 Ok(())
             }
             ServerMessage::Error { code, message } => {

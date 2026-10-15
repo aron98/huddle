@@ -67,6 +67,10 @@ pub enum ErrorCode {
     Unauthorized,
     InvalidMessage,
     Internal,
+    /// A recording is already running for this meeting.
+    RecordingActive,
+    /// The meeting has no live session to record (nobody has joined).
+    MeetingNotLive,
 }
 
 /// Client → server messages.
@@ -131,13 +135,18 @@ pub enum ClientMessage {
     rename_all_fields = "snake_case"
 )]
 pub enum ServerMessage {
-    /// Answer to `Join`: who you are, where you landed, who else is there.
+    /// Answer to `Join`: who you are, where you landed, who else is there,
+    /// and whether the meeting is currently being recorded (consent).
     Welcome {
         protocol_version: u32,
         you: Participant,
         meeting: crate::api::MeetingDto,
         roster: Vec<Participant>,
         ice_servers: Vec<IceServer>,
+        /// `#[serde(default)]` keeps this additive for peers that predate
+        /// recording support.
+        #[serde(default)]
+        recording: bool,
     },
     ParticipantJoined {
         participant: Participant,
@@ -180,6 +189,11 @@ pub enum ServerMessage {
     Sharing {
         id: ParticipantId,
         sharing: bool,
+    },
+    /// Broadcast when the organizer starts or stops a recording, so every
+    /// participant knows the meeting is being recorded (consent indicator).
+    Recording {
+        active: bool,
     },
     Error {
         code: ErrorCode,
@@ -245,6 +259,7 @@ mod tests {
             },
             roster: vec![],
             ice_servers: vec![],
+            recording: false,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "welcome");
@@ -301,6 +316,43 @@ mod tests {
         assert_eq!(v, json!({"type": "sdp_offer", "sdp": "v=0 offer"}));
         let back: ServerMessage = serde_json::from_value(v).unwrap();
         assert_eq!(back, msg);
+    }
+
+    #[test]
+    fn recording_round_trips_and_defaults() {
+        let msg = ServerMessage::Recording { active: true };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "recording", "active": true}));
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+
+        // The `recording` flag on `Welcome` is additive: old payloads
+        // (without it) still parse, as false.
+        let legacy = json!({
+            "type": "welcome",
+            "protocol_version": 1,
+            "you": {
+                "id": Uuid::nil().to_string(),
+                "name": "alice",
+                "audio_muted": false,
+                "video_muted": false,
+                "sharing": false,
+            },
+            "meeting": {
+                "id": Uuid::nil().to_string(),
+                "code": "H7KD-PM2X-QR4T",
+                "title": "Standup",
+                "starts_at": "1970-01-01T00:00:00Z",
+                "ends_at": "1970-01-01T00:00:00Z",
+                "cancelled": false,
+            },
+            "roster": [],
+            "ice_servers": [],
+        });
+        let back: ServerMessage = serde_json::from_value(legacy).unwrap();
+        let ServerMessage::Welcome { recording, .. } = back else {
+            panic!("expected welcome");
+        };
+        assert!(!recording);
     }
 
     #[test]
