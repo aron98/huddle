@@ -356,9 +356,9 @@ impl BrowserPeerConnection {
         }
     }
 
-    /// Publish the camera with three simulcast encodings: full resolution
-    /// (the 1280x720 class), half (640x360) and a quarter (320x180),
-    /// rids ordered high → low to mirror the SFU's layer convention.
+    /// Publish the camera as two simulcast layers: full resolution (the
+    /// high layer) and a quarter-scale thumbnail (the low layer), rids
+    /// ordered high → low to mirror the SFU's layer convention.
     ///
     /// Rids are fixed at transceiver creation: `setParameters` treats
     /// `rid` as read-only (Chrome rejects any attempt with
@@ -368,12 +368,21 @@ impl BrowserPeerConnection {
     /// mutable knob. Screen shares never go through here — they stay
     /// single-layer.
     ///
+    /// Two layers, tightly budgeted: Chrome allocates simulcast
+    /// bandwidth top-down and reliably activates only the first two
+    /// encodings — a third layer sits at zero bytes forever (observed
+    /// with 500/200/100 kbps caps: high and mid consumed the whole
+    /// estimate, low never encoded a frame), which starves every
+    /// subscriber the SFU defaults onto the low layer. With two layers
+    /// the low layer is always among the active ones, so late joiners
+    /// and unfocused tiles keep a live picture.
+    ///
     /// A `setParameters` rejection is non-fatal: the layers keep their
     /// creation-time scale factors and the SFU simply forwards whatever
     /// arrives.
     async fn publish_camera(&self, track: &MediaStreamTrack, stream: &MediaStream) {
         let encodings = js_sys::Array::new();
-        for (rid, scale) in [("high", 1.0_f32), ("mid", 2.0), ("low", 4.0)] {
+        for (rid, scale) in [("high", 1.0_f32), ("low", 4.0)] {
             let encoding = RtcRtpEncodingParameters::new();
             encoding.set_rid(rid);
             encoding.set_active(true);
@@ -391,16 +400,22 @@ impl BrowserPeerConnection {
             .add_transceiver_with_media_stream_track_and_init(track, &init);
         let sender = transceiver.sender();
 
-        // Tune the layer budgets via setParameters: full 1.2 Mbps, half
-        // 500 kbps, quarter 150 kbps.
+        // Tune the layer budgets via setParameters: 500 kbps for the full
+        // layer, 100 for the quarter-scale thumbnail. The tight high-layer
+        // cap leaves room for the low layer inside Chrome's top-down
+        // allocation (see the doc comment above).
+        //
+        // The encodings come back from `getParameters()` as plain JS
+        // dictionaries, not `RTCRtpEncodingParameters` interface
+        // instances, so `dyn_into` cannot cast them — the bitrates are
+        // set with `Reflect::set` on the raw values instead.
         let params = sender.get_parameters();
         if let Some(existing) = params.get_encodings() {
-            for (i, max_bitrate) in [1_200_000_u32, 500_000, 150_000].into_iter().enumerate() {
-                if let Ok(encoding) = existing
-                    .get(i as u32)
-                    .dyn_into::<RtcRtpEncodingParameters>()
-                {
-                    encoding.set_max_bitrate(max_bitrate);
+            for (i, max_bitrate) in [500_000_u32, 100_000].into_iter().enumerate() {
+                let encoding = existing.get(i as u32);
+                let name = JsValue::from("maxBitrate");
+                if js_sys::Reflect::set(&encoding, &name, &JsValue::from(max_bitrate)).is_err() {
+                    leptos::logging::warn!("simulcast encoding {i} has no maxBitrate field");
                 }
             }
             let promise = sender.set_parameters_with_parameters(&params);
