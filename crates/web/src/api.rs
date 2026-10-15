@@ -58,3 +58,30 @@ pub fn local_datetime_to_rfc3339(value: &str) -> Option<String> {
     }
     date.to_iso_string().as_string()
 }
+
+/// Render an RFC3339 UTC timestamp in the viewer's local time — used for
+/// "starts at" and "ends at" hints. Falls back to the raw string when the
+/// browser cannot parse it.
+pub fn rfc3339_to_local(value: &str) -> String {
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_str(value));
+    if date.get_time().is_nan() {
+        return value.to_owned();
+    }
+    // Invoke `toLocaleString(undefined)` through reflection: js-sys's
+    // typed wrapper only accepts a `&str` locale and Chrome rejects `""`
+    // as an invalid language tag, while `undefined` selects the viewer's
+    // own locale.
+    js_sys::Reflect::get(
+        date.as_ref(),
+        &wasm_bindgen::JsValue::from_str("toLocaleString"),
+    )
+    .ok()
+    .and_then(|method| method.dyn_into::<js_sys::Function>().ok())
+    .and_then(|method| {
+        method
+            .call1(date.as_ref(), &wasm_bindgen::JsValue::UNDEFINED)
+            .ok()
+    })
+    .and_then(|formatted| formatted.as_string())
+    .unwrap_or_else(|| value.to_owned())
+}
