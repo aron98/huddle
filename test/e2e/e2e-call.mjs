@@ -187,11 +187,12 @@ async function videoInboundSnapshot(page) {
   });
 }
 
-// Per-ssrc video decode details (decoded frames + frame width). A
-// simulcast layer switch shows as a NEW inbound ssrc: the browser
-// receives the rid-tagged layer as a fresh ssrc on the same m-line, so
-// layer routing is asserted from ssrc snapshots, never from track ids
-// (unstable provisional wrappers).
+// Per-ssrc video decode details (decoded frames + frame width). The
+// SFU forwards over one ssrc per m-line and switches which simulcast
+// rid it feeds, so a layer switch shows as a frameWidth CHANGE on the
+// SAME ssrc (fresh decodable frames), never a new ssrc. Layer routing
+// is asserted from ssrc snapshots, never from track ids (unstable
+// provisional wrappers).
 const videoDetails = (page) =>
   page.evaluate(async () => {
     const stats = await window.__huddlePc.getStats();
@@ -300,20 +301,33 @@ async function main() {
     console.log('asserting simulcast layers switch on tile focus (issue #12)');
     // Bob's only remote camera right now is alice's, so every decoding
     // video ssrc below belongs to her camera — no tile-to-ssrc mapping
-    // needed. The default subscription is the low layer: the downscaled
-    // encoding (scale 4 on the 640px fake camera → 160px wide).
-    const preFocus = await videoDetails(bob);
-    if (Object.keys(preFocus).length === 0) {
+    // needed. The SFU forwards one ssrc per m-line and switches which
+    // rid it feeds, so the layer switch is a frameWidth change on the
+    // SAME ssrc. Default subscription: the low layer (scale 4 on the
+    // 640px fake camera → 160px wide).
+    let preFocus = null;
+    await waitFor('alice’s camera to start decoding at bob', async () => {
+      preFocus = await videoDetails(bob);
+      return Object.keys(preFocus).length > 0;
+    }, 60_000).catch(async () => {
+      await stateDump(bob, 'bob').catch(() => {});
       fail(`bob: no decoding video ssrcs before the focus test: ${JSON.stringify(preFocus)}`);
+    });
+    const ssrcs = Object.keys(preFocus);
+    if (ssrcs.length !== 1) {
+      fail(`bob: expected exactly one decoding camera ssrc, got ${JSON.stringify(preFocus)}`);
     }
-    for (const [ssrc, d] of Object.entries(preFocus)) {
-      if (d.frameWidth > 320) {
-        fail(`bob: expected the low layer (<=320px) before focus, ssrc ${ssrc} is ${d.frameWidth}px`);
-      }
+    const camSsrc = ssrcs[0];
+    const lowDecodedAt = preFocus[camSsrc].framesDecoded;
+    if (preFocus[camSsrc].frameWidth > 320) {
+      fail(
+        `bob: expected the low layer (<=320px) before focus, ` +
+          `ssrc ${camSsrc} is ${preFocus[camSsrc].frameWidth}px`,
+      );
     }
 
-    // Focusing alice's tile switches bob onto the high layer: a NEW
-    // ssrc (bigger frames) appears and starts decoding fresh frames.
+    // Focusing alice's tile switches bob onto the high layer: the SAME
+    // ssrc starts delivering bigger frames.
     await bob.click('[data-testid="tile-alice"]');
     await bob
       .waitForFunction(
@@ -324,62 +338,49 @@ async function main() {
     let focusSnap = null;
     await waitFor('the high layer to arrive after focus', async () => {
       focusSnap = await videoDetails(bob);
-      return Object.entries(focusSnap).some(
-        ([ssrc, d]) => !(ssrc in preFocus) && d.frameWidth > 320 && d.framesDecoded > 0,
+      return (
+        (focusSnap[camSsrc]?.framesDecoded ?? 0) > lowDecodedAt &&
+        (focusSnap[camSsrc]?.frameWidth ?? 0) > 320
       );
     }, 60_000).catch(async () => {
       await stateDump(bob, 'bob').catch(() => {});
       fail(
-        `bob: no high-layer ssrc after focusing alice ` +
+        `bob: alice’s camera never switched to the high layer after focus ` +
           `(pre: ${JSON.stringify(preFocus)}, post: ${JSON.stringify(focusSnap)})`,
       );
     });
-    const highSsrc = Object.entries(focusSnap).find(
-      ([ssrc, d]) => !(ssrc in preFocus) && d.frameWidth > 320,
-    )[0];
-    // Fresh decodable frames: the new ssrc keeps decoding.
-    const highDecodedAt = focusSnap[highSsrc].framesDecoded;
+    // Fresh decodable frames: the high layer keeps decoding.
+    const highDecodedAt = focusSnap[camSsrc].framesDecoded;
     await delay(1000);
     const grownSnap = await videoDetails(bob);
-    if ((grownSnap[highSsrc]?.framesDecoded ?? 0) <= highDecodedAt) {
-      fail(`bob: the high-layer ssrc ${highSsrc} is not decoding fresh frames`);
+    if ((grownSnap[camSsrc]?.framesDecoded ?? 0) <= highDecodedAt) {
+      fail(`bob: the high layer on ssrc ${camSsrc} is not decoding fresh frames`);
     }
     console.log(
       `bob: focus switched alice to the high layer ` +
-        `(new ssrc ${highSsrc}, ${grownSnap[highSsrc].frameWidth}px, still decoding)`,
+        `(ssrc ${camSsrc} now ${grownSnap[camSsrc].frameWidth}px, still decoding)`,
     );
 
-    // The low-layer ssrc stops while the high one flows.
-    const lowSsrc = Object.keys(preFocus).find((s) => s !== highSsrc);
-    const lowFrozenAt = (grownSnap[lowSsrc] ?? preFocus[lowSsrc]).framesDecoded;
-
-    // Unfocusing falls back to the low layer: the high ssrc freezes and
-    // the original low ssrc resumes decoding fresh frames.
+    // Unfocusing falls back to the low layer: the same ssrc shrinks back
+    // to <=320px and resumes decoding fresh frames.
     await bob.click('[data-testid="tile-alice"]');
-    let unfocusPrev = null;
+    const unfocusBaseline = (await videoDetails(bob))[camSsrc]?.framesDecoded ?? 0;
     await waitFor('the low layer to resume after unfocus', async () => {
       const snap = await videoDetails(bob);
-      if ((snap[lowSsrc]?.framesDecoded ?? 0) <= lowFrozenAt) return false;
-      if (!unfocusPrev) {
-        unfocusPrev = snap;
-        return false;
-      }
-      // Low resumed; the high layer must be frozen (two consecutive
-      // polls half a second apart with no new decoded frames).
-      const highNow = snap[highSsrc]?.framesDecoded ?? 0;
-      const highThen = unfocusPrev[highSsrc]?.framesDecoded ?? 0;
-      unfocusPrev = snap;
-      return highNow === highThen;
+      return (
+        (snap[camSsrc]?.framesDecoded ?? 0) > unfocusBaseline &&
+        (snap[camSsrc]?.frameWidth ?? 9999) <= 320
+      );
     }, 60_000).catch(async () => {
       const snap = await videoDetails(bob);
       fail(
         `bob: the low layer never resumed after unfocus ` +
-          `(low ${lowSsrc} frozen at ${lowFrozenAt}, high ${highSsrc} at ` +
-          `${unfocusPrev?.[highSsrc]?.framesDecoded ?? 'n/a'} now ${snap[highSsrc]?.framesDecoded ?? 'n/a'}, ` +
+          `(ssrc ${camSsrc} decoded ${unfocusBaseline} at unfocus, ` +
+          `now ${snap[camSsrc]?.framesDecoded ?? 'n/a'} @ ${snap[camSsrc]?.frameWidth ?? 'n/a'}px, ` +
           `pre: ${JSON.stringify(preFocus)}, now: ${JSON.stringify(snap)})`,
       );
     });
-    console.log('bob: unfocus fell back to the low layer (ssrc resumed decoding)');
+    console.log('bob: unfocus fell back to the low layer (same ssrc, small frames resumed)');
 
     console.log('carol joins late');
     const carol = await newClient('carol');
