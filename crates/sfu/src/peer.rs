@@ -460,6 +460,15 @@ impl Peer {
         }
     }
 
+    /// The incoming track on `mid`, if this peer owns one (used by the
+    /// recording tap to resolve a frame's track kind and origin).
+    pub(crate) fn track_in(&self, mid: Mid) -> Option<&Arc<TrackIn>> {
+        self.tracks_in
+            .iter()
+            .find(|e| e.track.mid == mid)
+            .map(|e| &e.track)
+    }
+
     /// If any tracks are waiting to be opened or stopped, bundle them into
     /// a single renegotiation offer and return its SDP string.
     pub(crate) fn negotiate_if_needed(&mut self) -> Option<String> {
