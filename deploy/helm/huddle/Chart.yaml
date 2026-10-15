@@ -1,6 +1,8 @@
 apiVersion: v2
 name: huddle
 description: "Self-hosted video meetings: a single Rust binary serving web, signaling, and SFU"
+annotations:
+  licenses: Apache-2.0
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
