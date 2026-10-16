@@ -137,6 +137,9 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::Sharing { sharing } => {
                         engine.sharing(code.clone(), id, sharing);
                     }
+                    ClientMessage::LayerPreference { origin, layer } => {
+                        engine.layer_preference(code.clone(), id, origin, layer);
+                    }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;

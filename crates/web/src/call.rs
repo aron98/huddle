@@ -11,7 +11,7 @@ use crate::rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient};
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
-use huddle_protocol::{ChatMessage, MeetingDto, Participant, ServerMessage};
+use huddle_protocol::{ChatMessage, MeetingDto, Participant, ServerMessage, VideoLayer};
 use leptos::oco::Oco;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -30,6 +30,12 @@ enum UiAction {
     ShareScreen(ScreenCommand),
     Chat {
         body: String,
+    },
+    /// Focus a participant's camera tile (`Some`) or clear the focus
+    /// (`None`). Drives the simulcast layer policy: the focused origin
+    /// upgrades to the high layer, everyone else stays low.
+    Focus {
+        origin: Option<Uuid>,
     },
     Leave,
 }
@@ -60,6 +66,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
     let sharing = RwSignal::new(false);
+    // The camera tile currently focused (if any): the focused origin
+    // receives the high simulcast layer, everyone else the low one.
+    let focused = RwSignal::<Option<Uuid>>::new(None);
     // Transient in-call notices (e.g. a denied screen-share picker).
     let status = RwSignal::<Option<String>>::new(None);
     // The live session's action inbox, present only between a
@@ -112,6 +121,7 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
                         mic_on=mic_on
                         cam_on=cam_on
                         sharing=sharing
+                        focused=focused
                         status=status
                         ui_tx_slot=ui_tx_slot
                     />
@@ -242,7 +252,7 @@ async fn run_session(
         });
     }
     if let Some(local) = &local {
-        peer.attach_stream(local);
+        peer.attach_stream(local).await;
     }
 
     let mut client = RtcClient::new(signaling, peer);
@@ -439,6 +449,37 @@ async fn run_session(
                             break;
                         }
                     }
+                    UiAction::Focus { origin } => {
+                        // The simulcast layer policy: the focused origin
+                        // gets the high layer, every other camera (and
+                        // any previously focused tile) drops to low.
+                        // Screens and audio ignore the message.
+                        let you = client.you().map(|p| p.id);
+                        let preferences: Vec<(Participant, VideoLayer)> = client
+                            .roster()
+                            .iter()
+                            .filter(|p| Some(p.id) != you)
+                            .map(|p| {
+                                let layer = if origin == Some(p.id) {
+                                    VideoLayer::High
+                                } else {
+                                    VideoLayer::Low
+                                };
+                                (p.clone(), layer)
+                            })
+                            .collect();
+                        let mut failure = None;
+                        for (p, layer) in preferences {
+                            if let Err(e) = client.set_layer_preference(p.id, layer).await {
+                                failure = Some(e);
+                                break;
+                            }
+                        }
+                        if let Some(e) = failure {
+                            signals.connection_lost(e.to_string());
+                            break;
+                        }
+                    }
                     UiAction::Leave => {
                         let _ = client.leave().await;
                         signals.ui_tx_slot.set(None);
@@ -466,7 +507,9 @@ fn JoiningView() -> impl IntoView {
     }
 }
 
-/// One media tile: a `<video>` bound to `stream` with a caption.
+/// One media tile: a `<video>` bound to `stream` with a caption. Camera
+/// tiles are clickable to focus (which drives the simulcast layer
+/// policy); the local and screen tiles are not.
 #[component]
 fn VideoTile(
     stream: MediaStream,
@@ -475,6 +518,8 @@ fn VideoTile(
     testid: Oco<'static, str>,
     speaking: bool,
     screen: bool,
+    focused: bool,
+    on_click: Option<Callback<()>>,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
     Effect::new(move |_| {
@@ -484,13 +529,20 @@ fn VideoTile(
             crate::play_silently(&video);
         }
     });
-    let class = match (speaking, screen) {
-        (_, true) => "tile screen",
-        (true, false) => "tile speaking",
-        (false, false) => "tile",
+    let mut class = match (speaking, screen) {
+        (_, true) => "tile screen".to_owned(),
+        (true, false) => "tile speaking".to_owned(),
+        (false, false) => "tile".to_owned(),
     };
+    if focused {
+        class.push_str(" focused");
+    }
     view! {
-        <figure class=class data-testid=testid>
+        <figure
+            class=class
+            data-testid=testid
+            on:click=move |_| if let Some(cb) = &on_click { cb.run(()) }
+        >
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>{label}</figcaption>
         </figure>
@@ -522,6 +574,7 @@ fn CallView(
     mic_on: RwSignal<bool>,
     cam_on: RwSignal<bool>,
     sharing: RwSignal<bool>,
+    focused: RwSignal<Option<Uuid>>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
 ) -> impl IntoView {
@@ -609,6 +662,16 @@ fn CallView(
 
     let tiles_style = move || format!("--cols: {}", cols.get());
 
+    // A departed (or unfocused-away) participant must not stay focused.
+    Effect::new(move |_| {
+        let roster = roster.get();
+        if let Some(id) = focused.get_untracked()
+            && !roster.iter().any(|p| p.id == id)
+        {
+            focused.set(None);
+        }
+    });
+
     view! {
         <div class="call">
             <header class="call-header">
@@ -637,6 +700,8 @@ fn CallView(
                                     testid=Oco::from("tile-you")
                                     speaking=false
                                     screen=false
+                                    focused=false
+                                    on_click=None
                                 />
                             }
                         })}
@@ -651,11 +716,29 @@ fn CallView(
                                     None => (s.0.as_str(), false),
                                 };
                                 let base = label_for(origin, &roster.get());
+                                let id = Uuid::parse_str(origin).ok();
                                 // The speaking set is keyed by participant id, so
                                 // it tells us whose camera tile to ring.
                                 let is_speaking = !is_screen
-                                    && Uuid::parse_str(origin)
-                                        .is_ok_and(|id| speaking.get().contains(&id));
+                                    && id.is_some_and(|id| speaking.get().contains(&id));
+                                let is_focused =
+                                    !is_screen && focused.get().is_some_and(|f| Some(f) == id);
+                                // Clicking a camera tile focuses it (upgrading
+                                // that origin to the high simulcast layer);
+                                // clicking the focused tile again clears it.
+                                let on_click = if is_screen {
+                                    None
+                                } else {
+                                    Some(Callback::from(move || {
+                                        let next = if focused.get_untracked() == id {
+                                            None
+                                        } else {
+                                            id
+                                        };
+                                        focused.set(next);
+                                        send(UiAction::Focus { origin: next });
+                                    }))
+                                };
                                 let (label, testid) = if is_screen {
                                     (
                                         Oco::from(format!("{base}'s screen")),
@@ -672,6 +755,8 @@ fn CallView(
                                         testid=testid
                                         speaking=is_speaking
                                         screen=is_screen
+                                        focused=is_focused
+                                        on_click=on_click
                                     />
                                 }
                             }}

@@ -19,5 +19,5 @@ pub use api::{
 };
 pub use signaling::{
     ChatMessage, ClientMessage, ErrorCode, IceServer, Participant, ParticipantId, ServerMessage,
-    TrackKind,
+    TrackKind, VideoLayer,
 };

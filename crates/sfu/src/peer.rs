@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
+use huddle_protocol::VideoLayer;
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::media::{
     Direction, KeyframeRequest, KeyframeRequestKind, MediaData, MediaKind, Mid, Rid,
@@ -26,6 +28,10 @@ pub(crate) struct TrackIn {
     /// `"{origin}-screen"` msid and gated by the share state rather than
     /// the camera mute.
     pub screen: bool,
+    /// Negotiated simulcast rids for this track, in the sender's
+    /// encoding order (highest quality first). Empty for audio, screen
+    /// shares and non-simulcast cameras — those are forwarded as-is.
+    pub rids: Vec<Rid>,
     /// Screen tracks stop and resume without their peer dying (the
     /// sharer keeps the connection and simply stops sending). `active`
     /// gates forwarding and newcomer replay; camera/mic tracks are always
@@ -34,12 +40,13 @@ pub(crate) struct TrackIn {
 }
 
 impl TrackIn {
-    fn new(origin: PeerId, mid: Mid, kind: MediaKind, screen: bool) -> Self {
+    fn new(origin: PeerId, mid: Mid, kind: MediaKind, screen: bool, rids: Vec<Rid>) -> Self {
         Self {
             origin,
             mid,
             kind,
             screen,
+            rids,
             active: AtomicBool::new(true),
         }
     }
@@ -54,11 +61,24 @@ impl TrackIn {
     }
 }
 
+/// The rid a receiver set on `layer` should get from a track with `rids`
+/// (highest quality first). `None` means the track is not simulcast:
+/// everything is forwarded.
+pub(crate) fn chosen_rid(rids: &[Rid], layer: VideoLayer) -> Option<Rid> {
+    if rids.is_empty() {
+        return None;
+    }
+    match layer {
+        VideoLayer::High => rids.first().copied(),
+        VideoLayer::Low => rids.last().copied(),
+    }
+}
+
 /// Bookkeeping for an incoming track: the strong handle plus keyframe
-/// request throttling state.
+/// request throttling state, per simulcast rid (`None` = whole track).
 pub(crate) struct TrackInEntry {
     pub track: Arc<TrackIn>,
-    pub last_keyframe_request: Option<Instant>,
+    pub last_keyframe_request: HashMap<Option<Rid>, Instant>,
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
@@ -88,6 +108,9 @@ pub(crate) struct TrackOut {
     /// Copied from the source [`TrackIn`]: decides the msid the SFU
     /// labels this m-line with (plain origin id vs `"{origin}-screen"`).
     pub screen: bool,
+    /// The simulcast layer this receiver asked for on `origin`'s camera
+    /// (screens stay single-layer and are never filtered).
+    pub layer: VideoLayer,
     pub track_in: Weak<TrackIn>,
     pub state: TrackOutState,
 }
@@ -143,6 +166,10 @@ pub(crate) struct Peer {
     /// from this peer are not forwarded to anyone.
     audio_muted: bool,
     video_muted: bool,
+    /// Simulcast rids per incoming m-line, recorded from the client's
+    /// offers before `MediaAdded` fires (the event carries no rids, so
+    /// `TrackIn` creation reads them from here).
+    rids_by_mid: HashMap<Mid, Vec<Rid>>,
     /// Set when the client announces a screen share
     /// ([`crate::Room::set_sharing`]); the next remote video m-line is
     /// marked as the screen track. `false` is also set when a share
@@ -195,6 +222,7 @@ impl Peer {
             has_session: false,
             audio_muted: false,
             video_muted: false,
+            rids_by_mid: HashMap::new(),
             screen_pending: false,
             rx_frames: 0,
             tx_frames: 0,
@@ -232,6 +260,16 @@ impl Peer {
         sdp: &str,
     ) -> Result<(String, Vec<ScreenFlip>), SfuError> {
         let offer = SdpOffer::from_sdp_string(sdp)?;
+
+        // Record simulcast rids before accepting: MediaAdded fires later
+        // (on poll) and needs them to tag the incoming track. Screen
+        // tracks are never simulcast — leave their mids unrecorded so
+        // forwarding stays unconditional.
+        for line in &offer.media_lines {
+            if !line.rids().is_empty() {
+                self.rids_by_mid.insert(line.mid(), line.rids());
+            }
+        }
 
         // Screen tracks flip with the direction the client offers:
         // removeTrack turns the m-line recvonly, a re-share (reusing
@@ -350,6 +388,7 @@ impl Peer {
             mid_in: track_in.mid,
             kind: track_in.kind,
             screen: track_in.screen,
+            layer: VideoLayer::Low,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
@@ -397,7 +436,7 @@ impl Peer {
                 .map(|e| e.track.mid)
                 .collect();
             for mid in video_mids {
-                self.request_keyframe_throttled(mid, None, KeyframeRequestKind::Fir);
+                self.request_keyframe_all_layers_throttled(mid, KeyframeRequestKind::Fir);
             }
         }
     }
@@ -575,10 +614,15 @@ impl Peer {
                 if screen {
                     self.screen_pending = false;
                 }
-                let track = Arc::new(TrackIn::new(self.id, m.mid, m.kind, screen));
+                let rids = if screen {
+                    Vec::new()
+                } else {
+                    self.rids_by_mid.get(&m.mid).cloned().unwrap_or_default()
+                };
+                let track = Arc::new(TrackIn::new(self.id, m.mid, m.kind, screen, rids));
                 self.tracks_in.push(TrackInEntry {
                     track: Arc::clone(&track),
-                    last_keyframe_request: None,
+                    last_keyframe_request: HashMap::new(),
                 });
                 PollOutcome::TrackOpened(track)
             }
@@ -652,12 +696,36 @@ impl Peer {
             .map(|t| (t.origin, t.mid))
     }
 
+    /// Whether the frame's simulcast rid matches the layer this receiver
+    /// asked for on the outgoing track. Non-simulcast sources (audio,
+    /// screens, legacy cameras) always match.
+    fn wants_layer(&self, mid_out: Mid, data: &MediaData) -> bool {
+        let Some(out) = self
+            .tracks_out
+            .iter()
+            .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))
+        else {
+            return true;
+        };
+        let Some(track) = out.track_in.upgrade() else {
+            return true;
+        };
+        let Some(rid) = chosen_rid(&track.rids, out.layer) else {
+            return true;
+        };
+        data.rid == Some(rid)
+    }
+
     /// Forward one media frame to this peer over the outgoing `mid`.
     ///
+    /// Simulcast sources are filtered to the receiver's chosen layer.
     /// Silently drops the frame if the writer or a matching payload type is
     /// not (yet) available; a write error is propagated so the room can
     /// disconnect the peer.
     pub(crate) fn forward_media(&mut self, mid_out: Mid, data: &MediaData) -> Result<(), SfuError> {
+        if !self.wants_layer(mid_out, data) {
+            return Ok(());
+        }
         let Some(writer) = self.rtc.writer(mid_out) else {
             return Ok(());
         };
@@ -669,8 +737,8 @@ impl Peer {
         Ok(())
     }
 
-    /// Ask the source of `mid` (an incoming track on this peer) for a
-    /// keyframe, at most once per interval.
+    /// Ask the source of `mid` for a keyframe, at most once per interval
+    /// and rid.
     pub(crate) fn request_keyframe_throttled(
         &mut self,
         mid: Mid,
@@ -683,16 +751,34 @@ impl Peer {
         };
         let due = entry
             .last_keyframe_request
-            .is_none_or(|t| now.duration_since(t) >= KEYFRAME_REQUEST_INTERVAL);
+            .get(&rid)
+            .is_none_or(|t| now.duration_since(*t) >= KEYFRAME_REQUEST_INTERVAL);
         if !due {
             return;
         }
-        entry.last_keyframe_request = Some(now);
+        entry.last_keyframe_request.insert(rid, now);
         if let Some(mut writer) = self.rtc.writer(mid) {
             match writer.request_keyframe(rid, kind) {
                 Ok(()) => self.keyframes_requested += 1,
                 Err(e) => tracing::warn!("keyframe request on {mid:?} failed: {e}"),
             }
+        }
+    }
+
+    /// Ask the source of `mid` for keyframes on every simulcast layer (or
+    /// the whole track when it is not simulcast), each throttled
+    /// independently per layer.
+    pub(crate) fn request_keyframe_all_layers_throttled(
+        &mut self,
+        mid: Mid,
+        kind: KeyframeRequestKind,
+    ) {
+        let rids: Vec<Option<Rid>> = match self.tracks_in.iter().find(|e| e.track.mid == mid) {
+            Some(e) if !e.track.rids.is_empty() => e.track.rids.iter().copied().map(Some).collect(),
+            _ => vec![None],
+        };
+        for rid in rids {
+            self.request_keyframe_throttled(mid, rid, kind);
         }
     }
 
@@ -711,5 +797,41 @@ impl Peer {
         writer.request_keyframe(rid, kind)?;
         self.keyframes_requested += 1;
         Ok(())
+    }
+
+    /// Set this receiver's preferred simulcast layer for `origin`'s camera
+    /// tracks (screens and audio are never filtered). Returns the
+    /// `(origin mid, rid)` pairs a keyframe should be requested on for the
+    /// newly chosen layer — one per simulcast camera track of `origin`.
+    pub(crate) fn set_layer_preference(
+        &mut self,
+        origin: PeerId,
+        layer: VideoLayer,
+    ) -> Vec<(Mid, Rid)> {
+        let mut keyframes = Vec::new();
+        for out in self.tracks_out.iter_mut() {
+            if out.origin != origin || out.screen || !matches!(out.kind, MediaKind::Video) {
+                continue;
+            }
+            out.layer = layer;
+            if let Some(track) = out.track_in.upgrade()
+                && let Some(rid) = chosen_rid(&track.rids, layer)
+            {
+                keyframes.push((track.mid, rid));
+            }
+        }
+        keyframes
+    }
+
+    /// The rid this receiver currently wants for `origin`'s track
+    /// `mid_in`: `None` when the track is not simulcast (the caller then
+    /// asks the origin for a whole-track keyframe).
+    pub(crate) fn chosen_rid_for(&self, origin: PeerId, mid_in: Mid) -> Option<Rid> {
+        let out = self
+            .tracks_out
+            .iter()
+            .find(|t| t.origin == origin && t.mid_in == mid_in)?;
+        let track = out.track_in.upgrade()?;
+        chosen_rid(&track.rids, out.layer)
     }
 }

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use huddle_protocol::VideoLayer;
 use str0m::Input;
 use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaData, Mid};
 
@@ -164,12 +165,17 @@ impl Room {
     ///
     /// Every track that just went live gets a keyframe request fan-out to
     /// its source: a fresh subscriber joins mid-GOP, and without this its
-    /// first tiles would stay black until the next PLI.
+    /// first tiles would stay black until the next PLI. Simulcast sources
+    /// are asked on the rid matching the subscriber's current layer.
     pub fn accept_sdp_answer(&mut self, id: PeerId, sdp: &str) -> Result<(), SfuError> {
         let opened = self.peer_mut(id)?.accept_sdp_answer(sdp)?;
         for (origin, mid_in) in opened {
+            let rid = self
+                .peers
+                .get(&id)
+                .and_then(|p| p.chosen_rid_for(origin, mid_in));
             if let Some(origin_peer) = self.peers.get_mut(&origin)
-                && let Err(e) = origin_peer.request_keyframe(mid_in, None, KeyframeRequestKind::Fir)
+                && let Err(e) = origin_peer.request_keyframe(mid_in, rid, KeyframeRequestKind::Fir)
             {
                 tracing::debug!("subscription keyframe request to {origin} failed: {e}");
             }
@@ -180,6 +186,25 @@ impl Room {
     /// Deliver a trickled ICE candidate from a peer.
     pub fn add_remote_candidate(&mut self, id: PeerId, candidate: &str) -> Result<(), SfuError> {
         self.peer_mut(id)?.add_remote_candidate(candidate)
+    }
+
+    /// Set the simulcast layer `receiver` wants from `origin`'s camera
+    /// tracks, and ask the origin for a keyframe on the newly chosen
+    /// layer (throttled per layer) so the switch lands on a decodable
+    /// frame quickly. Screens and audio are unaffected.
+    pub fn set_layer_preference(
+        &mut self,
+        receiver: PeerId,
+        origin: PeerId,
+        layer: VideoLayer,
+    ) -> Result<(), SfuError> {
+        let keyframes = self.peer_mut(receiver)?.set_layer_preference(origin, layer);
+        for (mid_in, rid) in keyframes {
+            if let Some(origin_peer) = self.peers.get_mut(&origin) {
+                origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
+            }
+        }
+        Ok(())
     }
 
     /// Apply a (partial) mute update for a peer. Frames of a muted kind
@@ -317,7 +342,7 @@ impl Room {
         if let Some(peer) = self.peers.get_mut(&origin) {
             peer.rx_frames += 1;
             if !data.contiguous {
-                peer.request_keyframe_throttled(data.mid, data.rid, KeyframeRequestKind::Fir);
+                peer.request_keyframe_all_layers_throttled(data.mid, KeyframeRequestKind::Fir);
             }
             // Muted at the source: the frame is counted but not forwarded.
             if !peer.is_forwardable(data.mid) {
