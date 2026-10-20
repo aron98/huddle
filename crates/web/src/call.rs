@@ -4,6 +4,7 @@
 //! and the visual surfaces for each phase.
 
 use crate::api;
+use crate::audio_settings;
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
@@ -27,6 +28,11 @@ enum UiAction {
         video_muted: Option<bool>,
     },
     Speaking(bool),
+    /// Re-acquire the microphone with new echo-cancellation /
+    /// noise-suppression constraints and swap it into the live call.
+    AudioSettings {
+        settings: audio_settings::AudioSettings,
+    },
     ShareScreen(ScreenCommand),
     Chat {
         body: String,
@@ -368,19 +374,11 @@ async fn run_session(
 
     // Best-effort speaking detection: watch our own level and report
     // flips through the session. Failure is non-fatal — the call just
-    // runs without the indicator.
-    let _speaking_watch = match local.as_ref() {
-        Some(stream) => match media::watch_speaking(stream, move |speaking| {
-            let _ = ui_tx.unbounded_send(UiAction::Speaking(speaking));
-        })
-        .await
-        {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                leptos::logging::warn!("speaking detection off: {e}");
-                None
-            }
-        },
+    // runs without the indicator. The watcher is rebuilt whenever the
+    // mic track is swapped (the Web Audio graph binds to the tracks
+    // present at creation), so the binding must stay mutable.
+    let mut speaking_watch = match local.as_ref() {
+        Some(stream) => watch_speaking_for(stream, &ui_tx).await,
         None => None,
     };
 
@@ -454,6 +452,58 @@ async fn run_session(
                         if let Err(e) = client.set_speaking(speaking).await {
                             signals.connection_lost(e.to_string());
                             break;
+                        }
+                    }
+                    UiAction::AudioSettings { settings } => {
+                        // A constraint change needs a fresh acquisition:
+                        // re-acquire the mic and swap it into the live
+                        // sender (replaceTrack needs no renegotiation).
+                        // The old capture is stopped FIRST: while it is
+                        // open, the browser keeps the per-device audio
+                        // processing (AEC/NS) it started with, and a
+                        // concurrent getUserMedia inherits those settings
+                        // instead of the requested ones (issue #34).
+                        // Failure is a status message, not a call ender.
+                        if let Some(local) = local.as_ref() {
+                            let mic_id = signals.prejoin.mic_id.get_untracked();
+                            for old in media::tracks_of(local) {
+                                if old.kind() == "audio" {
+                                    local.remove_track(&old);
+                                    old.stop();
+                                }
+                            }
+                            match media::request_mic(mic_id.as_deref(), settings).await {
+                                Ok(track) => {
+                                    // Carry the mute state across the swap.
+                                    if !signals.mic_on.get_untracked() {
+                                        track.set_enabled(false);
+                                    }
+                                    match client.peer_mut().replace_mic_track(&track).await {
+                                        Ok(()) => {
+                                            local.add_track(&track);
+                                            // The Web Audio graph bound the old
+                                            // track; rebuild it for the new one.
+                                            speaking_watch =
+                                                watch_speaking_for(local, &screen_ui_tx).await;
+                                            signals.status.set(Some(
+                                                "Microphone re-acquired with the new audio settings."
+                                                    .to_string(),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            track.stop();
+                                            signals.status.set(Some(format!(
+                                                "Audio settings could not be applied: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    signals.status.set(Some(format!(
+                                        "Audio settings could not be applied: {e}"
+                                    )));
+                                }
+                            }
                         }
                     }
                     UiAction::ShareScreen(command) => match command {
@@ -581,6 +631,34 @@ async fn run_session(
                     }
                 }
             }
+        }
+    }
+
+    // The speaking watcher (and its Web Audio graph) lives exactly as
+    // long as the session loop; dropping it here detaches the last
+    // interval callback after a leave or a connection loss.
+    drop(speaking_watch);
+}
+
+/// (Re)build the speaking watcher for `stream`, wiring its verdicts back
+/// into the session through `ui_tx`. The Web Audio graph binds to the
+/// tracks present when it is created, so every mic swap needs a fresh
+/// watcher. Best-effort like the original: `None` just runs the call
+/// without the indicator.
+async fn watch_speaking_for(
+    stream: &MediaStream,
+    ui_tx: &UnboundedSender<UiAction>,
+) -> Option<media::SpeakingGuard> {
+    let ui_tx = ui_tx.clone();
+    match media::watch_speaking(stream, move |speaking| {
+        let _ = ui_tx.unbounded_send(UiAction::Speaking(speaking));
+    })
+    .await
+    {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            leptos::logging::warn!("speaking detection off: {e}");
+            None
         }
     }
 }
@@ -1073,6 +1151,12 @@ fn CallView(
                 >
                     {move || if sharing.get() { "Stop sharing" } else { "Share screen" }}
                 </button>
+                <audio_settings::AudioSettingsControls
+                    settings=prejoin.audio
+                    on_change=Callback::new(move |settings: audio_settings::AudioSettings| {
+                        send(UiAction::AudioSettings { settings })
+                    })
+                />
                 <button class="btn danger" data-testid="leave-btn" on:click=leave>
                     "Leave"
                 </button>

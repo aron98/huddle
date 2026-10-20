@@ -13,6 +13,8 @@
 #[cfg(target_arch = "wasm32")]
 pub mod api;
 #[cfg(target_arch = "wasm32")]
+pub mod audio_settings;
+#[cfg(target_arch = "wasm32")]
 pub mod call;
 pub mod flow;
 #[cfg(target_arch = "wasm32")]

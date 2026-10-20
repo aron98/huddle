@@ -405,6 +405,29 @@ impl BrowserPeerConnection {
         }
     }
 
+    /// Swap the microphone track the peer connection already sends,
+    /// without touching any other sender and without renegotiating —
+    /// the browser's `replaceTrack` re-binds an existing sender to a
+    /// new track of the same kind. The camera and screen senders carry
+    /// video, and the recvonly transceivers the server's forwarded
+    /// tracks created hold no track at all, so "the sender whose
+    /// current track is audio" can only be the microphone.
+    pub async fn replace_mic_track(&self, track: &MediaStreamTrack) -> Result<(), PeerError> {
+        let senders = self.pc.get_senders();
+        for i in 0..senders.length() {
+            let Ok(sender) = senders.get(i).dyn_into::<RtcRtpSender>() else {
+                continue;
+            };
+            if sender.track().is_some_and(|t| t.kind() == "audio") {
+                let promise = sender.replace_track(Some(track));
+                return JsFuture::from(promise).await.map_err(js_error).map(drop);
+            }
+        }
+        Err(PeerError::Failed(
+            "no microphone sender to replace".to_owned(),
+        ))
+    }
+
     /// Publish the camera as two simulcast layers: full resolution (the
     /// high layer) and a quarter-scale thumbnail (the low layer), rids
     /// ordered high → low to mirror the SFU's layer convention.

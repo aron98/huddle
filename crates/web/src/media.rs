@@ -1,5 +1,6 @@
 //! Camera/microphone acquisition and device enumeration.
 
+use crate::audio_settings::{self, AudioSettings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -23,17 +24,18 @@ pub enum DeviceKind {
 
 /// Acquire the camera and microphone. `camera_id`/`mic_id` select specific
 /// devices (`None` = browser default); used by the prejoin pickers.
+/// `audio` carries the explicit echo-cancellation / noise-suppression
+/// constraints (issue #34) — they apply on this and every
+/// re-acquisition alike.
 pub async fn request_media(
     camera_id: Option<&str>,
     mic_id: Option<&str>,
+    audio: AudioSettings,
 ) -> Result<MediaStream, String> {
     let devices = media_devices()?;
 
     let constraints = MediaStreamConstraints::new();
-    match mic_id {
-        Some(id) => constraints.set_audio(&exact_device(id)),
-        None => constraints.set_audio_bool(true),
-    }
+    constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
     match camera_id {
         Some(id) => constraints.set_video(&exact_device(id)),
         None => constraints.set_video_bool(true),
@@ -48,6 +50,33 @@ pub async fn request_media(
     stream
         .dyn_into::<MediaStream>()
         .map_err(|e| format!("getUserMedia returned {e:?}"))
+}
+
+/// Acquire only the microphone, with the same explicit audio
+/// constraints [`request_media`] applies — used by the in-call audio
+/// settings swap, where the camera track must not be disturbed.
+pub async fn request_mic(
+    mic_id: Option<&str>,
+    audio: AudioSettings,
+) -> Result<MediaStreamTrack, String> {
+    let devices = media_devices()?;
+
+    let constraints = MediaStreamConstraints::new();
+    constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
+
+    let promise = devices
+        .get_user_media_with_constraints(&constraints)
+        .map_err(|e| format!("cannot call getUserMedia: {e:?}"))?;
+    let stream = JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("getUserMedia denied or failed: {e:?}"))?;
+    let stream = stream
+        .dyn_into::<MediaStream>()
+        .map_err(|e| format!("getUserMedia returned {e:?}"))?;
+    tracks_of(&stream)
+        .into_iter()
+        .find(|t| t.kind() == "audio")
+        .ok_or_else(|| "microphone stream has no audio track".to_owned())
 }
 
 /// List cameras and microphones. Labels are only populated once the page
@@ -251,7 +280,9 @@ pub async fn request_screen() -> Result<ScreenCapture, String> {
     let test_mode = query.contains("test=1");
     let test_audio = query.contains("screen-audio=1");
     let stream = if test_mode {
-        request_media(None, None).await?
+        // The audio constraints are irrelevant for the screen stand-in
+        // (only the video track is used), so plain defaults go in.
+        request_media(None, None, AudioSettings::default()).await?
     } else {
         let devices = media_devices()?;
         let constraints = DisplayMediaStreamConstraints::new();
