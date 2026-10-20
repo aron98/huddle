@@ -40,7 +40,7 @@ pub enum RepeatFrequency {
 /// occurrence (RFC 5545 `DTSTART`); every occurrence keeps the
 /// meeting's duration. At most one of `until`/`count` may be set —
 /// RFC 5545 §3.3.10 makes them mutually exclusive parts of one rule.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RecurrenceRule {
     pub frequency: RepeatFrequency,
