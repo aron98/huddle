@@ -73,6 +73,10 @@ pub struct Config {
     /// keeps magic links as the organizer sign-in flow; when set, SSO
     /// replaces them. See [`OidcConfig`].
     pub oidc: Option<OidcConfig>,
+    /// TLS termination (issue #30, ADR 008). `None` (the default)
+    /// serves plain HTTP — development and tests only. See
+    /// [`TlsConfig`].
+    pub tls: Option<TlsConfig>,
     /// Optional bearer token protecting `GET /metrics`. `None` (the
     /// default) leaves the endpoint open, matching Prometheus's
     /// pull model: deployments are expected to gate it at the network
@@ -230,6 +234,132 @@ pub struct OidcConfig {
     pub client_secret: String,
 }
 
+/// TLS termination (issue #30, ADR 008), as configured in `huddle.toml`:
+///
+/// ```toml
+/// # Automatic certificates via Let's Encrypt (TLS-ALPN-01):
+/// [tls]
+/// mode = "acme"
+///
+/// [tls.acme]
+/// domains = ["meet.example.com"]
+/// contact = "admin@example.com" # optional, expiration mail from LE
+/// staging = false               # rehearse against the LE staging CA
+///
+/// # Or bring your own certificate chain:
+/// [tls]
+/// mode = "static"
+///
+/// [tls.certs]
+/// cert = "/etc/huddle/fullchain.pem"
+/// key = "/etc/huddle/privkey.pem"
+/// ```
+///
+/// No `[tls]` section serves plain HTTP — development and tests only.
+/// `mode` may be omitted when exactly one of `[tls.acme]` / `[tls.certs]`
+/// is present; an explicit `mode` wins over detection, and both sections
+/// without one is an error rather than a silent pick.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Pins the mode when set; `None` auto-detects from the sections.
+    pub mode: Option<TlsMode>,
+    /// Automatic certificates via Let's Encrypt; required when the mode
+    /// is (or detects to) `acme`.
+    pub acme: Option<AcmeTlsConfig>,
+    /// PEM files on disk; required when the mode is (or detects to)
+    /// `static`.
+    pub certs: Option<StaticTlsConfig>,
+}
+
+/// Which kind of TLS termination to run, e.g. from `tls.mode` or
+/// `HUDDLE_TLS_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsMode {
+    /// Automatic certificates via Let's Encrypt (TLS-ALPN-01).
+    Acme,
+    /// A certificate chain and key from PEM files on disk.
+    Static,
+}
+
+impl TlsMode {
+    /// Parse a mode name, e.g. from `HUDDLE_TLS_MODE`. A typo fails
+    /// loudly, naming the valid values.
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "acme" => Ok(Self::Acme),
+            "static" => Ok(Self::Static),
+            other => {
+                anyhow::bail!("unknown TLS mode {other:?}; valid values are \"acme\", \"static\"")
+            }
+        }
+    }
+}
+
+/// Let's Encrypt automation, as configured in `huddle.toml`:
+///
+/// ```toml
+/// [tls.acme]
+/// domains = ["meet.example.com"]
+/// contact = "admin@example.com"
+/// staging = false
+/// ```
+///
+/// The certificate cache lives under `data_dir`; the domain must point
+/// at this server and port 443 (or whichever port `bind` uses) must be
+/// reachable for the TLS-ALPN-01 challenge.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AcmeTlsConfig {
+    /// Domains to request certificates for; at least one is required.
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// Contact email forwarded to Let's Encrypt (expiry notices).
+    #[serde(default)]
+    pub contact: Option<String>,
+    /// Use the Let's Encrypt *staging* directory while rehearsing;
+    /// production rate limits are unforgiving of experiments.
+    #[serde(default)]
+    pub staging: bool,
+}
+
+/// A certificate chain and key from PEM files on disk, as configured in
+/// `huddle.toml`:
+///
+/// ```toml
+/// [tls.certs]
+/// cert = "/etc/huddle/fullchain.pem"
+/// key = "/etc/huddle/privkey.pem"
+/// ```
+///
+/// Or per-field via `HUDDLE_TLS_CERT` / `HUDDLE_TLS_KEY`. Both files
+/// must exist at startup — a missing file fails fast instead of at the
+/// first handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct StaticTlsConfig {
+    /// PEM certificate chain (leaf first, then intermediates).
+    pub cert: PathBuf,
+    /// PEM private key matching the leaf certificate.
+    pub key: PathBuf,
+}
+
+/// The TLS setup a configuration resolves to (issue #30, ADR 008):
+/// decided and validated here — pure data, no keys loaded — so config
+/// tests can cover every combination without touching the network or
+/// the filesystem beyond an existence check. Startup turns it into a
+/// listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TlsSelection {
+    /// Automatic certificates via Let's Encrypt.
+    Acme {
+        domains: Vec<String>,
+        contact: Option<String>,
+        staging: bool,
+    },
+    /// PEM files on disk.
+    Static { cert: PathBuf, key: PathBuf },
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -249,6 +379,7 @@ impl Default for Config {
             smtp: None,
             mail: MailConfig::default(),
             oidc: None,
+            tls: None,
             stats_token: None,
             rate_limit_per_min: 30,
         }
@@ -299,6 +430,7 @@ impl Config {
         let mut config = config;
         Self::apply_oidc_env_with(&mut config, issuer, client_id, secret)?;
         Self::apply_mail_env_with(&mut config, MailEnv::from_env())?;
+        Self::apply_tls_env_with(&mut config, TlsEnv::from_env())?;
         Ok(config)
     }
 
@@ -393,6 +525,99 @@ impl Config {
         Ok(MailSelection::Resend(resend.clone()))
     }
 
+    /// Resolve and validate the TLS setup (issue #30, ADR 008),
+    /// mirroring [`Config::mail_selection`].
+    ///
+    /// `None` (no `[tls]` section) means plain HTTP — development and
+    /// tests only; the server logs a warning. An explicit `mode` wins
+    /// and requires its section, without one the mode is detected from
+    /// whichever section is present, and both configured at once is an
+    /// error rather than a silent pick.
+    pub fn tls_selection(&self) -> anyhow::Result<Option<TlsSelection>> {
+        let Some(tls) = &self.tls else {
+            return Ok(None);
+        };
+        if let Some(mode) = tls.mode {
+            return match mode {
+                TlsMode::Acme => {
+                    if tls.certs.is_some() {
+                        anyhow::bail!(
+                            "tls.mode = \"acme\" conflicts with a [tls.certs] \
+                             section; remove one of them"
+                        );
+                    }
+                    Ok(Some(self.selected_acme()?))
+                }
+                TlsMode::Static => {
+                    if tls.acme.is_some() {
+                        anyhow::bail!(
+                            "tls.mode = \"static\" conflicts with a [tls.acme] \
+                             section; remove one of them"
+                        );
+                    }
+                    Ok(Some(self.selected_static()?))
+                }
+            };
+        }
+        match (&tls.acme, &tls.certs) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[tls.acme] and [tls.certs] are both configured; \
+                 set tls.mode to pick one"
+            ),
+            (Some(_), None) => Ok(Some(self.selected_acme()?)),
+            (None, Some(_)) => Ok(Some(self.selected_static()?)),
+            (None, None) => anyhow::bail!(
+                "[tls] is configured but empty; add [tls.acme] or \
+                 [tls.certs], or set tls.mode"
+            ),
+        }
+    }
+
+    /// Validate `[tls.acme]` and select it — shared by the explicit
+    /// `mode = "acme"` arm and acme detection.
+    fn selected_acme(&self) -> anyhow::Result<TlsSelection> {
+        let Some(acme) = self.tls.as_ref().and_then(|t| t.acme.as_ref()) else {
+            anyhow::bail!("TLS mode \"acme\" requires a [tls.acme] section");
+        };
+        if acme.domains.iter().all(|d| d.trim().is_empty()) {
+            anyhow::bail!("[tls.acme] domains must list at least one domain");
+        }
+        Ok(TlsSelection::Acme {
+            domains: acme.domains.clone(),
+            contact: acme.contact.clone(),
+            staging: acme.staging,
+        })
+    }
+
+    /// Validate `[tls.certs]` and select it — shared by the explicit
+    /// `mode = "static"` arm and static detection. The files must
+    /// already exist: a missing certificate is a deployment mistake
+    /// worth failing fast on, not a first-handshake problem.
+    fn selected_static(&self) -> anyhow::Result<TlsSelection> {
+        let Some(certs) = self.tls.as_ref().and_then(|t| t.certs.as_ref()) else {
+            anyhow::bail!("TLS mode \"static\" requires a [tls.certs] section");
+        };
+        for (kind, path) in [("cert", &certs.cert), ("key", &certs.key)] {
+            if !path.is_file() {
+                anyhow::bail!("TLS {kind} file {} does not exist", path.display());
+            }
+        }
+        Ok(TlsSelection::Static {
+            cert: certs.cert.clone(),
+            key: certs.key.clone(),
+        })
+    }
+
+    /// Whether session cookies should carry the `Secure` attribute.
+    ///
+    /// Any TLS termination in play — built-in (`[tls]`) or a proxy in
+    /// front (an `https://` `base_url`) — means browsers must refuse to
+    /// send the cookie over plain HTTP. Plain-HTTP dev setups (and the
+    /// e2e suite, which talks to 127.0.0.1 over HTTP) keep working.
+    pub fn secure_cookies(&self) -> bool {
+        self.tls.is_some() || self.base_url.starts_with("https://")
+    }
+
     /// Testable core of the `HUDDLE_MAIL_*` / `HUDDLE_SMTP_*` env
     /// handling, mirroring [`Config::apply_oidc_env_with`]: each set,
     /// non-empty value overrides the matching TOML field, merging
@@ -469,6 +694,79 @@ impl Config {
         Ok(())
     }
 
+    /// Testable core of the `HUDDLE_TLS_*` env handling, mirroring
+    /// [`Config::apply_mail_env_with`]: each set, non-empty value
+    /// overrides the matching `[tls]` TOML field, merging into an
+    /// existing section when there is one. A half-configured mode must
+    /// fail loudly rather than silently break TLS; cross-field checks
+    /// (mode conflicts, file existence) live in
+    /// [`Config::tls_selection`], which runs on every startup anyway.
+    fn apply_tls_env_with(&mut self, env: TlsEnv) -> anyhow::Result<()> {
+        let any_set = env.mode.is_some()
+            || env.domains.is_some()
+            || env.contact.is_some()
+            || env.staging.is_some()
+            || env.cert.is_some()
+            || env.key.is_some();
+        if !any_set {
+            return Ok(());
+        }
+        let mut tls = self.tls.clone().unwrap_or_default();
+
+        if let Some(mode) = env.mode.filter(|v| !v.trim().is_empty()) {
+            tls.mode = Some(TlsMode::parse(&mode)?);
+        }
+
+        if env.domains.is_some() || env.contact.is_some() || env.staging.is_some() {
+            let mut acme = tls.acme.clone().unwrap_or(AcmeTlsConfig {
+                domains: Vec::new(),
+                contact: None,
+                staging: false,
+            });
+            if let Some(v) = env.domains {
+                acme.domains = parse_tls_domains(&v)?;
+            }
+            if let Some(v) = env.contact.filter(|v| !v.trim().is_empty()) {
+                acme.contact = Some(v);
+            }
+            if let Some(v) = env.staging {
+                acme.staging = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("HUDDLE_TLS_STAGING must be \"true\" or \"false\", got {v:?}")
+                })?;
+            }
+            if acme.domains.is_empty() {
+                anyhow::bail!(
+                    "HUDDLE_TLS_DOMAINS is required when any \
+                     HUDDLE_TLS_DOMAINS/CONTACT/STAGING variable is set"
+                );
+            }
+            tls.acme = Some(acme);
+        }
+
+        if env.cert.is_some() || env.key.is_some() {
+            let mut certs = tls.certs.clone().unwrap_or(StaticTlsConfig {
+                cert: PathBuf::new(),
+                key: PathBuf::new(),
+            });
+            if let Some(v) = env.cert.filter(|v| !v.trim().is_empty()) {
+                certs.cert = PathBuf::from(v);
+            }
+            if let Some(v) = env.key.filter(|v| !v.trim().is_empty()) {
+                certs.key = PathBuf::from(v);
+            }
+            if certs.cert.as_os_str().is_empty() || certs.key.as_os_str().is_empty() {
+                anyhow::bail!(
+                    "HUDDLE_TLS_CERT and HUDDLE_TLS_KEY are both required \
+                     when either is set"
+                );
+            }
+            tls.certs = Some(certs);
+        }
+
+        self.tls = Some(tls);
+        Ok(())
+    }
+
     /// The IP browsers should be told to send media to.
     ///
     /// An explicitly configured `public_ip` wins; otherwise the machine's
@@ -540,6 +838,53 @@ impl MailEnv {
     }
 }
 
+/// The `HUDDLE_TLS_*` variables, collected for
+/// [`Config::apply_tls_env_with`]. Figment's flat env keys cannot reach
+/// nested sections (see the OIDC note on `Config::load`), so — mirroring
+/// `HUDDLE_OIDC_*` and `HUDDLE_MAIL_*` — they are applied explicitly
+/// after extraction.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TlsEnv {
+    mode: Option<String>,
+    domains: Option<String>,
+    contact: Option<String>,
+    staging: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+}
+
+impl TlsEnv {
+    /// Collect the variables from the process environment.
+    fn from_env() -> Self {
+        let var = |key: &str| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned());
+        Self {
+            mode: var("HUDDLE_TLS_MODE"),
+            domains: var("HUDDLE_TLS_DOMAINS"),
+            contact: var("HUDDLE_TLS_CONTACT"),
+            staging: var("HUDDLE_TLS_STAGING"),
+            cert: var("HUDDLE_TLS_CERT"),
+            key: var("HUDDLE_TLS_KEY"),
+        }
+    }
+}
+
+/// Parse `HUDDLE_TLS_DOMAINS`: a JSON-style array — the same value
+/// syntax figment itself uses for `HUDDLE_ICE_SERVERS` — or a bare
+/// single domain as a convenience.
+fn parse_tls_domains(value: &str) -> anyhow::Result<Vec<String>> {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') {
+        serde_json::from_str(trimmed).map_err(|_| {
+            anyhow::anyhow!(
+                "HUDDLE_TLS_DOMAINS must be an array like '[\"meet.example.com\"]', \
+                 got {value:?}"
+            )
+        })
+    } else {
+        Ok(vec![trimmed.to_owned()])
+    }
+}
+
 /// Detect the machine's primary outbound IP by asking the kernel which
 /// source address it would pick for a public destination. Connecting a
 /// UDP socket never sends a packet — it only installs a route.
@@ -587,6 +932,7 @@ mod tests {
         assert_eq!(config.mail.provider, None);
         assert_eq!(config.mail.resend, None);
         assert_eq!(config.oidc, None);
+        assert_eq!(config.tls, None);
         assert_eq!(config.stats_token, None);
         assert_eq!(config.rate_limit_per_min, 30);
     }
@@ -1022,5 +1368,325 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("HUDDLE_SMTP_HOST is required"), "got: {err}");
+    }
+
+    // --- TLS termination (issue #30) -----------------------------------
+
+    #[test]
+    fn no_tls_section_selects_plain_http() {
+        let config = config_with_toml("");
+        assert_eq!(config.tls, None);
+        assert!(config.tls_selection().unwrap().is_none());
+        // Dev default: plain HTTP, no Secure cookie attribute.
+        assert!(!config.secure_cookies());
+    }
+
+    #[test]
+    fn acme_section_parses_and_selects() {
+        let config = config_with_toml(
+            r#"
+            [tls.acme]
+            domains = ["meet.example.com", "alt.example.com"]
+            contact = "admin@example.com"
+            staging = true
+            "#,
+        );
+        assert_eq!(
+            config.tls_selection().unwrap(),
+            Some(TlsSelection::Acme {
+                domains: vec!["meet.example.com".into(), "alt.example.com".into()],
+                contact: Some("admin@example.com".into()),
+                staging: true,
+            })
+        );
+        assert!(config.secure_cookies());
+    }
+
+    #[test]
+    fn acme_mode_requires_its_section_and_domains() {
+        let err = config_with_toml(
+            r#"
+            [tls]
+            mode = "acme"
+            "#,
+        )
+        .tls_selection()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires a [tls.acme] section"), "got: {err}");
+
+        let err = config_with_toml(
+            r#"
+            [tls]
+            mode = "acme"
+
+            [tls.acme]
+            domains = []
+            "#,
+        )
+        .tls_selection()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("at least one domain"), "got: {err}");
+    }
+
+    #[test]
+    fn static_section_selects_when_files_exist() {
+        let dir =
+            std::env::temp_dir().join(format!("huddle-tls-config-{}-static", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, b"not really a cert").unwrap();
+        std::fs::write(&key, b"not really a key").unwrap();
+
+        let config = config_with_toml(&format!(
+            r#"
+            [tls.certs]
+            cert = {:?}
+            key = {:?}
+            "#,
+            cert.display(),
+            key.display()
+        ));
+        assert_eq!(
+            config.tls_selection().unwrap(),
+            Some(TlsSelection::Static { cert, key })
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn static_selection_fails_fast_on_missing_files() {
+        let config = config_with_toml(
+            r#"
+            [tls.certs]
+            cert = "/nonexistent/cert.pem"
+            key = "/nonexistent/key.pem"
+            "#,
+        );
+        let err = config.tls_selection().unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "got: {err}");
+        assert!(err.contains("cert"), "got: {err}");
+    }
+
+    #[test]
+    fn both_tls_sections_conflict_without_mode() {
+        let err = config_with_toml(
+            r#"
+            [tls.acme]
+            domains = ["meet.example.com"]
+
+            [tls.certs]
+            cert = "cert.pem"
+            key = "key.pem"
+            "#,
+        )
+        .tls_selection()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("set tls.mode to pick one"), "got: {err}");
+    }
+
+    #[test]
+    fn explicit_tls_mode_wins_and_conflicting_section_fails() {
+        // A cert file must exist for the winning side to validate; the
+        // conflicting section is rejected before that even matters.
+        let err = config_with_toml(
+            r#"
+            [tls]
+            mode = "acme"
+
+            [tls.acme]
+            domains = ["meet.example.com"]
+
+            [tls.certs]
+            cert = "cert.pem"
+            key = "key.pem"
+            "#,
+        )
+        .tls_selection()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("conflicts with a [tls.certs] section"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_tls_section_fails() {
+        let err = config_with_toml("[tls]")
+            .tls_selection()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[tls] is configured but empty"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_env_configures_acme() {
+        let mut config = Config::default();
+        Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                mode: Some("acme".into()),
+                domains: Some(r#"["meet.example.com"]"#.into()),
+                contact: Some("admin@example.com".into()),
+                staging: Some("true".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.tls_selection().unwrap(),
+            Some(TlsSelection::Acme {
+                domains: vec!["meet.example.com".into()],
+                contact: Some("admin@example.com".into()),
+                staging: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tls_env_accepts_bare_single_domain() {
+        let mut config = Config::default();
+        Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                domains: Some("meet.example.com".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.tls_selection().unwrap(),
+            Some(TlsSelection::Acme {
+                domains: vec!["meet.example.com".into()],
+                contact: None,
+                staging: false,
+            })
+        );
+    }
+
+    #[test]
+    fn tls_env_merges_into_toml_per_field() {
+        let config = config_with_toml(
+            r#"
+            [tls.acme]
+            domains = ["toml.example.com"]
+            contact = "toml@example.com"
+            "#,
+        );
+        let mut config = config;
+        Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                domains: Some(r#"["env.example.com"]"#.into()),
+                staging: Some("true".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.tls_selection().unwrap(),
+            Some(TlsSelection::Acme {
+                domains: vec!["env.example.com".into()],
+                contact: Some("toml@example.com".into()),
+                staging: true,
+            })
+        );
+    }
+
+    #[test]
+    fn half_configured_tls_env_fails() {
+        // Domains are the one required acme field.
+        let mut config = Config::default();
+        let err = Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                contact: Some("admin@example.com".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HUDDLE_TLS_DOMAINS is required"), "got: {err}");
+
+        // Cert and key are a pair.
+        let mut config = Config::default();
+        let err = Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                cert: Some("/cert.pem".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("both required"), "got: {err}");
+
+        // A typo'd mode names the valid values.
+        let mut config = Config::default();
+        let err = Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                mode: Some("acme-cert".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown TLS mode"), "got: {err}");
+
+        // A non-boolean staging flag fails loudly, named.
+        let mut config = Config::default();
+        let err = Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                domains: Some("meet.example.com".into()),
+                staging: Some("yes".into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HUDDLE_TLS_STAGING"), "got: {err}");
+
+        // A malformed domains array fails loudly, named.
+        let mut config = Config::default();
+        let err = Config::apply_tls_env_with(
+            &mut config,
+            TlsEnv {
+                domains: Some(r#"["unterminated"#.into()),
+                ..TlsEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HUDDLE_TLS_DOMAINS"), "got: {err}");
+    }
+
+    #[test]
+    fn secure_cookies_follows_tls_and_base_url() {
+        // Dev default over plain HTTP: no Secure attribute (e2e runs
+        // against 127.0.0.1 over HTTP and must keep working).
+        assert!(!Config::default().secure_cookies());
+
+        // Behind an HTTPS reverse proxy without built-in TLS.
+        let config = config_with_toml(r#"base_url = "https://meet.example.com""#);
+        assert!(config.secure_cookies());
+
+        // Built-in TLS, even with a plain-HTTP base_url left behind.
+        let config = config_with_toml(
+            r#"
+            [tls.acme]
+            domains = ["meet.example.com"]
+            "#,
+        );
+        assert!(config.secure_cookies());
+
+        // No TLS and a plain-HTTP base_url stays non-secure.
+        let config = config_with_toml(r#"base_url = "http://localhost:3000""#);
+        assert!(!config.secure_cookies());
     }
 }

@@ -39,9 +39,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 jsonwebtoken = "9"
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+rustls-acme = { version = "0.15", features = ["axum", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+rcgen = "0.13"
 str0m.workspace = true
 tokio-tungstenite.workspace = true
 tower = { version = "0.5", features = ["util"] }

@@ -1,7 +1,7 @@
 //! HTTP router: API routes plus the embedded web UI.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -67,8 +67,48 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Apply the headers that must only be present when huddle itself
+/// terminates TLS (issue #30, ADR 008): `Strict-Transport-Security`
+/// tells browsers to refuse plain-HTTP visits to this origin from
+/// then on, so it must never appear on a plain-HTTP dev server where
+/// following it would lock the developer out. Called from `main` with
+/// the result of `Config::tls_selection`.
+pub fn with_tls_headers(app: Router, tls_active: bool) -> Router {
+    if tls_active {
+        app.layer(axum::middleware::from_fn(hsts_header))
+    } else {
+        app
+    }
+}
+
+/// Insert `Strict-Transport-Security: max-age=31536000; includeSubDomains`
+/// on every response when TLS is active.
+async fn hsts_header(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+    );
+    response
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// An [`AppState`] wired for tests: loopback media, ephemeral ports, a
+/// scratch database. Module-level so the TLS handshake test in
+/// `crate::tls` can serve a real router over a real listener.
+#[cfg(test)]
+pub(crate) async fn test_state() -> AppState {
+    let config = Arc::new(crate::config::Config {
+        media_port: 0,
+        // Tests talk loopback-to-loopback; detection is machine-dependent.
+        public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        ..crate::config::Config::default()
+    });
+    let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+    AppState::new(config, crate::db::test_pool().await, engine).unwrap()
 }
 
 /// How many upcoming occurrences a response carries for a series —
@@ -720,17 +760,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    async fn test_state() -> AppState {
-        let config = Arc::new(crate::config::Config {
-            media_port: 0,
-            // Tests talk loopback-to-loopback; detection is machine-dependent.
-            public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
-            ..crate::config::Config::default()
-        });
-        let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
-        AppState::new(config, crate::db::test_pool().await, engine).unwrap()
-    }
-
     #[tokio::test]
     async fn health_is_ok() {
         let response = router(test_state().await)
@@ -740,6 +769,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, r#"{"status":"ok"}"#);
+    }
+
+    #[tokio::test]
+    async fn hsts_header_present_only_when_tls_is_active() {
+        // With built-in TLS the header pins browsers to HTTPS for a year.
+        let response = with_tls_headers(router(test_state().await), true)
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .and_then(|v| v.to_str().ok())
+                .unwrap(),
+            "max-age=31536000; includeSubDomains"
+        );
+
+        // Plain-HTTP dev servers must not send it — a browser that
+        // honored it over plain HTTP would lock the developer out.
+        let response = with_tls_headers(router(test_state().await), false)
+            .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(header::STRICT_TRANSPORT_SECURITY)
+                .is_none()
+        );
     }
 
     #[tokio::test]

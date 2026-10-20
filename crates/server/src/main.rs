@@ -18,11 +18,12 @@ mod recording;
 mod recurrence;
 mod session;
 mod state;
+mod tls;
 
 use std::sync::Arc;
 
 use anyhow::Context;
-use tracing::info;
+use tracing::{info, warn};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -54,24 +55,43 @@ async fn run() -> anyhow::Result<()> {
 
     let state = state::AppState::new(config.clone(), pool, engine.clone())
         .context("building application state")?;
-    let app = http::router(state);
-    let listener = tokio::net::TcpListener::bind(config.bind)
-        .await
-        .with_context(|| format!("binding {}", config.bind))?;
+    // TLS is validated before anything binds (issue #30, ADR 008):
+    // a broken certificate path or a domain-less ACME section fails
+    // fast, not at the first handshake.
+    let tls = config
+        .tls_selection()
+        .context("validating [tls] configuration")?;
+    let app = http::with_tls_headers(http::router(state), tls.is_some());
 
-    info!(url = %config.base_url, "listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("server error")?;
+    match tls {
+        None => {
+            warn!(
+                "no [tls] configuration: serving plain HTTP — fine for \
+                 local development, never expose it to the internet"
+            );
+            let listener = tokio::net::TcpListener::bind(config.bind)
+                .await
+                .with_context(|| format!("binding {}", config.bind))?;
+
+            info!(url = %config.base_url, "listening");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("server error")?;
+        }
+        Some(selection) => {
+            tls::serve(&config, selection, app).await?;
+        }
+    }
     engine.shutdown();
     Ok(())
 }
 
-async fn shutdown_signal() {
+/// Ctrl-C → graceful drain, shared by the HTTP and TLS serve paths.
+pub(crate) async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     info!("shutdown signal received");
 }
