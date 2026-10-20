@@ -71,6 +71,7 @@ mod tests {
             organizer_id: None,
             cancelled: false,
             created_at: datetime!(2025-12-30 12:00 UTC),
+            repeat: None,
         }
     }
 

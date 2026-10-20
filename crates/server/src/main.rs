@@ -15,6 +15,7 @@ mod metrics;
 mod oidc_test_idp;
 mod ratelimit;
 mod recording;
+mod recurrence;
 mod session;
 mod state;
 
