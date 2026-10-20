@@ -9,7 +9,8 @@
 // rather than frozen tiles, that a departing participant's tile and
 // roster entry disappear everywhere, that mute state broadcasts
 // propagate, that a shared screen reaches subscribers as a live,
-// decoding tile (and withdraws when stopped), and that chat survives
+// decoding tile (and withdraws when stopped), that a second share
+// preempts the first everywhere, and that chat survives
 // a participant reloading and rejoining.
 
 import { spawn } from 'node:child_process';
@@ -521,6 +522,214 @@ async function main() {
           fail(`${who}: alice's screen tile never withdrew`);
         });
     }
+
+    console.log('asserting a second share preempts the first (issue #6)');
+    // Carol is the third page — a pure viewer for this section. Which
+    // video ssrcs exist on her side before anyone shares again.
+    const carolBeforeAliceShare = await videoInboundSnapshot(carol);
+    await alice.click('[data-testid="share-screen"]');
+    await alice
+      .waitForFunction(
+        () =>
+          document.querySelector('[data-testid="share-screen"]')?.textContent.includes('Stop sharing'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(alice, 'alice').catch(() => {});
+        fail(`alice: second screen share never started (status: ${await statusText(alice)})`);
+      });
+    // The sharer sees their own share as a small picture-in-picture
+    // preview with a stop control next to it (issue #6).
+    await alice
+      .waitForSelector('[data-testid="share-pip"]', { timeout: 10_000 })
+      .catch(async () => {
+        await stateDump(alice, 'alice').catch(() => {});
+        fail('alice: share picture-in-picture preview never appeared');
+      });
+    await (async () => {
+      try {
+        await waitTile(carol, '[data-testid="tile-alice-screen"]', 'carol');
+      } catch (e) {
+        await stateDump(alice, 'alice').catch(() => {});
+        await stateDump(bob, 'bob').catch(() => {});
+        throw e;
+      }
+    })();
+    // A screen on the grid switches the call to a stage layout: the
+    // screen spans the stage and participants collapse into a strip.
+    await carol
+      .waitForFunction(
+        () => document.querySelector('.tiles')?.classList.contains('has-screen'),
+        { timeout: 10_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(carol, 'carol').catch(() => {});
+        fail('carol: the tiles container never entered the stage layout');
+      });
+    // And the screen must be live, decoding media — ssrcs, not track ids.
+    let aliceShareLive = null;
+    await waitFor(
+      "carol receiving alice's shared screen",
+      async () => {
+        aliceShareLive = await videoInboundSnapshot(carol);
+        const fresh = Object.keys(aliceShareLive).filter((s) => !(s in carolBeforeAliceShare));
+        return fresh.length > 0 && fresh.every((s) => aliceShareLive[s] > 0);
+      },
+      60_000,
+    ).catch(async () => {
+      await stateDump(carol, 'carol').catch(() => {});
+      fail(
+        `carol: alice's shared screen not decoding (before: ${JSON.stringify(carolBeforeAliceShare)}, ` +
+          `after: ${JSON.stringify(aliceShareLive)})`,
+      );
+    });
+    const aliceScreenSsrcs = Object.keys(aliceShareLive).filter(
+      (s) => !(s in carolBeforeAliceShare),
+    );
+    console.log(`carol sees alice's screen live (fresh ssrcs: ${aliceScreenSsrcs.join(', ')})`);
+
+    // Bob starts his own share: the server preempts alice's, so every
+    // viewer sees only bob's screen and alice's share winds down.
+    await bob.click('[data-testid="share-screen"]');
+    await bob
+      .waitForFunction(
+        () =>
+          document.querySelector('[data-testid="share-screen"]')?.textContent.includes('Stop sharing'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(bob, 'bob').catch(() => {});
+        fail(`bob: preempting screen share never started (status: ${await statusText(bob)})`);
+      });
+    await bob.waitForSelector('[data-testid="share-pip"]', { timeout: 10_000 }).catch(async () => {
+      await stateDump(bob, 'bob').catch(() => {});
+      fail('bob: share picture-in-picture preview never appeared');
+    });
+    await waitTile(carol, '[data-testid="tile-bob-screen"]', 'carol');
+    await carol
+      .waitForFunction(() => !document.querySelector('[data-testid="tile-alice-screen"]'), {
+        timeout: 30_000,
+        polling: 250,
+      })
+      .catch(async () => {
+        await stateDump(carol, 'carol').catch(() => {});
+        fail("carol: alice's screen tile never withdrew after bob preempted her");
+      });
+    // The roster hands over: bob sharing, alice not.
+    await carol
+      .waitForFunction(
+        () => {
+          const bobRoster = document.querySelector('[data-testid="roster-bob"]')?.textContent ?? '';
+          const aliceRoster =
+            document.querySelector('[data-testid="roster-alice"]')?.textContent ?? '';
+          return bobRoster.includes('sharing') && !aliceRoster.includes('sharing');
+        },
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(carol, 'carol').catch(() => {});
+        fail('carol: roster never handed the share from alice to bob');
+      });
+    // The share changed hands but never stopped, so the stage layout
+    // must still be up.
+    if (
+      !(await carol.evaluate(
+        () => document.querySelector('.tiles')?.classList.contains('has-screen') ?? false,
+      ))
+    ) {
+      await stateDump(carol, 'carol').catch(() => {});
+      fail('carol: stage layout dropped during the share hand-off');
+    }
+    // Bob's screen is a NEW decoding ssrc, distinct from everything
+    // carol had before (cameras + alice's still-live screen).
+    let bobShareLive = null;
+    const priorToBob = { ...carolBeforeAliceShare, ...aliceShareLive };
+    await waitFor(
+      "carol receiving bob's shared screen",
+      async () => {
+        bobShareLive = await videoInboundSnapshot(carol);
+        const fresh = Object.keys(bobShareLive).filter((s) => !(s in priorToBob));
+        return fresh.length > 0 && fresh.every((s) => bobShareLive[s] > 0);
+      },
+      60_000,
+    ).catch(async () => {
+      await stateDump(carol, 'carol').catch(() => {});
+      fail(
+        `carol: bob's shared screen not decoding (before: ${JSON.stringify(carolBeforeAliceShare)}, ` +
+          `alice live: ${JSON.stringify(aliceShareLive)}, after: ${JSON.stringify(bobShareLive)})`,
+      );
+    });
+    // Alice's preempted screen must wind down on carol's side too: its
+    // ssrcs stop decoding fresh frames (the reports can linger after
+    // deactivation, so compare frame growth, not presence).
+    const windDownStart = await videoInboundSnapshot(carol);
+    await delay(1500);
+    const windDownEnd = await videoInboundSnapshot(carol);
+    for (const ssrc of aliceScreenSsrcs) {
+      if ((windDownEnd[ssrc] ?? 0) > (windDownStart[ssrc] ?? 0)) {
+        fail(
+          `carol: alice's preempted screen ssrc ${ssrc} is still decoding fresh frames ` +
+            `(${windDownStart[ssrc] ?? 0} -> ${windDownEnd[ssrc] ?? 0})`,
+        );
+      }
+    }
+    // The preempted sharer is stood down on her own page as well: the
+    // button flips back, her preview disappears, and she becomes a
+    // viewer of bob's screen.
+    await alice
+      .waitForFunction(
+        () =>
+          document.querySelector('[data-testid="share-screen"]')?.textContent.includes('Share screen'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => {
+        await stateDump(alice, 'alice').catch(() => {});
+        fail(`alice: preempted share never stood down (status: ${await statusText(alice)})`);
+      });
+    await alice
+      .waitForFunction(() => !document.querySelector('[data-testid="share-pip"]'), {
+        timeout: 30_000,
+        polling: 250,
+      })
+      .catch(async () => {
+        await stateDump(alice, 'alice').catch(() => {});
+        fail("alice: share preview never disappeared after preemption");
+      });
+    await waitTile(alice, '[data-testid="tile-bob-screen"]', 'alice');
+    console.log("bob preempted alice: carol and alice see only bob's screen");
+
+    // Bob stops; the share fully withdraws and the layout reverts.
+    await bob.click('[data-testid="share-screen"]');
+    for (const [page, who] of [
+      [alice, 'alice'],
+      [carol, 'carol'],
+    ]) {
+      await page
+        .waitForFunction(() => !document.querySelector('[data-testid="tile-bob-screen"]'), {
+          timeout: 30_000,
+          polling: 250,
+        })
+        .catch(async () => {
+          await stateDump(page, who).catch(() => {});
+          fail(`${who}: bob's screen tile never withdrew`);
+        });
+    }
+    await carol
+      .waitForFunction(() => !document.querySelector('.tiles')?.classList.contains('has-screen'), {
+        timeout: 30_000,
+        polling: 250,
+      })
+      .catch(async () => {
+        await stateDump(carol, 'carol').catch(() => {});
+        fail('carol: stage layout never reverted after bob stopped sharing');
+      });
+    await bob
+      .waitForFunction(() => !document.querySelector('[data-testid="share-pip"]'), {
+        timeout: 30_000,
+        polling: 250,
+      })
+      .catch(async () => fail('bob: share preview never disappeared after stopping'));
+    console.log("bob's share withdrew everywhere and the layout reverted");
 
     console.log('asserting chat and its persistence across a rejoin');
     await alice.type('[data-testid="chat-input"]', 'hello from alice');
