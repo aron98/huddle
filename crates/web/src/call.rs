@@ -274,6 +274,11 @@ async fn run_session(
     // still creates receivers for it — skip that self-echo so it does
     // not render as a phantom "Guest" tile. The stream id is captured
     // ONCE: Chrome's `MediaStream.id()` is unstable across reads.
+    //
+    // A re-delivery (reshare) arrives under the same id, so replace the
+    // stale entry rather than append: Leptos keyed-<For> does not
+    // re-render same-key children, and the old tile's video element must
+    // be torn down and rebound to the new stream to show anything.
     let local_id = local.as_ref().map(|s| s.id());
     {
         let streams = signals.remote_streams;
@@ -281,7 +286,10 @@ async fn run_session(
             if local_id.as_deref() == Some(id) {
                 return;
             }
-            streams.update(|list| list.push((id.to_owned(), stream)));
+            streams.update(|list| {
+                list.retain(|(existing, _)| existing != id);
+                list.push((id.to_owned(), stream));
+            });
         });
     }
     if let Some(local) = &local {

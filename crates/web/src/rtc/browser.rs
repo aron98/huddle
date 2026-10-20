@@ -24,6 +24,20 @@ use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
 use super::peer::{LocalCandidate, PeerConnection, PeerError};
 use super::transport::{SignalingError, SignalingStream};
 
+/// Snapshot the track ids a stream currently carries, as plain `String`s —
+/// the ids are unique per delivery and `MediaStream::id()` itself is
+/// unstable across reads, so capture them once, at event time.
+fn track_ids(stream: &MediaStream) -> Vec<String> {
+    let tracks = stream.get_tracks();
+    let mut ids = Vec::with_capacity(tracks.length() as usize);
+    for i in 0..tracks.length() {
+        if let Ok(track) = tracks.get(i).dyn_into::<MediaStreamTrack>() {
+            ids.push(track.id());
+        }
+    }
+    ids
+}
+
 /// A [`SignalingStream`] over a browser `WebSocket`.
 ///
 /// Event handlers push into an unbounded channel that `next_message` drains,
@@ -287,11 +301,25 @@ impl BrowserPeerConnection {
         // event time* is the correct msid, so capture it into a `String`
         // and deduplicate — and carry the id onward — instead of ever
         // re-reading `.id()` from a stored stream.
-        let remote_streams = Rc::new(RefCell::new(Vec::<(String, MediaStream)>::new()));
+        //
+        // Deduplication still has to let a *re-delivered* stream through:
+        // the server labels every reshare m-line with the same
+        // `{origin}-screen` msid, so `ontrack` fires again with the same
+        // stream id after a stop+reshare cycle. Remembering ids alone
+        // would swallow the new stream and no viewer would ever see a
+        // reshared screen. Track ids are unique per delivery, so snapshot
+        // the track ids each stream carried when it was delivered and
+        // re-deliver whenever a fire carries a track we have not seen in
+        // that stream. `setRemoteDescription` is atomic (all tracks of a
+        // stream attach before any `ontrack` fires), so the first fire of
+        // a camera stream already sees the other track's id in the
+        // snapshot and the second fire is skipped.
+        let remote_streams = Rc::new(RefCell::new(Vec::<(String, Vec<String>)>::new()));
         let on_remote_stream: RemoteStreamCallback = Rc::new(RefCell::new(None));
         let streams_sink = Rc::clone(&remote_streams);
         let callback_sink = Rc::clone(&on_remote_stream);
         let on_track = Closure::<dyn FnMut(RtcTrackEvent)>::new(move |event: RtcTrackEvent| {
+            let track_id = event.track().id();
             let streams = event.streams();
             for i in 0..streams.length() {
                 let Ok(stream) = streams.get(i).dyn_into::<MediaStream>() else {
@@ -299,10 +327,19 @@ impl BrowserPeerConnection {
                 };
                 let id = stream.id();
                 let mut seen = streams_sink.borrow_mut();
-                if seen.iter().any(|(existing, _)| existing == &id) {
-                    continue;
+                let entry = seen.iter_mut().find(|(existing, _)| existing == &id);
+                match entry {
+                    // A track this stream already delivered: the other
+                    // track of the same atomic `setRemoteDescription`.
+                    Some((_, tracks)) if tracks.contains(&track_id) => continue,
+                    // A new track under a known stream id: a re-delivery
+                    // (reshare) — refresh the snapshot and deliver again.
+                    Some(entry) => *entry = (id.clone(), track_ids(&stream)),
+                    // First time this stream id is seen.
+                    None => {
+                        seen.push((id.clone(), track_ids(&stream)));
+                    }
                 }
-                seen.push((id.clone(), stream.clone()));
                 drop(seen);
                 let mut callback = callback_sink.borrow_mut();
                 if let Some(notify) = callback.as_mut() {
