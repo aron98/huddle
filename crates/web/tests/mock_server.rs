@@ -63,6 +63,9 @@ fn meeting_dto(code: &str) -> MeetingDto {
 struct MockState {
     received: Arc<Mutex<Vec<ClientMessage>>>,
     error_on_join: bool,
+    /// Put a renegotiation offer on the wire before the answer to our own
+    /// offer — the shape of a stale server offer racing our negotiation.
+    offer_before_answer: bool,
 }
 
 impl MockState {
@@ -95,18 +98,25 @@ impl MockState {
                     recording: false,
                 }]
             }
-            ClientMessage::SdpOffer { .. } => vec![
-                ServerMessage::SdpAnswer {
+            ClientMessage::SdpOffer { .. } => {
+                let mut replies = Vec::new();
+                if self.offer_before_answer {
+                    replies.push(ServerMessage::SdpOffer {
+                        sdp: "v=0 stale server offer".into(),
+                    });
+                }
+                replies.push(ServerMessage::SdpAnswer {
                     sdp: "v=0 mock answer".into(),
-                },
+                });
                 // A trickled candidate, as a real SFU sends right after the
                 // answer.
-                ServerMessage::IceCandidate {
+                replies.push(ServerMessage::IceCandidate {
                     candidate: "candidate:1 1 udp 2130706431 192.168.1.2 54321 typ host".into(),
                     sdp_mid: Some("0".into()),
                     sdp_m_line_index: Some(0),
-                },
-            ],
+                });
+                replies
+            }
             // Our trickled candidate reaching the server coincides with a
             // roster change, as it would in a live room.
             ClientMessage::IceCandidate { .. } => vec![ServerMessage::ParticipantJoined {
@@ -191,9 +201,14 @@ struct MockServer {
 
 impl MockServer {
     async fn start(error_on_join: bool) -> Self {
+        Self::start_with(error_on_join, false).await
+    }
+
+    async fn start_with(error_on_join: bool, offer_before_answer: bool) -> Self {
         let state = Arc::new(MockState {
             received: Arc::new(Mutex::new(Vec::new())),
             error_on_join,
+            offer_before_answer,
         });
         let app = Router::new()
             .route("/ws", get(ws_handler))
@@ -291,6 +306,9 @@ struct FakePeerConnection {
     pending_local_candidates: Vec<LocalCandidate>,
     screen_tracks: usize,
     ice_server_updates: usize,
+    /// Make `apply_remote_offer` fail, as Chrome does for an offer whose
+    /// m-line order no longer matches the negotiated session.
+    fail_remote_offers: bool,
 }
 
 impl FakePeerConnection {
@@ -316,6 +334,11 @@ impl PeerConnection for FakePeerConnection {
 
     async fn apply_remote_offer(&mut self, sdp: String) -> Result<String, PeerError> {
         self.remote_offers_applied.push(sdp);
+        if self.fail_remote_offers {
+            return Err(PeerError::Failed(
+                "m-line order doesn't match the previous offer/answer".to_owned(),
+            ));
+        }
         Ok("v=0 fake answer".to_owned())
     }
 
@@ -531,6 +554,39 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
     assert!(
         server.saw(|m| matches!(m, ClientMessage::Leave)).await,
         "graceful leave must reach the server"
+    );
+}
+
+#[tokio::test]
+async fn publish_survives_a_stale_deferred_server_offer() {
+    // A share that preempts another one puts the SFU's stop-offer for the
+    // old share on the wire while our own renegotiation is in flight; the
+    // SFU discards that offer when it accepts ours and re-offers from the
+    // rebased session. The stale offer must be dropped, not fatal.
+    let server = MockServer::start_with(false, true).await;
+    let mut client = connect(&server).await;
+    client.join("H7KD-PM2X-QR4T", "bob").await.unwrap();
+
+    // The peer connection rejects the stale offer, as Chrome does.
+    client.peer_mut().fail_remote_offers = true;
+    client.publish().await.unwrap();
+
+    // The stale offer was attempted (and dropped) …
+    assert_eq!(
+        client.peer_mut().remote_offers_applied,
+        vec!["v=0 stale server offer"]
+    );
+    // … our own answer still applied …
+    assert_eq!(client.peer_mut().answers_applied, vec!["v=0 mock answer"]);
+    // … and no answer was sent for the dropped offer: the SFU regenerates
+    // it, and that fresh one will be answered instead.
+    assert!(
+        !server
+            .saw(|m| matches!(
+                m,
+                ClientMessage::SdpAnswer { sdp } if sdp == "v=0 fake answer"
+            ))
+            .await
     );
 }
 
