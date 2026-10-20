@@ -109,8 +109,8 @@ async function createMeeting() {
   return body.meeting.code;
 }
 
-async function joinAs(page, code, name) {
-  await page.goto(`${BASE}/m/${code}?test=1`, { waitUntil: 'domcontentloaded' });
+async function joinAs(page, code, name, query = '?test=1') {
+  await page.goto(`${BASE}/m/${code}${query}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-testid="name-input"]');
   await page.type('[data-testid="name-input"]', name);
   // Join is gated on the local stream being live (the button enables
@@ -182,6 +182,23 @@ async function videoInboundSnapshot(page) {
     stats.forEach((report) => {
       if (report.type === 'inbound-rtp' && report.kind === 'video') {
         live[report.ssrc] = report.framesDecoded ?? 0;
+      }
+    });
+    return live;
+  });
+}
+
+// Snapshot of inbound AUDIO ssrcs → received bytes. Share audio has no
+// decodable-frame counter worth asserting here, so bytes are the
+// liveness signal; ssrcs (not track ids) for the same reason as the
+// video snapshot above.
+async function audioInboundSnapshot(page) {
+  return page.evaluate(async () => {
+    const stats = await window.__huddlePc.getStats();
+    const live = {};
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+        live[report.ssrc] = report.bytesReceived ?? 0;
       }
     });
     return live;
@@ -730,6 +747,113 @@ async function main() {
       })
       .catch(async () => fail('bob: share preview never disappeared after stopping'));
     console.log("bob's share withdrew everywhere and the layout reverted");
+
+    console.log('asserting a share can also carry the computer sound (issue #33)');
+    const frank = await newClient('frank');
+    // The screen-audio=1 knob keeps the fake capture stream's audio
+    // track in the share (real picks keep whatever the browser's own
+    // share-sound checkbox produced).
+    await joinAs(frank, code, 'frank', '?test=1&screen-audio=1');
+
+    const bobAudioBefore = await audioInboundSnapshot(bob);
+    // Frank just joined: wait for the meeting footer to render before
+    // clicking (page.click does not auto-wait for the selector).
+    await frank.waitForSelector('[data-testid="share-screen"]', { timeout: 30_000 });
+    await frank.click('[data-testid="share-screen"]');
+    await frank
+      .waitForFunction(
+        () =>
+          document
+            .querySelector('[data-testid="share-screen"]')
+            ?.textContent.includes('Stop sharing'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => fail(`frank: audio-bearing share never started (status: ${await statusText(frank)})`));
+
+    // The sharer's own preview flags the sound and offers the
+    // mid-share audio toggle.
+    await frank
+      .waitForSelector('[data-testid="share-audio-badge"]', { timeout: 10_000 })
+      .catch(() => fail('frank: share-audio badge never appeared on the preview'));
+    await frank
+      .waitForSelector('[data-testid="share-audio-toggle"]', { timeout: 10_000 })
+      .catch(() => fail('frank: share-audio toggle never appeared'));
+
+    // Viewers get the screen tile WITH the audio badge, and a fresh
+    // inbound AUDIO ssrc actually delivering bytes.
+    await waitTile(bob, '[data-testid="tile-frank-screen"]', 'bob');
+    await bob
+      .waitForSelector('[data-testid="tile-frank-screen"] [data-testid="screen-audio-badge"]', {
+        timeout: 10_000,
+      })
+      .catch(() => fail('bob: screen-audio badge missing from the share tile'));
+    await waitFor(
+      'bob receiving the share audio',
+      async () => {
+        const audio = await audioInboundSnapshot(bob);
+        const fresh = Object.keys(audio).filter((s) => !(s in bobAudioBefore));
+        return fresh.length > 0 && fresh.every((s) => audio[s] > 0);
+      },
+      30_000,
+    );
+    console.log('bob hears frank audio-bearing share (fresh audio ssrc with bytes)');
+
+    // Flipping the sharer's audio toggle must not disturb the share:
+    // the m-line stays up (a disabled track sends silence — no
+    // renegotiation involved) and the video keeps decoding.
+    const bobVideoAtFlip = await videoInboundSnapshot(bob);
+    await frank.click('[data-testid="share-audio-toggle"]');
+    await frank
+      .waitForFunction(
+        () =>
+          document
+            .querySelector('[data-testid="share-audio-toggle"]')
+            ?.textContent.includes('audio off'),
+        { timeout: 10_000, polling: 250 },
+      )
+      .catch(() => fail('frank: audio toggle never flipped to off'));
+    await waitFor(
+      "the share video to keep decoding after the audio flip",
+      async () => {
+        const video = await videoInboundSnapshot(bob);
+        return Object.keys(bobVideoAtFlip).some((s) => (video[s] ?? 0) > bobVideoAtFlip[s]);
+      },
+      15_000,
+    );
+
+    // Frank stops; tile and badge withdraw.
+    await frank.click('[data-testid="share-screen"]');
+    await bob
+      .waitForFunction(() => !document.querySelector('[data-testid="tile-frank-screen"]'), {
+        timeout: 30_000,
+        polling: 250,
+      })
+      .catch(() => fail("bob: frank's audio-bearing share tile never withdrew"));
+
+    // A re-share re-delivers the sound under the same state-preservation
+    // rules as the video.
+    const bobAudioBefore2 = await audioInboundSnapshot(bob);
+    await frank.click('[data-testid="share-screen"]');
+    await frank
+      .waitForFunction(
+        () =>
+          document
+            .querySelector('[data-testid="share-screen"]')
+            ?.textContent.includes('Stop sharing'),
+        { timeout: 30_000, polling: 250 },
+      )
+      .catch(async () => fail(`frank: re-share never started (status: ${await statusText(frank)})`));
+    await waitTile(bob, '[data-testid="tile-frank-screen"]', 'bob');
+    await waitFor(
+      'bob receiving the re-shared audio',
+      async () => {
+        const audio = await audioInboundSnapshot(bob);
+        const fresh = Object.keys(audio).filter((s) => !(s in bobAudioBefore2));
+        return fresh.length > 0 && fresh.every((s) => audio[s] > 0);
+      },
+      30_000,
+    );
+    console.log("frank's audio-bearing share flowed, toggled, withdrew, and re-shared cleanly");
 
     console.log('asserting chat and its persistence across a rejoin');
     await alice.type('[data-testid="chat-input"]', 'hello from alice');
