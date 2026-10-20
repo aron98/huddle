@@ -8,6 +8,7 @@
 //! expand a series start into concrete occurrence start times.
 
 use huddle_protocol::{RecurrenceRule, RepeatFrequency};
+use time::macros::format_description;
 use time::{Duration, Month, OffsetDateTime, Weekday};
 
 /// Hard cap on expanded occurrences for open-ended series. Expansion
@@ -40,6 +41,29 @@ pub fn parse_stored_rule(raw: &str) -> Option<RepeatFrequency> {
         "FREQ=MONTHLY" => Some(RepeatFrequency::Monthly),
         _ => None,
     }
+}
+
+/// An RFC 5545 `DATE-TIME` in UTC (`20260601T090000Z`) — the form both
+/// `UNTIL` values and `EXDATE` properties need.
+pub fn ics_datetime(t: OffsetDateTime) -> Result<String, time::error::Format> {
+    let fmt = format_description!("[year][month][day]T[hour][minute][second]Z");
+    // The `Z` suffix is only honest once the wall clock is UTC.
+    t.replace_offset(time::UtcOffset::UTC).format(&fmt)
+}
+
+/// The `RRULE` property value for a rule: the frequency fragment plus
+/// `COUNT` or `UNTIL`. RFC 5545 §3.3.10 makes those parts of the rule
+/// value itself — they are never separate properties.
+pub fn rrule_property(rule: &RecurrenceRule) -> Result<String, time::error::Format> {
+    let mut value = stored_rule(rule.frequency).to_owned();
+    if let Some(until) = rule.until {
+        value.push_str(";UNTIL=");
+        value.push_str(&ics_datetime(until)?);
+    } else if let Some(count) = rule.count {
+        value.push_str(";COUNT=");
+        value.push_str(&count.to_string());
+    }
+    Ok(value)
 }
 
 /// Does `candidate` count as an occurrence under `frequency`? Only the
@@ -212,5 +236,25 @@ mod tests {
         let mut counted = rule(RepeatFrequency::Daily);
         counted.count = Some(3);
         assert_eq!(occurrence_starts(&counted, start).len(), 3);
+    }
+
+    #[test]
+    fn rrule_property_is_rfc_5545_shaped() {
+        assert_eq!(
+            rrule_property(&rule(RepeatFrequency::Weekly)).unwrap(),
+            "FREQ=WEEKLY"
+        );
+        let mut counted = rule(RepeatFrequency::Weekdays);
+        counted.count = Some(10);
+        assert_eq!(
+            rrule_property(&counted).unwrap(),
+            "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10"
+        );
+        let mut bounded = rule(RepeatFrequency::Monthly);
+        bounded.until = Some(at(2026, Month::June, 1, 9));
+        assert_eq!(
+            rrule_property(&bounded).unwrap(),
+            "FREQ=MONTHLY;UNTIL=20260601T090000Z"
+        );
     }
 }

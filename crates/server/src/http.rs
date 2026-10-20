@@ -255,7 +255,10 @@ async fn meeting_ics(state: State<AppState>, Path(code): Path<String>) -> Result
         .await
         .map_err(ApiErr::internal)?
         .ok_or_else(ApiErr::not_found)?;
-    let body = ics::build_ics(&meeting, &state.config().base_url).map_err(|e| {
+    let cancelled = meetings::cancelled_occurrences(state.pool(), meeting.id)
+        .await
+        .map_err(ApiErr::internal)?;
+    let body = ics::build_ics(&meeting, &cancelled, &state.config().base_url).map_err(|e| {
         tracing::error!(error = %e, "ics generation failure");
         ApiErr(
             StatusCode::INTERNAL_SERVER_ERROR,
