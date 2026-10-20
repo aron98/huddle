@@ -66,6 +66,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     let mic_on = RwSignal::new(true);
     let cam_on = RwSignal::new(true);
     let sharing = RwSignal::new(false);
+    // The sharer's own capture stream, shown picture-in-picture while
+    // the share is live so they see exactly what everyone else sees.
+    let share_preview = RwSignal::<Option<MediaStream>>::new(None);
     // The camera tile currently focused (if any): the focused origin
     // receives the high simulcast layer, everyone else the low one.
     let focused = RwSignal::<Option<Uuid>>::new(None);
@@ -89,6 +92,7 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
             mic_on,
             cam_on,
             sharing,
+            share_preview,
             recording,
             status,
             ui_tx_slot,
@@ -125,6 +129,7 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
                         mic_on=mic_on
                         cam_on=cam_on
                         sharing=sharing
+                        share_preview=share_preview
                         focused=focused
                         recording=recording
                         status=status
@@ -154,6 +159,9 @@ struct SessionSignals {
     mic_on: RwSignal<bool>,
     cam_on: RwSignal<bool>,
     sharing: RwSignal<bool>,
+    /// The local capture stream while our share is live; drives the
+    /// sharer's picture-in-picture preview.
+    share_preview: RwSignal<Option<MediaStream>>,
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
@@ -195,6 +203,7 @@ async fn wind_down_share(
     // no share state of its own.
     screen_end_guard.take();
     signals.sharing.set(false);
+    signals.share_preview.set(None);
     client.stop_screen_share().await
 }
 
@@ -443,7 +452,7 @@ async fn run_session(
                                     client
                                         .peer_mut()
                                         .screen_share_handle()
-                                        .stage(track.clone(), stream);
+                                        .stage(track.clone(), stream.clone());
                                     let stop_tx = screen_ui_tx.clone();
                                     let guard = media::watch_track_ended(&track, move || {
                                         let _ = stop_tx.unbounded_send(
@@ -462,10 +471,14 @@ async fn run_session(
                                             // mid-start. The roster is the
                                             // truth: only claim the share if
                                             // it still says we are sharing.
-                                            let still_sharing =
-                                                client.you().is_some_and(|you| you.sharing);
+                                            let still_sharing = client
+                                                .you()
+                                                .is_some_and(|you| you.sharing);
                                             if still_sharing {
                                                 signals.sharing.set(true);
+                                                // The sharer sees their own
+                                                // capture picture-in-picture.
+                                                signals.share_preview.set(Some(stream));
                                             } else if let Err(e) = wind_down_share(
                                                 &mut client,
                                                 &mut screen_end_guard,
@@ -473,7 +486,8 @@ async fn run_session(
                                             )
                                             .await
                                             {
-                                                signals.connection_lost(e.to_string());
+                                                signals
+                                                    .connection_lost(e.to_string());
                                                 break;
                                             }
                                         }
@@ -609,6 +623,41 @@ fn VideoTile(
     }
 }
 
+/// The sharer's own picture-in-picture: their capture stream, so they
+/// see exactly what everyone else sees, with the stop control right
+/// in the caption. The session task tears it down when the share ends
+/// (stop button, preemption, or the browser's native stop UI).
+#[component]
+fn SharePip(
+    stream: MediaStream,
+    ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
+) -> impl IntoView {
+    let video_ref = NodeRef::<leptos::html::Video>::new();
+    Effect::new(move |_| {
+        if let Some(video) = video_ref.get() {
+            video.set_muted(true);
+            video.set_src_object(Some(&stream));
+            crate::play_silently(&video);
+        }
+    });
+    let stop = move |_| {
+        if let Some(tx) = ui_tx_slot.get_untracked() {
+            let _ = tx.unbounded_send(UiAction::ShareScreen(ScreenCommand::Stop));
+        }
+    };
+    view! {
+        <figure class="share-pip" data-testid="share-pip">
+            <video node_ref=video_ref autoplay muted playsinline></video>
+            <figcaption>
+                <span>"Sharing your screen"</span>
+                <button class="btn small danger" data-testid="share-pip-stop" on:click=stop>
+                    "Stop"
+                </button>
+            </figcaption>
+        </figure>
+    }
+}
+
 // Resolve a remote stream's origin participant from its msid. The id
 // string was captured at `ontrack` time; never re-read `.id()` from
 // the stream (unstable in Chrome, see `BrowserPeerConnection::new`).
@@ -634,6 +683,7 @@ fn CallView(
     mic_on: RwSignal<bool>,
     cam_on: RwSignal<bool>,
     sharing: RwSignal<bool>,
+    share_preview: RwSignal<Option<MediaStream>>,
     focused: RwSignal<Option<Uuid>>,
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
@@ -648,13 +698,35 @@ fn CallView(
             .unwrap_or_else(|| "Meeting".to_owned())
     };
 
+    // A remote screen tile switches the grid into stage layout: the
+    // screen spans the top row, participants collapse into a strip
+    // below it (all CSS — this is the one flag the stylesheet needs).
+    // Tile-driven rather than roster-driven: the sharer has no remote
+    // tile of their own screen, so a roster check would leave their
+    // stage row empty, and the tile appears exactly when media flows.
+    let has_screen = Memo::new(move |_| {
+        remote_streams
+            .get()
+            .iter()
+            .any(|(id, _)| id.ends_with("-screen"))
+    });
+
     // Adaptive grid: square-root packing keeps tiles usable from a
     // one-on-one to a full room (CSS clamps it further on phones).
-    let cols = Memo::new(move |_| match remote_streams.get().len() + 1 {
-        1 => 1,
-        2..=4 => 2,
-        5..=9 => 3,
-        _ => 4,
+    // Screen tiles live in the stage row, so they do not count
+    // towards the strip's packing.
+    let cols = Memo::new(move |_| {
+        let streams = remote_streams.get();
+        let screens = streams
+            .iter()
+            .filter(|(id, _)| id.ends_with("-screen"))
+            .count();
+        match streams.len() + 1 - screens {
+            1 => 1,
+            2..=4 => 2,
+            5..=9 => 3,
+            _ => 4,
+        }
     });
 
     let send = move |action: UiAction| {
@@ -764,7 +836,7 @@ fn CallView(
 
             <div class="call-body">
                 <section class="stage" aria-label="Video tiles">
-                    <div class="tiles" style=tiles_style>
+                    <div class="tiles" class:has-screen=move || has_screen.get() style=tiles_style>
                         {local.clone().map(|stream| {
                             view! {
                                 <VideoTile
@@ -836,6 +908,14 @@ fn CallView(
                             }}
                         </For>
                     </div>
+
+                    {move || {
+                        share_preview
+                            .get()
+                            .map(|stream| {
+                                view! { <SharePip stream=stream ui_tx_slot=ui_tx_slot /> }
+                            })
+                    }}
                 </section>
 
                 <aside class="side">
