@@ -61,6 +61,7 @@ web-sys = { version = "0.3", features = [
     "BinaryType",
     "Clipboard",
     "DisplayMediaStreamConstraints",
+    "EventTarget",
     "GainNode",
     "Headers",
     "HtmlMediaElement",
