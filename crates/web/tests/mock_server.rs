@@ -565,7 +565,7 @@ async fn publish_survives_a_stale_deferred_server_offer() {
     // rebased session. The stale offer must be dropped, not fatal.
     let server = MockServer::start_with(false, true).await;
     let mut client = connect(&server).await;
-    client.join("H7KD-PM2X-QR4T", "bob").await.unwrap();
+    client.join("H7KD-PM2X-QR4T", "bob", None).await.unwrap();
 
     // The peer connection rejects the stale offer, as Chrome does.
     client.peer_mut().fail_remote_offers = true;
