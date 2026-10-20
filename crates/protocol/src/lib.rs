@@ -16,7 +16,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub use api::{
     ApiError, CreateMeetingRequest, Joinability, MeetingDto, MeetingResponse, OccurrenceDto,
-    RecordingDto, RecurrenceRule, RepeatFrequency, UpdateMeetingRequest,
+    PASSCODE_MAX_LEN, RecordingDto, RecurrenceRule, RepeatFrequency, UpdateMeetingRequest,
+    validate_passcode,
 };
 pub use signaling::{
     ChatMessage, ClientMessage, ErrorCode, IceServer, Participant, ParticipantId, ServerMessage,

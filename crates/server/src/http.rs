@@ -885,6 +885,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn passcode_round_trip_via_api() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let now = time::OffsetDateTime::now_utc();
+        let rfc3339 = time::format_description::well_known::Rfc3339;
+
+        // Create with a passcode: the response advertises the flag but
+        // never the value.
+        let body = serde_json::json!({
+            "title": "Locked standup",
+            "starts_at": now.format(&rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(60)).format(&rfc3339).unwrap(),
+            "passcode": "sekrit",
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(!text.contains("sekrit"), "passcode value leaked: {text}");
+        let created: MeetingResponse = serde_json::from_str(&text).unwrap();
+        assert!(created.meeting.has_passcode);
+        let code = created.meeting.code.clone();
+
+        // An unauthenticated GET sees the flag too (the prejoin form
+        // shows the passcode field from it).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/meetings/{code}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let fetched: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(fetched.meeting.has_passcode);
+
+        // PATCH with an absent passcode keeps it (title-only change).
+        let patch = serde_json::json!({ "title": "Renamed" });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/meetings/{code}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let updated: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(updated.meeting.has_passcode);
+
+        // PATCH with null removes it.
+        let patch = serde_json::json!({ "passcode": null });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/meetings/{code}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let removed: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(!removed.meeting.has_passcode);
+
+        // PATCH with a value sets it again, and the value never echoes.
+        let patch = serde_json::json!({ "passcode": "rotated" });
+        let response = app
+            .oneshot(
+                Request::patch(format!("/api/meetings/{code}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(!text.contains("rotated"), "passcode value leaked: {text}");
+        let rotated: MeetingResponse = serde_json::from_str(&text).unwrap();
+        assert!(rotated.meeting.has_passcode);
+    }
+
+    #[tokio::test]
     async fn create_meeting_rejects_invalid_json() {
         let app = router(test_state().await);
         let response = app
