@@ -208,6 +208,58 @@ clients that split-tunnel TCP, and — unless you are building an internal
 setup — do **not** copy `allow-loopback-peers` from the e2e configs; coturn
 refuses loopback peers by default for good reason.
 
+### Email delivery
+
+Organizers sign in with magic links, and huddle needs a way to deliver
+them. Three transports are built in ([ADR 006](docs/adr/006-pluggable-mailer-transports.md));
+with nothing configured, huddle **logs the link at `info` level instead of
+sending it**, so evaluating a self-hosted instance never requires an email
+account — copy the link out of the server log and paste it into a browser.
+
+**`log` (default).** No configuration needed. Nothing leaves the machine;
+the sign-in link is only in the server log.
+
+**`smtp`** — send through a STARTTLS relay (lettre), configured by the
+`[smtp]` section:
+
+```toml
+[smtp]
+host = "smtp.example.com"
+port = 587            # default 587
+username = "huddle@example.com"
+password = "…"
+from = "huddle@example.com"   # default huddle@localhost
+```
+
+**`resend`** — deliver via the [Resend](https://resend.com) HTTPS API: no
+SMTP relay to operate, just an API key. Select it with the `[mail]`
+section:
+
+```toml
+[mail]
+provider = "resend"
+
+[mail.resend]
+api_key = "re_…"              # from the Resend dashboard
+from = "Huddle <huddle@example.com>"
+```
+
+Selection rules: an explicit `mail.provider` (`"log"`, `"smtp"`,
+`"resend"`) always wins — `provider = "smtp"` uses the `[smtp]` section.
+Without one, huddle detects the transport from whichever section is
+present: `[mail.resend]` selects Resend, a bare `[smtp]` selects SMTP
+(**a pre-existing SMTP-only config keeps working unchanged**), nothing at
+all logs the link. Having both `[smtp]` and `[mail.resend]` without an
+explicit `provider` is a startup error rather than a silent pick.
+
+Everything is configurable via environment variables too — useful in
+containers where a config file is awkward: `HUDDLE_MAIL_PROVIDER`
+(`log`/`smtp`/`resend`), `HUDDLE_MAIL_RESEND_API_KEY`,
+`HUDDLE_MAIL_RESEND_FROM`, and `HUDDLE_SMTP_HOST` / `HUDDLE_SMTP_PORT` /
+`HUDDLE_SMTP_USERNAME` / `HUDDLE_SMTP_PASSWORD` / `HUDDLE_SMTP_FROM`. A
+half-configured transport fails loudly at startup instead of silently
+breaking sign-in.
+
 ### Single sign-on (OIDC)
 
 Huddle signs organizers in with passwordless magic links by default. To
