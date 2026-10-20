@@ -9,7 +9,7 @@ use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::media::{
     Direction, KeyframeRequest, KeyframeRequestKind, MediaData, MediaKind, Mid, Rid,
 };
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
 use crate::PeerId;
 use crate::error::SfuError;
@@ -177,6 +177,10 @@ pub(crate) struct Peer {
     screen_pending: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
+    /// Media frames shed because this peer's str0m egress queue
+    /// overflowed ([`RtcError::WriteWithoutPoll`] backpressure). str0m
+    /// drops the frame itself; the peer stays connected.
+    pub dropped_frames: u64,
     /// Keyframe (FIR/PLI) requests successfully enqueued toward this
     /// peer. The wire form is SRTCP, invisible to outside observers, so
     /// tests assert on this counter instead of sniffing datagrams.
@@ -226,6 +230,7 @@ impl Peer {
             screen_pending: false,
             rx_frames: 0,
             tx_frames: 0,
+            dropped_frames: 0,
             keyframes_requested: 0,
             stats: None,
             stats_prev: None,
@@ -729,8 +734,8 @@ impl Peer {
     ///
     /// Simulcast sources are filtered to the receiver's chosen layer.
     /// Silently drops the frame if the writer or a matching payload type is
-    /// not (yet) available; a write error is propagated so the room can
-    /// disconnect the peer.
+    /// not (yet) available; a write error is propagated to the room, which
+    /// decides the peer's fate via [`Peer::handle_forward_error`].
     pub(crate) fn forward_media(&mut self, mid_out: Mid, data: &MediaData) -> Result<(), SfuError> {
         if !self.wants_layer(mid_out, data) {
             return Ok(());
@@ -744,6 +749,28 @@ impl Peer {
         writer.write(pt, data.network_time, data.time, data.data.clone())?;
         self.tx_frames += 1;
         Ok(())
+    }
+
+    /// Handle an error from [`Peer::forward_media`].
+    ///
+    /// `RtcError::WriteWithoutPoll` is egress backpressure: str0m's send
+    /// queue already dropped the frame, so this is a load-shed, not a
+    /// transport failure — count it and keep the peer connected (a busy
+    /// receiver catches up as soon as it is polled again). Any other
+    /// write error is treated as fatal and disconnects the peer, as
+    /// before.
+    pub(crate) fn handle_forward_error(&mut self, e: SfuError) {
+        if matches!(e, SfuError::Rtc(RtcError::WriteWithoutPoll)) {
+            self.dropped_frames += 1;
+            tracing::debug!(
+                "peer {} egress queue full, shedding frame (dropped: {})",
+                self.id,
+                self.dropped_frames
+            );
+        } else {
+            tracing::warn!("forward to peer {} failed, disconnecting: {e}", self.id);
+            self.disconnect();
+        }
     }
 
     /// Ask the source of `mid` for a keyframe, at most once per interval
@@ -842,5 +869,28 @@ impl Peer {
             .find(|t| t.origin == origin && t.mid_in == mid_in)?;
         let track = out.track_in.upgrade()?;
         chosen_rid(&track.rids, out.layer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn forward_backpressure_sheds_while_other_errors_disconnect() {
+        let addr: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let mut peer = Peer::new(PeerId::new_v4(), addr).unwrap();
+
+        // Egress backpressure: str0m already dropped the frame, the
+        // peer must survive and the shed must be counted.
+        peer.handle_forward_error(SfuError::Rtc(RtcError::WriteWithoutPoll));
+        assert!(peer.is_alive(), "backpressure must not be fatal");
+        assert_eq!(peer.dropped_frames, 1);
+
+        // Any other write error is still fatal for the peer.
+        peer.handle_forward_error(SfuError::Rtc(RtcError::NoSenderSource));
+        assert!(!peer.is_alive(), "genuine write errors must disconnect");
     }
 }

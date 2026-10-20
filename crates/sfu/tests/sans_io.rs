@@ -1035,3 +1035,90 @@ fn recorder_taps_exactly_the_forwarded_media() {
     drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(600));
     assert_eq!(tap.len(), before, "frames recorded after removal");
 }
+
+/// Poll ONLY `client`'s outputs straight into the room, without polling
+/// the room itself, so everything the client sends piles up in the
+/// room-side peer's receive buffer (simulates the room's polling loop
+/// stalling under load while packets keep arriving).
+///
+/// The pacer allows one packet per `handle_timeout`: a timeout only a
+/// few milliseconds out is the pacer gate asking for time to advance,
+/// while a distant timeout means the client has nothing more to send.
+fn pump_client_into_room(room: &mut Room, client: &mut TestClient) {
+    let start = Instant::now();
+    while start.elapsed() < DRIVE_BUDGET {
+        match client.rtc.poll_output() {
+            Ok(Output::Transmit(t)) => {
+                let receive =
+                    Receive::new(Protocol::Udp, client.addr, MEDIA_ADDR, &t.contents).unwrap();
+                room.handle_input(Input::Receive(Instant::now(), receive));
+            }
+            Ok(Output::Timeout(next)) => {
+                if next.saturating_duration_since(Instant::now()) <= Duration::from_millis(10) {
+                    let _ = client.rtc.handle_input(Input::Timeout(Instant::now()));
+                } else {
+                    break;
+                }
+            }
+            Ok(Output::Event(_)) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Regression test for issue #38: when a receiver's str0m egress queue
+/// overflows, `Writer::write` fails with `RtcError::WriteWithoutPoll`
+/// after already dropping the frame. That is load-shed backpressure,
+/// not a transport failure — the SFU must count the shed frame and keep
+/// the peer connected instead of disconnecting it (which took the whole
+/// room down under load).
+#[test]
+fn egress_backpressure_sheds_frames_without_disconnecting_the_peer() {
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let b_id = b.id;
+    a.join(&mut room);
+    b.join(&mut room);
+
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients.iter().all(|c| c.connected)
+    });
+
+    // Baseline: audio flows a -> b.
+    a.send_audio(10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients[1].media_rx > 0
+    });
+    assert!(b.media_rx > 0, "baseline audio did not reach b");
+
+    // ~1200 frames pile up in peer a's receive buffer, unpollled. Batches
+    // stay under the client-side 512-payload egress cap (each batch is
+    // pumped out before the next is written).
+    for _ in 0..3 {
+        a.send_audio(400);
+        pump_client_into_room(&mut room, &mut a);
+    }
+
+    // One step drains a's whole backlog toward b, whose egress queue
+    // (512 payloads) overflows: str0m sheds the excess and the SFU must
+    // not treat it as a fatal write error.
+    step(&mut room, &mut [&mut a, &mut b]);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+
+    let stats = room.peer_stats(b_id).unwrap();
+    assert!(
+        stats.dropped_frames > 0,
+        "expected shed frames from the egress overflow: {stats:?}"
+    );
+    assert!(stats.tx_frames > 0, "no frames forwarded to b: {stats:?}");
+
+    // b is still connected: NEW frames from a reach it. Under the old
+    // fatal handling b's Rtc was closed during the flood and media never
+    // flowed again.
+    let before = b.media_rx;
+    a.send_audio(20);
+    drive(&mut room, &mut [&mut a, &mut b], |_, clients| {
+        clients[1].media_rx > before
+    });
+}
