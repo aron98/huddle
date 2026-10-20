@@ -129,8 +129,14 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         &mut self.peer
     }
 
-    /// Send `Join` and wait for `Welcome`.
-    pub async fn join(&mut self, meeting_code: &str, name: &str) -> Result<(), RtcError> {
+    /// Send `Join` and wait for `Welcome`. `token` carries the per-meeting
+    /// passcode, if the meeting has one.
+    pub async fn join(
+        &mut self,
+        meeting_code: &str,
+        name: &str,
+        token: Option<String>,
+    ) -> Result<(), RtcError> {
         if self.state != SessionState::New {
             return Err(RtcError::NotJoined);
         }
@@ -139,7 +145,7 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             .send(ClientMessage::Join {
                 meeting_code: meeting_code.to_owned(),
                 name: name.to_owned(),
-                token: None,
+                token,
             })
             .await?;
 

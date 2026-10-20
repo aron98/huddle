@@ -31,6 +31,8 @@ pub struct Meeting {
     /// The series rule when this meeting recurs; `None` for a one-off.
     /// `starts_at` is the first occurrence.
     pub repeat: Option<RecurrenceRule>,
+    /// Per-meeting join passcode (issue #13). `None` means open.
+    pub passcode: Option<String>,
 }
 
 impl From<Meeting> for MeetingDto {
@@ -43,6 +45,7 @@ impl From<Meeting> for MeetingDto {
             ends_at: m.ends_at,
             cancelled: m.cancelled,
             repeat: m.repeat,
+            has_passcode: m.passcode.is_some(),
         }
     }
 }
@@ -114,6 +117,7 @@ fn row_to_meeting(row: &SqliteRow) -> Result<Meeting, MeetingError> {
             "created_at",
         )?,
         repeat: row_repeat(row)?,
+        passcode: row.try_get("passcode")?,
     })
 }
 
@@ -183,11 +187,16 @@ pub async fn create(
 
     // Codes are random; a collision burns the insert on the UNIQUE index,
     // so just retry with a fresh code.
+    let passcode = req
+        .passcode
+        .as_ref()
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty());
     for _ in 0..5 {
         let code = generate_code();
         let result = sqlx::query(
-            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
+            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&code)
@@ -199,6 +208,7 @@ pub async fn create(
         .bind(&rrule)
         .bind(&rrule_until)
         .bind(rrule_count)
+        .bind(&passcode)
         .execute(pool)
         .await;
 
@@ -218,7 +228,7 @@ pub async fn create(
 /// Look up a meeting by its (normalized) code.
 pub async fn get_by_code(pool: &SqlitePool, code: &str) -> Result<Option<Meeting>, MeetingError> {
     let row = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode
          FROM meetings WHERE code = ?1",
     )
     .bind(normalize_code(code))
@@ -234,7 +244,7 @@ pub async fn list_for_organizer(
     organizer_id: Uuid,
 ) -> Result<Vec<Meeting>, MeetingError> {
     let rows = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode
          FROM meetings WHERE organizer_id = ?1 ORDER BY starts_at ASC",
     )
     .bind(organizer_id.to_string())
@@ -266,6 +276,16 @@ pub async fn update_by_code(
     if let Some(ends_at) = req.ends_at {
         meeting.ends_at = ends_at;
     }
+    // Tri-state passcode: absent leaves it alone, `null` removes it,
+    // a value sets it (validated and trimmed like create).
+    match req.passcode {
+        None => {}
+        Some(None) => meeting.passcode = None,
+        Some(Some(passcode)) => {
+            huddle_protocol::validate_passcode(&passcode).map_err(|_| MeetingError::Invalid)?;
+            meeting.passcode = Some(passcode.trim().to_owned());
+        }
+    }
     if meeting.ends_at <= meeting.starts_at {
         return Err(MeetingError::Invalid);
     }
@@ -287,8 +307,8 @@ pub async fn update_by_code(
     let ends_at = to_text(meeting.ends_at).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
     let (rrule, rrule_until, rrule_count) = repeat_columns(&meeting.repeat)?;
     sqlx::query(
-        "UPDATE meetings SET title = ?1, starts_at = ?2, ends_at = ?3, rrule = ?4, rrule_until = ?5, rrule_count = ?6
-         WHERE code = ?7",
+        "UPDATE meetings SET title = ?1, starts_at = ?2, ends_at = ?3, rrule = ?4, rrule_until = ?5, rrule_count = ?6, passcode = ?7
+         WHERE code = ?8",
     )
     .bind(&meeting.title)
     .bind(starts_at)
@@ -296,6 +316,7 @@ pub async fn update_by_code(
     .bind(rrule)
     .bind(rrule_until)
     .bind(rrule_count)
+    .bind(&meeting.passcode)
     .bind(&meeting.code)
     .execute(pool)
     .await?;
@@ -469,6 +490,7 @@ mod tests {
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
             repeat: None,
+            passcode: None,
         }
     }
 
@@ -519,6 +541,7 @@ mod tests {
                 starts_at: OffsetDateTime::now_utc() + Duration::hours(2),
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 repeat: None,
+                passcode: None,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -549,6 +572,7 @@ mod tests {
                 ends_at: None,
                 cancelled: None,
                 repeat: None,
+                passcode: None,
             },
         )
         .await
@@ -557,6 +581,118 @@ mod tests {
         assert_eq!(updated.title, "New title");
         assert_eq!(updated.starts_at, new_start);
         assert_eq!(updated.ends_at, meeting.ends_at);
+    }
+
+    #[tokio::test]
+    async fn create_stores_trimmed_passcode() {
+        let pool = pool().await;
+        let mut request = req(Duration::hours(1), Duration::hours(1), "Locked sync");
+        request.passcode = Some("  sekrit  ".into());
+        let meeting = create(&pool, &request, None, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert_eq!(meeting.passcode.as_deref(), Some("sekrit"));
+
+        // The DTO exposes only the fact that there is one.
+        let dto = MeetingDto::from(meeting.clone());
+        assert!(dto.has_passcode);
+
+        let fetched = get_by_code(&pool, &meeting.code).await.unwrap().unwrap();
+        assert_eq!(fetched.passcode.as_deref(), Some("sekrit"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_blank_passcode() {
+        let pool = pool().await;
+        let mut request = req(Duration::hours(1), Duration::hours(1), "Broken lock");
+        request.passcode = Some("   ".into());
+        let err = create(&pool, &request, None, OffsetDateTime::now_utc())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MeetingError::Invalid));
+    }
+
+    #[tokio::test]
+    async fn update_passcode_is_tri_state() {
+        let pool = pool().await;
+        let meeting = create(
+            &pool,
+            &req(Duration::hours(1), Duration::hours(1), "Locked"),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meeting.passcode, None);
+
+        // Absent leaves the passcode unchanged (still none).
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                title: Some("Retitled".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.passcode, None);
+
+        // A value sets it.
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                passcode: Some(Some("sekrit".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.passcode.as_deref(), Some("sekrit"));
+
+        // Absent still leaves it alone.
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                title: Some("Again".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.passcode.as_deref(), Some("sekrit"));
+
+        // Explicit null removes it.
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                passcode: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.passcode, None);
+
+        // A blank value is rejected as invalid.
+        let err = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                passcode: Some(Some("  ".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MeetingError::Invalid));
     }
 
     #[tokio::test]
@@ -638,6 +774,7 @@ mod tests {
             cancelled: false,
             created_at: start,
             repeat: None,
+            passcode: None,
         };
         assert!(matches!(
             joinability_with(&meeting, &[], &config, start - Duration::minutes(6)),
@@ -666,6 +803,7 @@ mod tests {
             cancelled: true,
             created_at: OffsetDateTime::now_utc(),
             repeat: None,
+            passcode: None,
         };
         assert_eq!(
             joinability_with(&meeting, &[], &config, OffsetDateTime::now_utc()),
@@ -688,6 +826,7 @@ mod tests {
             organizer_id: None,
             cancelled: false,
             created_at: OffsetDateTime::now_utc(),
+            passcode: None,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,
@@ -706,6 +845,7 @@ mod tests {
             title: "Series".into(),
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
+            passcode: None,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,

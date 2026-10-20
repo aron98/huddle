@@ -19,7 +19,8 @@ use huddle_protocol::ErrorCode;
 /// owns the current phase and renders the matching view.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FlowPhase {
-    /// On `/m/{code}`: name, camera preview, device pickers.
+    /// On `/m/{code}`: name, passcode when required, camera preview,
+    /// device pickers.
     Prejoin,
     /// Join clicked: WS connect, join, and publish are in flight.
     Joining,
@@ -61,6 +62,9 @@ pub enum JoinError {
     Cancelled,
     /// Someone in the room already uses this name — an inline field error.
     NameTaken,
+    /// The meeting is protected by a passcode that was missing or wrong —
+    /// an inline field error, like [`JoinError::NameTaken`].
+    PasscodeRequired,
     /// The meeting is at capacity.
     Full,
     /// The server refused the join for any other reason; carries its message.
@@ -82,6 +86,7 @@ impl JoinError {
                 ErrorCode::MeetingCancelled => JoinError::Cancelled,
                 ErrorCode::NameTaken => JoinError::NameTaken,
                 ErrorCode::CapacityReached => JoinError::Full,
+                ErrorCode::PasscodeRequired => JoinError::PasscodeRequired,
                 ErrorCode::InvalidMessage
                 | ErrorCode::Internal
                 | ErrorCode::Unauthorized
@@ -110,6 +115,7 @@ impl JoinError {
             JoinError::Ended => "This meeting has ended",
             JoinError::Cancelled => "This meeting was cancelled",
             JoinError::NameTaken => "That name is taken",
+            JoinError::PasscodeRequired => "This meeting needs a passcode",
             JoinError::Full => "This meeting is full",
             JoinError::Server(_) => "Couldn't join",
             JoinError::ProtocolVersion(_) => "Update huddle to join",
@@ -151,6 +157,11 @@ impl JoinError {
             }
             JoinError::NameTaken => {
                 format!("Someone is already called \"{name}\" in this meeting. Try your full name.")
+            }
+            JoinError::PasscodeRequired => {
+                "The passcode is missing or wrong. Enter the meeting's passcode — ask the \
+                organizer for it if you don't have it — then join again."
+                    .to_owned()
             }
             JoinError::Full => "Everyone who can join has joined. Ask the organizer to make room, \
                 then try again."

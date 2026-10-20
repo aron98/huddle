@@ -504,6 +504,17 @@ button:disabled {
   font-size: var(--fs-sm);
 }
 
+.meeting-row-passcode {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+}
+
+.meeting-row-passcode input {
+  max-width: 12em;
+}
+
 .meeting-row-actions {
   display: flex;
   gap: var(--sp-2);

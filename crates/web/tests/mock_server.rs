@@ -56,6 +56,7 @@ fn meeting_dto(code: &str) -> MeetingDto {
         ends_at: now + time::Duration::hours(1),
         cancelled: false,
         repeat: None,
+        has_passcode: false,
     }
 }
 
@@ -396,7 +397,7 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
     let mut client = connect(&server).await;
 
     // --- Join ---------------------------------------------------------------
-    client.join("H7KD-PM2X-QR4T", "bob").await.unwrap();
+    client.join("H7KD-PM2X-QR4T", "bob", None).await.unwrap();
     assert_eq!(client.state(), huddle_web::rtc::SessionState::InCall);
     assert_eq!(client.you().map(|p| p.name.as_str()), Some("bob"));
     assert_eq!(client.roster().len(), 2, "alice + bob in welcome roster");
@@ -564,7 +565,7 @@ async fn publish_survives_a_stale_deferred_server_offer() {
     // rebased session. The stale offer must be dropped, not fatal.
     let server = MockServer::start_with(false, true).await;
     let mut client = connect(&server).await;
-    client.join("H7KD-PM2X-QR4T", "bob").await.unwrap();
+    client.join("H7KD-PM2X-QR4T", "bob", None).await.unwrap();
 
     // The peer connection rejects the stale offer, as Chrome does.
     client.peer_mut().fail_remote_offers = true;
@@ -594,7 +595,7 @@ async fn join_error_surfaces_server_code() {
     let server = MockServer::start(true).await;
     let mut client = connect(&server).await;
 
-    let err = client.join("NOPE", "bob").await.unwrap_err();
+    let err = client.join("NOPE", "bob", None).await.unwrap_err();
     let huddle_web::rtc::RtcError::Server(server_err) = &err else {
         panic!("expected server error, got: {err}");
     };

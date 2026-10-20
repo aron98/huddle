@@ -1,8 +1,8 @@
 //! The prejoin page (`/m/{code}`): meeting info, camera preview, name,
-//! and device pickers. This is the `Prejoin` state of the flow defined
-//! in `crate::flow`; the flow owner (`crate::call::MeetingFlow`) hands the
-//! signals down so a failed join can land back here with everything the
-//! user set up still intact.
+//! passcode (when the meeting has one), and device pickers. This is the
+//! `Prejoin` state of the flow defined in `crate::flow`; the flow owner
+//! (`crate::call::MeetingFlow`) hands the signals down so a failed join
+//! can land back here with everything the user set up still intact.
 
 use crate::api;
 use crate::flow::JoinError;
@@ -26,6 +26,10 @@ pub struct PrejoinState {
     pub mic_id: RwSignal<Option<String>>,
     pub cam_on: RwSignal<bool>,
     pub mic_on: RwSignal<bool>,
+    /// The per-meeting passcode, sent as the join token. Kept in the
+    /// flow-owned state so a refused join lands back here with it
+    /// intact, like the name.
+    pub passcode: RwSignal<String>,
     /// Camera/mic acquisition failure; `None` while media works.
     pub media_error: RwSignal<Option<String>>,
     /// Meeting info from `GET /api/meetings/{code}`, for the title and
@@ -56,6 +60,7 @@ impl PrejoinState {
             mic_id: RwSignal::new(None),
             cam_on: RwSignal::new(true),
             mic_on: RwSignal::new(true),
+            passcode: RwSignal::new(String::new()),
             media_error: RwSignal::new(None),
             meeting: RwSignal::new(None),
             joinability: RwSignal::new(None),
@@ -246,6 +251,34 @@ pub fn Prejoin(
         }
     };
 
+    let on_passcode_input = move |ev| {
+        state.passcode.set(event_target_value(&ev));
+        // Typing here is the fix for a passcode refusal — drop it so the
+        // inline error (and any banner) disappears as soon as the user
+        // reacts, mirroring the name field.
+        if matches!(
+            state.join_error.get_untracked(),
+            Some(JoinError::PasscodeRequired)
+        ) {
+            state.join_error.set(None);
+        }
+    };
+
+    // The passcode field appears when the meeting is known to have one
+    // (proactive, from the prejoin fetch) or when the server just said a
+    // passcode is required (meeting info may not have arrived).
+    let passcode_needed = move || {
+        state.meeting.get().is_some_and(|m| m.has_passcode)
+            || matches!(state.join_error.get(), Some(JoinError::PasscodeRequired))
+    };
+    // A passcode refusal is an inline field error, like a taken name.
+    let inline_passcode_error = move || {
+        if let Some(JoinError::PasscodeRequired) = state.join_error.get() {
+            return Some(JoinError::PasscodeRequired.detail(&state.name.get_untracked()));
+        }
+        None
+    };
+
     let retry_join = {
         move || {
             let name = state.name.get_untracked().trim().to_owned();
@@ -306,7 +339,9 @@ pub fn Prejoin(
     };
     let banner = move || {
         state.join_error.get().and_then(|err| {
-            (!matches!(err, JoinError::NameTaken)).then(move || {
+            // NameTaken and PasscodeRequired render as inline field
+            // errors instead of a banner: the fix is the field itself.
+            (!matches!(err, JoinError::NameTaken | JoinError::PasscodeRequired)).then(move || {
                 let headline = err.headline();
                 let detail = err.detail(&state.name.get_untracked());
                 view! {
@@ -398,6 +433,33 @@ pub fn Prejoin(
                     {move || {
                         inline_name_error()
                             .map(|message| view! { <p class="field-error" role="alert">{message}</p> })
+                    }}
+
+                    {move || {
+                        passcode_needed().then(|| {
+                            view! {
+                                <label class="field">
+                                    "Passcode"
+                                    <input
+                                        type="password"
+                                        placeholder="Meeting passcode"
+                                        autocomplete="off"
+                                        data-testid="passcode-input"
+                                        prop:value=state.passcode
+                                        on:input=on_passcode_input
+                                    />
+                                </label>
+                                {move || {
+                                    inline_passcode_error().map(
+                                        |message| {
+                                            view! {
+                                                <p class="field-error" role="alert">{message}</p>
+                                            }
+                                        },
+                                    )
+                                }}
+                            }
+                        })
                     }}
 
                     <label class="field">

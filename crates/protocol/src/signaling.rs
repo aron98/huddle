@@ -80,6 +80,9 @@ pub enum ErrorCode {
     RecordingActive,
     /// The meeting has no live session to record (nobody has joined).
     MeetingNotLive,
+    /// The join did not carry the meeting's passcode, or carried a wrong
+    /// one. The client should prompt for a passcode and rejoin with it.
+    PasscodeRequired,
 }
 
 /// Client → server messages.
@@ -94,7 +97,8 @@ pub enum ClientMessage {
     Join {
         meeting_code: String,
         name: String,
-        /// Reserved for per-meeting passcodes (post-MVP).
+        /// Per-meeting passcode, required when the meeting has one
+        /// (issue #13). Compared in constant time server-side.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -273,6 +277,7 @@ mod tests {
                 ends_at: OffsetDateTime::UNIX_EPOCH,
                 cancelled: false,
                 repeat: None,
+                has_passcode: false,
             },
             roster: vec![],
             ice_servers: vec![],
@@ -392,10 +397,38 @@ mod tests {
             "ice_servers": [],
         });
         let back: ServerMessage = serde_json::from_value(legacy).unwrap();
-        let ServerMessage::Welcome { recording, .. } = back else {
+        let ServerMessage::Welcome {
+            recording, meeting, ..
+        } = back
+        else {
             panic!("expected welcome");
         };
         assert!(!recording);
+        // Same additive story for the meeting's passcode flag.
+        assert!(!meeting.has_passcode);
+    }
+
+    #[test]
+    fn passcode_required_error_is_snake_case() {
+        let msg = ServerMessage::Error {
+            code: ErrorCode::PasscodeRequired,
+            message: "this meeting requires a passcode".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["code"], "passcode_required");
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn client_join_carries_token_when_present() {
+        let msg = ClientMessage::Join {
+            meeting_code: "H7KD-PM2X-QR4T".into(),
+            name: "alice".into(),
+            token: Some("sekrit".into()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["token"], "sekrit");
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
     }
 
     #[test]

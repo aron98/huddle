@@ -106,7 +106,11 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
             signals.prejoin.join_error.set(None);
             signals.phase.set(FlowPhase::Joining);
             let code = code.get_untracked();
-            spawn_local(run_session(code, name, local, signals));
+            // The passcode field is empty when the meeting has none (or
+            // the user left it blank); trim so whitespace never ships.
+            let passcode = signals.prejoin.passcode.get_untracked().trim().to_owned();
+            let passcode = (!passcode.is_empty()).then_some(passcode);
+            spawn_local(run_session(code, name, passcode, local, signals));
         }
     };
 
@@ -213,6 +217,7 @@ async fn wind_down_share(
 async fn run_session(
     code: String,
     name: String,
+    passcode: Option<String>,
     local: Option<MediaStream>,
     signals: SessionSignals,
 ) {
@@ -297,7 +302,7 @@ async fn run_session(
     }
 
     let mut client = RtcClient::new(signaling, peer);
-    if let Err(e) = client.join(&code, &name).await {
+    if let Err(e) = client.join(&code, &name, passcode).await {
         signals
             .prejoin
             .join_error

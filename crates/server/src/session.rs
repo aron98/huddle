@@ -54,8 +54,12 @@ async fn run_session(socket: WebSocket, state: AppState) {
 
     // The first frame must be a join; anything else gets one error and a
     // close.
-    let (meeting_code, name) = match expect_join(&mut receiver).await {
-        JoinOutcome::Joined { meeting_code, name } => (meeting_code, name),
+    let (meeting_code, name, token) = match expect_join(&mut receiver).await {
+        JoinOutcome::Joined {
+            meeting_code,
+            name,
+            token,
+        } => (meeting_code, name, token),
         JoinOutcome::Closed => return,
         JoinOutcome::Rejected { code, message } => {
             send_error(&mut sender, code, message).await;
@@ -67,7 +71,15 @@ async fn run_session(socket: WebSocket, state: AppState) {
     // engine. The engine enforces capacity and name uniqueness; both it
     // and this validation must agree on the meeting's normalized code.
     let (out_tx, mut out_rx) = unbounded_channel::<ServerMessage>();
-    let (id, meeting_id) = match try_join(&state, &meeting_code, &name, out_tx.clone()).await {
+    let (id, meeting_id) = match try_join(
+        &state,
+        &meeting_code,
+        &name,
+        token.as_deref(),
+        out_tx.clone(),
+    )
+    .await
+    {
         Ok(ids) => ids,
         Err((code, message)) => {
             send_error(&mut sender, code, message).await;
@@ -155,8 +167,13 @@ async fn run_session(socket: WebSocket, state: AppState) {
 
 /// What the first frame on a fresh socket resolved to.
 enum JoinOutcome {
-    /// A well-formed join message.
-    Joined { meeting_code: String, name: String },
+    /// A well-formed join message. `token` is the passcode, when the
+    /// client sent one.
+    Joined {
+        meeting_code: String,
+        name: String,
+        token: Option<String>,
+    },
     /// The socket closed before any usable frame arrived.
     Closed,
     /// The frame was wrong; `code`/`message` tell the client why.
@@ -187,8 +204,15 @@ async fn expect_join(receiver: &mut SplitStream<WebSocket>) -> JoinOutcome {
     };
     match serde_json::from_str::<ClientMessage>(&text) {
         Ok(ClientMessage::Join {
-            meeting_code, name, ..
-        }) => JoinOutcome::Joined { meeting_code, name },
+            meeting_code,
+            name,
+            token,
+            ..
+        }) => JoinOutcome::Joined {
+            meeting_code,
+            name,
+            token,
+        },
         Ok(_) => JoinOutcome::Rejected {
             code: ErrorCode::InvalidMessage,
             message: "expected a join message",
@@ -208,6 +232,7 @@ async fn try_join(
     state: &AppState,
     meeting_code: &str,
     name: &str,
+    token: Option<&str>,
     out: UnboundedSender<ServerMessage>,
 ) -> Result<(Uuid, Uuid), (ErrorCode, String)> {
     let name = name.trim();
@@ -254,6 +279,23 @@ async fn try_join(
             return Err((
                 ErrorCode::MeetingCancelled,
                 "the meeting was cancelled".into(),
+            ));
+        }
+    }
+
+    // Passcode gate (issue #13): compare in constant time so a wrong
+    // passcode takes the same path as a right one. The length check is
+    // inherently early-exit, but the length is not a secret worth
+    // protecting. Missing and wrong produce the same refusal.
+    if let Some(expected) = &meeting.passcode {
+        use subtle::ConstantTimeEq;
+        let provided = token.unwrap_or("").trim();
+        let ok = provided.len() == expected.len()
+            && bool::from(provided.as_bytes().ct_eq(expected.as_bytes()));
+        if !ok {
+            return Err((
+                ErrorCode::PasscodeRequired,
+                "this meeting requires a passcode".into(),
             ));
         }
     }
@@ -361,12 +403,33 @@ mod tests {
         }
 
         async fn create_meeting(&self, starts_in_min: i64, lasts_min: i64) -> String {
+            self.create_meeting_opt(starts_in_min, lasts_min, None)
+                .await
+        }
+
+        async fn create_meeting_with_passcode(
+            &self,
+            starts_in_min: i64,
+            lasts_min: i64,
+            passcode: &str,
+        ) -> String {
+            self.create_meeting_opt(starts_in_min, lasts_min, Some(passcode.into()))
+                .await
+        }
+
+        async fn create_meeting_opt(
+            &self,
+            starts_in_min: i64,
+            lasts_min: i64,
+            passcode: Option<String>,
+        ) -> String {
             let now = OffsetDateTime::now_utc();
             let req = CreateMeetingRequest {
                 title: "Test call".into(),
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: None,
+                passcode,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -388,6 +451,7 @@ mod tests {
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: Some(rule),
+                passcode: None,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -584,20 +648,35 @@ mod tests {
         /// Recording flag from this client's own Welcome: a late joiner
         /// must never be silently recorded.
         recording: bool,
+        /// Whether the Welcome's meeting announced a passcode.
+        meeting_has_passcode: bool,
     }
 
     impl TestClient {
         async fn connect(server: &TestServer, code: &str, name: &str) -> Self {
+            Self::connect_with_token(server, code, name, None).await
+        }
+
+        /// Connect and join with a passcode (`Join.token`).
+        async fn connect_with_token(
+            server: &TestServer,
+            code: &str,
+            name: &str,
+            token: Option<&str>,
+        ) -> Self {
             let request = format!("{}/ws", server.base).into_client_request().unwrap();
             let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
             let mut ws = ws;
             let pump = spawn_pump();
 
-            let join = serde_json::json!({
+            let mut join = serde_json::json!({
                 "type": "join",
                 "meeting_code": code,
                 "name": name,
             });
+            if let Some(token) = token {
+                join["token"] = serde_json::json!(token);
+            }
             ws.send(tokio_tungstenite::tungstenite::Message::Text(
                 join.to_string().into(),
             ))
@@ -610,6 +689,7 @@ mod tests {
                 you: Uuid::nil(),
                 roster: Vec::new(),
                 recording: false,
+                meeting_has_passcode: false,
             };
             let msg = client.next_server_message().await;
             let ServerMessage::Welcome {
@@ -617,6 +697,7 @@ mod tests {
                 roster,
                 protocol_version,
                 recording,
+                meeting,
                 ..
             } = msg
             else {
@@ -626,6 +707,7 @@ mod tests {
             client.you = you.id;
             client.roster = roster;
             client.recording = recording;
+            client.meeting_has_passcode = meeting.has_passcode;
             client
         }
 
@@ -946,6 +1028,73 @@ mod tests {
         )
         .await;
         expect_error(&mut ws, ErrorCode::NameTaken).await;
+    }
+
+    // ------------------------------------------------------------------
+    // Passcodes (issue 13).
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn join_without_passcode_is_rejected() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting_with_passcode(0, 60, "sekrit").await;
+
+        let mut ws = ws_connect(&server.base).await;
+        send_json(
+            &mut ws,
+            serde_json::json!({ "type": "join", "meeting_code": code, "name": "alice" }),
+        )
+        .await;
+        expect_error(&mut ws, ErrorCode::PasscodeRequired).await;
+    }
+
+    #[tokio::test]
+    async fn join_with_wrong_passcode_is_rejected() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting_with_passcode(0, 60, "sekrit").await;
+
+        let mut ws = ws_connect(&server.base).await;
+        send_json(
+            &mut ws,
+            serde_json::json!({
+                "type": "join",
+                "meeting_code": code,
+                "name": "alice",
+                "token": "wrong",
+            }),
+        )
+        .await;
+        // Same refusal as a missing passcode: no oracle for "close".
+        expect_error(&mut ws, ErrorCode::PasscodeRequired).await;
+    }
+
+    #[tokio::test]
+    async fn join_with_right_passcode_is_welcomed() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting_with_passcode(0, 60, "sekrit").await;
+
+        let alice = TestClient::connect_with_token(&server, &code, "alice", Some("sekrit")).await;
+        assert!(
+            alice.meeting_has_passcode,
+            "the Welcome must announce the passcode state"
+        );
+        alice.pump.stop();
+    }
+
+    #[tokio::test]
+    async fn join_without_passcode_to_open_meeting_is_unchanged() {
+        let server = TestServer::start().await;
+        let code = server.create_meeting(0, 60).await;
+
+        // No passcode set: a stray token changes nothing, and the
+        // Welcome reports no passcode.
+        let alice = TestClient::connect_with_token(&server, &code, "alice", Some("stray")).await;
+        assert!(!alice.meeting_has_passcode);
+        alice.pump.stop();
+
+        // And the plain join still works exactly as before.
+        let bob = TestClient::connect(&server, &code, "bob").await;
+        bob.pump.stop();
     }
 
     #[tokio::test]
