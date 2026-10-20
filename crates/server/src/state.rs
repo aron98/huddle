@@ -6,6 +6,7 @@ use sqlx::SqlitePool;
 use crate::config::Config;
 use crate::engine::EngineHandle;
 use crate::identity::{Identity, MagicLinkIdentityProvider, OidcIdentityProvider};
+use crate::mailer::Mailer;
 use crate::ratelimit::RateLimiter;
 
 /// Shared application state, cheap to clone into handlers.
@@ -22,6 +23,10 @@ pub struct Inner {
     /// when `[oidc]` is set. Concrete enum, not a trait object — the
     /// `IdentityProvider` trait is async-fn-in-trait and not dyn-safe.
     pub identity: Identity,
+    /// The configured mail transport: log by default, SMTP or Resend
+    /// when configured (issue #35). Concrete enum for the same reason
+    /// as `identity` (ADR 006).
+    pub mailer: Mailer,
     /// HMAC key for session cookies. Random per boot unless
     /// `session_secret` is configured.
     pub session_key: Vec<u8>,
@@ -50,6 +55,7 @@ impl AppState {
                 time::Duration::minutes(i64::from(config.login_token_ttl_min)),
             )),
         };
+        let mailer = Mailer::select(&config)?;
         let session_key = match &config.session_secret {
             Some(secret) => secret.as_bytes().to_vec(),
             None => {
@@ -67,6 +73,7 @@ impl AppState {
                 pool,
                 engine,
                 identity,
+                mailer,
                 session_key,
                 rate_limiter,
             }),
@@ -87,6 +94,10 @@ impl AppState {
 
     pub fn identity(&self) -> &Identity {
         &self.inner.identity
+    }
+
+    pub fn mailer(&self) -> &Mailer {
+        &self.inner.mailer
     }
 
     pub fn session_key(&self) -> &[u8] {
