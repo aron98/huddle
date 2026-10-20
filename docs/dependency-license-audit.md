@@ -58,6 +58,15 @@ fallback `crates/server/assets/index.html` into the release binary. All
 embedded content is first-party huddle code — no third-party notices need to be
 aggregated, and no `NOTICE` file is required today (see ADR 005).
 
+One vendored third-party asset set exists: `crates/web/assets/effects/`
+(background-blur pipeline, issue #32) carries the SIMD wasm build, solution
+graph, and landscape segmentation model from
+`@mediapipe/selfie_segmentation@0.1.1675465747` (Apache-2.0, no NOTICE file)
+plus a first-party `blur.js` shim. Provenance is tracked per file in
+`crates/web/assets/effects/README.md`; the assets are served same-origin under
+`/assets/effects/` and land in release binaries via rust-embed. Apache-2.0
+redistribution terms are met; no additional notices are required.
+
 ## Ongoing compliance
 
 - MIT, ISC, Zlib, BSD, Unicode-3.0, BSL-1.0, CC0-1.0, 0BSD, Unlicense, and
