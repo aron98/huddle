@@ -221,11 +221,22 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         }
 
         for sdp in deferred_offers {
-            let answer = self.peer.apply_remote_offer(sdp).await?;
-            self.signaling
-                .send(ClientMessage::SdpAnswer { sdp: answer })
-                .await?;
-            self.flush_local_candidates().await?;
+            // A deferred offer can already be stale: the SFU discards its
+            // own pending renegotiation whenever it accepts an offer from us
+            // and re-offers from the rebased session, so one that hit the
+            // wire before our own offer can no longer apply afterwards
+            // ("m-line order doesn't match"). Failing here would kill a
+            // healthy session — e.g. a share that preempts another one — so
+            // drop the offer and let the regenerated one be answered.
+            match self.peer.apply_remote_offer(sdp).await {
+                Ok(answer) => {
+                    self.signaling
+                        .send(ClientMessage::SdpAnswer { sdp: answer })
+                        .await?;
+                    self.flush_local_candidates().await?;
+                }
+                Err(e) => leptos::logging::warn!("dropping stale server offer: {e}"),
+            }
         }
         Ok(())
     }
@@ -320,6 +331,13 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             ServerMessage::Sharing { id, sharing } => {
                 if let Some(p) = self.roster.iter_mut().find(|p| p.id == id) {
                     p.sharing = sharing;
+                }
+                // `you` is a Welcome-time snapshot; keep it in sync so a
+                // sharer can tell whether a start survived (a preemption
+                // that lands mid-start flips this back to false before
+                // `publish` returns).
+                if let Some(you) = self.you.as_mut().filter(|you| you.id == id) {
+                    you.sharing = sharing;
                 }
                 Ok(())
             }
