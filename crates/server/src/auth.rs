@@ -198,7 +198,7 @@ fn land_with_session(state: &AppState, organizer: Organizer) -> Response {
     let expires_at =
         OffsetDateTime::now_utc() + time::Duration::minutes(i64::from(config.session_ttl_min));
     let value = issue_cookie(state.session_key(), &organizer, expires_at);
-    let secure = if config.base_url.starts_with("https://") {
+    let secure = if config.secure_cookies() {
         "; Secure"
     } else {
         ""
@@ -243,7 +243,7 @@ pub async fn oidc_login(
     }
     match provider.begin_login(OffsetDateTime::now_utc()).await {
         Ok((url, login_state)) => {
-            let secure = if state.config().base_url.starts_with("https://") {
+            let secure = if state.config().secure_cookies() {
                 "; Secure"
             } else {
                 ""
