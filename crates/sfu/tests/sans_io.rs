@@ -102,6 +102,20 @@ impl TestClient {
         mid
     }
 
+    /// Like [`TestClient::share_screen`] but with the sendonly direction a
+    /// browser's add_transceiver(SendOnly) init produces.
+    fn share_screen_sendonly(&mut self, room: &mut Room) -> str0m::media::Mid {
+        let mut changes = self.rtc.sdp_api();
+        let mid = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, pending) = changes.apply().unwrap();
+        let answer = room
+            .answer_sdp_offer(self.id, &offer.to_sdp_string())
+            .unwrap();
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        mid
+    }
+
     /// Add a simulcast camera m-line with three send layers ("high",
     /// "mid", "low" in the sender's encoding order, highest quality
     /// first) and offer it to the room, as a browser configured with
@@ -737,6 +751,48 @@ fn stopping_a_share_winds_down_subscribers_and_reshare_reopens() {
     let before = b.media_rx;
     a.send_screen_frames(screen_mid, 10);
     drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, cs| {
+        cs[1].media_rx > before
+    });
+}
+
+#[test]
+fn reshare_on_a_new_transceiver_reopens_subscribers() {
+    // The browser never reuses the screen transceiver: removeTrack leaves
+    // the old m-line recvonly and a re-share adds a brand-new sendonly
+    // m-line (add_transceiver with init). This replicates that sequence.
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+    let (a_id, b_id) = (a.id, b.id);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs.iter().all(|c| c.connected)
+    });
+
+    // First share: a new sendonly m-line, announced first.
+    room.set_sharing(a_id, true).unwrap();
+    let screen1 = a.share_screen_sendonly(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 2
+    });
+
+    // Stop: the old m-line flips recvonly (removeTrack).
+    a.set_screen_direction(&mut room, screen1, Direction::RecvOnly);
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 1
+    });
+
+    // Re-share: announced first, then a brand-new sendonly m-line.
+    room.set_sharing(a_id, true).unwrap();
+    let screen2 = a.share_screen_sendonly(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 2
+    });
+
+    let before = b.media_rx;
+    a.send_screen_frames(screen2, 10);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
         cs[1].media_rx > before
     });
 }
