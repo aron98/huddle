@@ -282,6 +282,7 @@ fn Dashboard() -> impl IntoView {
             title: title.get_untracked().trim().to_owned(),
             starts_at,
             ends_at,
+            repeat: None,
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));

@@ -15,8 +15,8 @@ pub mod signaling;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub use api::{
-    ApiError, CreateMeetingRequest, Joinability, MeetingDto, MeetingResponse, RecordingDto,
-    UpdateMeetingRequest,
+    ApiError, CreateMeetingRequest, Joinability, MeetingDto, MeetingResponse, OccurrenceDto,
+    RecordingDto, RecurrenceRule, RepeatFrequency, UpdateMeetingRequest,
 };
 pub use signaling::{
     ChatMessage, ClientMessage, ErrorCode, IceServer, Participant, ParticipantId, ServerMessage,

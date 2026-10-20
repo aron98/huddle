@@ -35,6 +35,7 @@ impl From<Meeting> for MeetingDto {
             starts_at: m.starts_at,
             ends_at: m.ends_at,
             cancelled: m.cancelled,
+            repeat: None,
         }
     }
 }
@@ -269,6 +270,7 @@ mod tests {
             title: title.into(),
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
+            repeat: None,
         }
     }
 
@@ -318,6 +320,7 @@ mod tests {
                 title: "Broken".into(),
                 starts_at: OffsetDateTime::now_utc() + Duration::hours(2),
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
+                repeat: None,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -347,6 +350,7 @@ mod tests {
                 starts_at: Some(new_start),
                 ends_at: None,
                 cancelled: None,
+                repeat: None,
             },
         )
         .await

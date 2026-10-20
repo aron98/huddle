@@ -272,6 +272,7 @@ mod tests {
                 starts_at: OffsetDateTime::UNIX_EPOCH,
                 ends_at: OffsetDateTime::UNIX_EPOCH,
                 cancelled: false,
+                repeat: None,
             },
             roster: vec![],
             ice_servers: vec![],

@@ -87,6 +87,7 @@ async fn create_meeting(
         Json(MeetingResponse {
             joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
             meeting: meeting.into(),
+            upcoming_occurrences: Vec::new(),
         }),
     ))
 }
@@ -102,6 +103,7 @@ async fn get_meeting(
     Ok(Json(MeetingResponse {
         joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
         meeting: meeting.into(),
+        upcoming_occurrences: Vec::new(),
     }))
 }
 
@@ -119,6 +121,7 @@ async fn update_meeting(
     Ok(Json(MeetingResponse {
         joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
         meeting: meeting.into(),
+        upcoming_occurrences: Vec::new(),
     }))
 }
 
@@ -135,6 +138,7 @@ async fn cancel_meeting(
     Ok(Json(MeetingResponse {
         joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
         meeting: meeting.into(),
+        upcoming_occurrences: Vec::new(),
     }))
 }
 
@@ -155,6 +159,7 @@ async fn my_meetings(
         .map(|meeting| MeetingResponse {
             joinability: meetings::joinability(&meeting, state.config(), now),
             meeting: meeting.into(),
+            upcoming_occurrences: Vec::new(),
         })
         .collect();
     Ok(Json(responses))
