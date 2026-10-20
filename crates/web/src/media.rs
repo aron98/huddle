@@ -51,6 +51,33 @@ pub async fn request_media(
         .map_err(|e| format!("getUserMedia returned {e:?}"))
 }
 
+/// Acquire only the microphone, with the same explicit audio
+/// constraints [`request_media`] applies — used by the in-call audio
+/// settings swap, where the camera track must not be disturbed.
+pub async fn request_mic(
+    mic_id: Option<&str>,
+    audio: AudioSettings,
+) -> Result<MediaStreamTrack, String> {
+    let devices = media_devices()?;
+
+    let constraints = MediaStreamConstraints::new();
+    constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
+
+    let promise = devices
+        .get_user_media_with_constraints(&constraints)
+        .map_err(|e| format!("cannot call getUserMedia: {e:?}"))?;
+    let stream = JsFuture::from(promise)
+        .await
+        .map_err(|e| format!("getUserMedia denied or failed: {e:?}"))?;
+    let stream = stream
+        .dyn_into::<MediaStream>()
+        .map_err(|e| format!("getUserMedia returned {e:?}"))?;
+    tracks_of(&stream)
+        .into_iter()
+        .find(|t| t.kind() == "audio")
+        .ok_or_else(|| "microphone stream has no audio track".to_owned())
+}
+
 /// List cameras and microphones. Labels are only populated once the page
 /// holds capture permission, so call [`request_media`] first.
 pub async fn list_devices() -> Result<Vec<Device>, String> {
