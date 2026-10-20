@@ -21,7 +21,7 @@ use uuid::Uuid;
 use huddle_protocol::{ApiError, ErrorCode};
 
 use crate::identity::{Identity, IdentityError, IdentityProvider, Organizer};
-use crate::mailer;
+use crate::mailer::{self, MailTransport};
 use crate::state::AppState;
 
 /// The browser-visible session cookie name.
@@ -156,8 +156,10 @@ pub async fn request_link(
         Ok(token) => {
             let base = state.config().base_url.trim_end_matches('/');
             let link = format!("{base}/api/auth/verify?token={token}");
-            if let Err(e) =
-                mailer::send_login_link(state.config().smtp.as_ref(), &body.email, &link).await
+            if let Err(e) = state
+                .mailer()
+                .send(mailer::Email::login_link(&body.email, &link))
+                .await
             {
                 tracing::warn!("magic-link delivery failed: {e}");
             }

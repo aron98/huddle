@@ -59,10 +59,16 @@ pub struct Config {
     pub session_secret: Option<String>,
     /// Minutes an organizer session cookie stays valid.
     pub session_ttl_min: u32,
-    /// SMTP relay for magic-link emails. `None` (the default) logs the
-    /// link instead of sending it — fine for development and small
-    /// self-hosted setups, and it keeps the single binary dependency-free.
+    /// SMTP relay for email (`[smtp]`). A section on its own still
+    /// selects the SMTP transport, exactly as before issue #35; the
+    /// general selection mechanism is [`Config::mail`].
     pub smtp: Option<SmtpConfig>,
+    /// Mail delivery selection (issue #35): the transport plus its
+    /// provider-specific settings. Unset (the default) auto-detects —
+    /// `[smtp]` alone keeps delivering through the relay, nothing
+    /// configured logs the email instead of sending it, so evaluating
+    /// huddle never requires an email account. See [`MailConfig`].
+    pub mail: MailConfig,
     /// OIDC identity provider for SSO (issue #11). `None` (the default)
     /// keeps magic links as the organizer sign-in flow; when set, SSO
     /// replaces them. See [`OidcConfig`].
@@ -103,6 +109,7 @@ pub struct IceServerConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SmtpConfig {
     pub host: String,
+    #[serde(default = "default_smtp_port")]
     pub port: u16,
     #[serde(default)]
     pub username: Option<String>,
@@ -110,6 +117,96 @@ pub struct SmtpConfig {
     pub password: Option<String>,
     #[serde(default)]
     pub from: Option<String>,
+}
+
+/// Serde default for [`SmtpConfig::port`]: submission over STARTTLS.
+fn default_smtp_port() -> u16 {
+    587
+}
+
+/// Which transport delivers huddle's email (issue #35, ADR 006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MailProvider {
+    /// Log the email at `info` level — the dependency-free default.
+    Log,
+    /// Send through the `[smtp]` relay (lettre STARTTLS).
+    Smtp,
+    /// Deliver via the Resend HTTPS API (`[mail.resend]`).
+    Resend,
+}
+
+impl MailProvider {
+    /// Parse a provider name, e.g. from `HUDDLE_MAIL_PROVIDER`. A typo
+    /// fails loudly, naming the valid values.
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim() {
+            "log" => Ok(Self::Log),
+            "smtp" => Ok(Self::Smtp),
+            "resend" => Ok(Self::Resend),
+            other => anyhow::bail!(
+                "unknown mail provider {other:?}; valid values are \"log\", \"smtp\", \"resend\""
+            ),
+        }
+    }
+}
+
+/// Mail delivery selection, as configured in `huddle.toml`:
+///
+/// ```toml
+/// [mail]
+/// provider = "resend"        # "log" | "smtp" | "resend"
+///
+/// [mail.resend]
+/// api_key = "re_…"
+/// from = "huddle@example.com"
+/// ```
+///
+/// `provider` may be omitted: huddle then detects the transport from
+/// whichever section is present — `[mail.resend]` selects Resend, a
+/// bare `[smtp]` keeps legacy deployments delivering exactly as
+/// before, nothing configured logs the email. An explicit `provider`
+/// always wins, and its section must exist.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct MailConfig {
+    /// Pins the transport when set; `None` auto-detects.
+    pub provider: Option<MailProvider>,
+    /// Resend API credentials; required when the provider is (or
+    /// detects to) `resend`.
+    pub resend: Option<ResendConfig>,
+}
+
+/// Resend delivery, as configured in `huddle.toml`:
+///
+/// ```toml
+/// [mail.resend]
+/// api_key = "re_…"
+/// from = "huddle@example.com"
+/// ```
+///
+/// Or per-field via `HUDDLE_MAIL_RESEND_API_KEY` /
+/// `HUDDLE_MAIL_RESEND_FROM`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResendConfig {
+    /// Resend API key (`re_…`) from the dashboard.
+    pub api_key: String,
+    /// Envelope sender, e.g. `"Huddle <huddle@example.com>"`.
+    pub from: String,
+}
+
+/// The transport a configuration resolves to (issue #35, ADR 006):
+/// decided and validated here — pure data, no clients built — so
+/// config tests can cover every combination without touching the
+/// network. Startup turns it into a `mailer::Mailer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailSelection {
+    /// Log emails at `info` level.
+    Log,
+    /// Deliver through the SMTP relay.
+    Smtp(SmtpConfig),
+    /// Deliver through the Resend API.
+    Resend(ResendConfig),
 }
 
 /// OIDC single sign-on, as configured in `huddle.toml`:
@@ -150,6 +247,7 @@ impl Default for Config {
             session_secret: None,
             session_ttl_min: 120,
             smtp: None,
+            mail: MailConfig::default(),
             oidc: None,
             stats_token: None,
             rate_limit_per_min: 30,
@@ -200,6 +298,7 @@ impl Config {
         let (issuer, client_id, secret) = env_oidc;
         let mut config = config;
         Self::apply_oidc_env_with(&mut config, issuer, client_id, secret)?;
+        Self::apply_mail_env_with(&mut config, MailEnv::from_env())?;
         Ok(config)
     }
 
@@ -250,6 +349,126 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve and validate the mail transport (issue #35, ADR 006).
+    ///
+    /// An explicit `mail.provider` wins; without one the transport is
+    /// detected from whichever section is present — a bare `[smtp]`
+    /// keeps existing deployments on SMTP, nothing at all logs the
+    /// email (the dependency-free default), and both configured at
+    /// once is an error rather than a silent pick.
+    pub fn mail_selection(&self) -> anyhow::Result<MailSelection> {
+        if let Some(provider) = self.mail.provider {
+            return match provider {
+                MailProvider::Log => Ok(MailSelection::Log),
+                MailProvider::Smtp => Ok(match &self.smtp {
+                    Some(smtp) => MailSelection::Smtp(smtp.clone()),
+                    None => anyhow::bail!("mail.provider = \"smtp\" requires an [smtp] section"),
+                }),
+                MailProvider::Resend => self.selected_resend(),
+            };
+        }
+        match (&self.mail.resend, &self.smtp) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "[smtp] and [mail.resend] are both configured; \
+                 set mail.provider to pick one"
+            ),
+            (Some(_), None) => self.selected_resend(),
+            (None, Some(smtp)) => Ok(MailSelection::Smtp(smtp.clone())),
+            (None, None) => Ok(MailSelection::Log),
+        }
+    }
+
+    /// Validate `[mail.resend]` and select it — shared by the explicit
+    /// `provider = "resend"` arm and resend detection.
+    fn selected_resend(&self) -> anyhow::Result<MailSelection> {
+        let Some(resend) = &self.mail.resend else {
+            anyhow::bail!("mail.provider = \"resend\" requires a [mail.resend] section");
+        };
+        if resend.api_key.trim().is_empty() {
+            anyhow::bail!("[mail.resend] api_key must not be empty");
+        }
+        if resend.from.trim().is_empty() {
+            anyhow::bail!("[mail.resend] from must not be empty");
+        }
+        Ok(MailSelection::Resend(resend.clone()))
+    }
+
+    /// Testable core of the `HUDDLE_MAIL_*` / `HUDDLE_SMTP_*` env
+    /// handling, mirroring [`Config::apply_oidc_env_with`]: each set,
+    /// non-empty value overrides the matching TOML field, merging
+    /// into an existing section when there is one. A half-configured
+    /// transport must fail loudly rather than silently break delivery.
+    fn apply_mail_env_with(&mut self, env: MailEnv) -> anyhow::Result<()> {
+        if let Some(provider) = env.provider.filter(|v| !v.trim().is_empty()) {
+            self.mail.provider = Some(MailProvider::parse(&provider)?);
+        }
+
+        if env.resend_api_key.is_some() || env.resend_from.is_some() {
+            let mut resend = self.mail.resend.clone().unwrap_or(ResendConfig {
+                api_key: String::new(),
+                from: String::new(),
+            });
+            if let Some(v) = env.resend_api_key.filter(|v| !v.trim().is_empty()) {
+                resend.api_key = v;
+            }
+            if let Some(v) = env.resend_from.filter(|v| !v.trim().is_empty()) {
+                resend.from = v;
+            }
+            if resend.api_key.trim().is_empty() {
+                anyhow::bail!(
+                    "HUDDLE_MAIL_RESEND_API_KEY is required when any \
+                     HUDDLE_MAIL_RESEND_* variable is set"
+                );
+            }
+            if resend.from.trim().is_empty() {
+                anyhow::bail!(
+                    "HUDDLE_MAIL_RESEND_FROM is required when any \
+                     HUDDLE_MAIL_RESEND_* variable is set"
+                );
+            }
+            self.mail.resend = Some(resend);
+        }
+
+        let any_smtp = env.smtp_host.is_some()
+            || env.smtp_port.is_some()
+            || env.smtp_username.is_some()
+            || env.smtp_password.is_some()
+            || env.smtp_from.is_some();
+        if any_smtp {
+            let mut smtp = self.smtp.clone().unwrap_or(SmtpConfig {
+                host: String::new(),
+                port: 587,
+                username: None,
+                password: None,
+                from: None,
+            });
+            if let Some(v) = env.smtp_host.filter(|v| !v.trim().is_empty()) {
+                smtp.host = v;
+            }
+            if let Some(v) = env.smtp_port {
+                smtp.port = v.trim().parse().map_err(|_| {
+                    anyhow::anyhow!("HUDDLE_SMTP_PORT must be a port number, got {v:?}")
+                })?;
+            }
+            if let Some(v) = env.smtp_username.filter(|v| !v.trim().is_empty()) {
+                smtp.username = Some(v);
+            }
+            if let Some(v) = env.smtp_password.filter(|v| !v.trim().is_empty()) {
+                smtp.password = Some(v);
+            }
+            if let Some(v) = env.smtp_from.filter(|v| !v.trim().is_empty()) {
+                smtp.from = Some(v);
+            }
+            if smtp.host.trim().is_empty() {
+                anyhow::bail!(
+                    "HUDDLE_SMTP_HOST is required when any HUDDLE_SMTP_* variable is set"
+                );
+            }
+            self.smtp = Some(smtp);
+        }
+        Ok(())
+    }
+
     /// The IP browsers should be told to send media to.
     ///
     /// An explicitly configured `public_ip` wins; otherwise the machine's
@@ -284,6 +503,40 @@ impl Config {
         let lead = time::Duration::minutes(i64::from(self.join_window_lead_min));
         let grace = time::Duration::minutes(i64::from(self.join_window_grace_min));
         (starts_at - lead, ends_at + grace)
+    }
+}
+
+/// The `HUDDLE_MAIL_*` / `HUDDLE_SMTP_*` variables, collected for
+/// [`Config::apply_mail_env_with`]. Figment's flat env keys cannot
+/// reach nested sections (see the OIDC note on `Config::load`), so —
+/// mirroring `HUDDLE_OIDC_*` — they are applied explicitly after
+/// extraction.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct MailEnv {
+    provider: Option<String>,
+    resend_api_key: Option<String>,
+    resend_from: Option<String>,
+    smtp_host: Option<String>,
+    smtp_port: Option<String>,
+    smtp_username: Option<String>,
+    smtp_password: Option<String>,
+    smtp_from: Option<String>,
+}
+
+impl MailEnv {
+    /// Collect the variables from the process environment.
+    fn from_env() -> Self {
+        let var = |key: &str| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned());
+        Self {
+            provider: var("HUDDLE_MAIL_PROVIDER"),
+            resend_api_key: var("HUDDLE_MAIL_RESEND_API_KEY"),
+            resend_from: var("HUDDLE_MAIL_RESEND_FROM"),
+            smtp_host: var("HUDDLE_SMTP_HOST"),
+            smtp_port: var("HUDDLE_SMTP_PORT"),
+            smtp_username: var("HUDDLE_SMTP_USERNAME"),
+            smtp_password: var("HUDDLE_SMTP_PASSWORD"),
+            smtp_from: var("HUDDLE_SMTP_FROM"),
+        }
     }
 }
 
@@ -331,6 +584,8 @@ mod tests {
         assert_eq!(config.session_secret, None);
         assert_eq!(config.session_ttl_min, 120);
         assert_eq!(config.smtp, None);
+        assert_eq!(config.mail.provider, None);
+        assert_eq!(config.mail.resend, None);
         assert_eq!(config.oidc, None);
         assert_eq!(config.stats_token, None);
         assert_eq!(config.rate_limit_per_min, 30);
@@ -491,5 +746,281 @@ mod tests {
         assert_eq!(oidc.issuer_url, "https://toml.example.com");
         assert_eq!(oidc.client_id, "env-client");
         assert_eq!(oidc.client_secret, "env-secret");
+    }
+
+    // --- mail transport selection (issue #35) ---------------------------
+
+    fn config_with_toml(toml: &str) -> Config {
+        Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .unwrap()
+    }
+
+    fn resend_config() -> ResendConfig {
+        ResendConfig {
+            api_key: "re_test_key".into(),
+            from: "huddle@example.com".into(),
+        }
+    }
+
+    #[test]
+    fn unconfigured_mail_logs() {
+        assert_eq!(
+            Config::default().mail_selection().unwrap(),
+            MailSelection::Log
+        );
+    }
+
+    #[test]
+    fn smtp_only_section_selects_smtp_unchanged() {
+        // A pre-issue-35 deployment: `[smtp]` and nothing else must
+        // keep delivering through the relay exactly as before.
+        let config = config_with_toml(
+            r#"
+            [smtp]
+            host = "smtp.example.com"
+            "#,
+        );
+        assert_eq!(
+            config.mail_selection().unwrap(),
+            MailSelection::Smtp(SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 587,
+                username: None,
+                password: None,
+                from: None,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_log_provider_wins_over_an_smtp_section() {
+        let config = config_with_toml(
+            r#"
+            mail.provider = "log"
+
+            [smtp]
+            host = "smtp.example.com"
+            "#,
+        );
+        assert_eq!(config.mail_selection().unwrap(), MailSelection::Log);
+    }
+
+    #[test]
+    fn explicit_smtp_provider_uses_the_smtp_section() {
+        let config = config_with_toml(
+            r#"
+            mail.provider = "smtp"
+
+            [smtp]
+            host = "smtp.example.com"
+            "#,
+        );
+        assert!(matches!(
+            config.mail_selection().unwrap(),
+            MailSelection::Smtp(_)
+        ));
+    }
+
+    #[test]
+    fn smtp_provider_without_section_fails() {
+        let config = config_with_toml(r#"mail.provider = "smtp""#);
+        let err = config.mail_selection().unwrap_err().to_string();
+        assert!(err.contains("requires an [smtp] section"), "got: {err}");
+    }
+
+    #[test]
+    fn resend_section_detects_resend() {
+        let config = config_with_toml(
+            r#"
+            [mail.resend]
+            api_key = "re_test_key"
+            from = "huddle@example.com"
+            "#,
+        );
+        assert_eq!(
+            config.mail_selection().unwrap(),
+            MailSelection::Resend(resend_config())
+        );
+    }
+
+    #[test]
+    fn explicit_resend_provider_requires_the_section() {
+        let config = config_with_toml(r#"mail.provider = "resend""#);
+        let err = config.mail_selection().unwrap_err().to_string();
+        assert!(
+            err.contains("requires a [mail.resend] section"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn smtp_and_resend_without_provider_is_an_error() {
+        // Both configured and no explicit pick must fail loudly, not
+        // silently choose a transport.
+        let config = config_with_toml(
+            r#"
+            [smtp]
+            host = "smtp.example.com"
+
+            [mail.resend]
+            api_key = "re_test_key"
+            from = "huddle@example.com"
+            "#,
+        );
+        let err = config.mail_selection().unwrap_err().to_string();
+        assert!(err.contains("set mail.provider"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_resend_fields_fail_validation() {
+        let mut config = Config {
+            mail: MailConfig {
+                resend: Some(ResendConfig {
+                    api_key: "  ".into(),
+                    from: "huddle@example.com".into(),
+                }),
+                ..MailConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.mail_selection().is_err());
+        config.mail.resend = Some(ResendConfig {
+            api_key: "re_test_key".into(),
+            from: String::new(),
+        });
+        assert!(config.mail_selection().is_err());
+    }
+
+    #[test]
+    fn mail_provider_env_pins_the_transport() {
+        let mut config = Config {
+            smtp: Some(SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 587,
+                username: None,
+                password: None,
+                from: None,
+            }),
+            ..Config::default()
+        };
+        Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                provider: Some("log".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(config.mail_selection().unwrap(), MailSelection::Log);
+
+        let mut config = Config::default();
+        let err = Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                provider: Some("carrier-pigeon".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown mail provider"), "got: {err}");
+    }
+
+    #[test]
+    fn resend_env_configures_and_merges() {
+        let mut config = config_with_toml(
+            r#"
+            [mail.resend]
+            api_key = "re_toml_key"
+            from = "toml@example.com"
+            "#,
+        );
+        Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                resend_api_key: Some("re_env_key".into()),
+                resend_from: None,
+                ..MailEnv::default()
+            },
+        )
+        .unwrap();
+        // Env overrides only the fields it names; the TOML from stays.
+        assert_eq!(
+            config.mail_selection().unwrap(),
+            MailSelection::Resend(ResendConfig {
+                api_key: "re_env_key".into(),
+                from: "toml@example.com".into(),
+            })
+        );
+
+        // Half-configured via env alone must fail loudly.
+        let mut config = Config::default();
+        let err = Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                resend_from: Some("env@example.com".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("HUDDLE_MAIL_RESEND_API_KEY is required"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn smtp_env_configures_and_merges() {
+        let mut config = Config::default();
+        Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                smtp_host: Some("smtp.example.com".into()),
+                smtp_port: Some("2525".into()),
+                smtp_from: Some("huddle@example.com".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config.mail_selection().unwrap(),
+            MailSelection::Smtp(SmtpConfig {
+                host: "smtp.example.com".into(),
+                port: 2525,
+                username: None,
+                password: None,
+                from: Some("huddle@example.com".into()),
+            })
+        );
+
+        // A garbage port fails loudly.
+        let mut config = Config::default();
+        let err = Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                smtp_host: Some("smtp.example.com".into()),
+                smtp_port: Some("not-a-port".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HUDDLE_SMTP_PORT"), "got: {err}");
+
+        // Any SMTP env var without a host must not pass half-configured.
+        let mut config = Config::default();
+        let err = Config::apply_mail_env_with(
+            &mut config,
+            MailEnv {
+                smtp_port: Some("2525".into()),
+                ..MailEnv::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("HUDDLE_SMTP_HOST is required"), "got: {err}");
     }
 }
