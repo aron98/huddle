@@ -1,5 +1,6 @@
 //! Camera/microphone acquisition and device enumeration.
 
+use crate::audio_settings::{self, AudioSettings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -22,17 +23,18 @@ pub enum DeviceKind {
 
 /// Acquire the camera and microphone. `camera_id`/`mic_id` select specific
 /// devices (`None` = browser default); used by the prejoin pickers.
+/// `audio` carries the explicit echo-cancellation / noise-suppression
+/// constraints (issue #34) — they apply on this and every
+/// re-acquisition alike.
 pub async fn request_media(
     camera_id: Option<&str>,
     mic_id: Option<&str>,
+    audio: AudioSettings,
 ) -> Result<MediaStream, String> {
     let devices = media_devices()?;
 
     let constraints = MediaStreamConstraints::new();
-    match mic_id {
-        Some(id) => constraints.set_audio(&exact_device(id)),
-        None => constraints.set_audio_bool(true),
-    }
+    constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
     match camera_id {
         Some(id) => constraints.set_video(&exact_device(id)),
         None => constraints.set_video_bool(true),
@@ -232,7 +234,9 @@ pub async fn request_screen() -> Result<(MediaStream, MediaStreamTrack), String>
         .and_then(|w| w.location().search().ok())
         .is_some_and(|s| s.contains("test=1"));
     let stream = if test_mode {
-        request_media(None, None).await?
+        // The audio constraints are irrelevant for the screen stand-in
+        // (only the video track is used), so plain defaults go in.
+        request_media(None, None, AudioSettings::default()).await?
     } else {
         let devices = media_devices()?;
         let promise = devices

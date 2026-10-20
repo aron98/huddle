@@ -5,6 +5,7 @@
 //! can land back here with everything the user set up still intact.
 
 use crate::api;
+use crate::audio_settings;
 use crate::flow::JoinError;
 use crate::media;
 use huddle_protocol::{Joinability, MeetingDto, MeetingResponse};
@@ -30,6 +31,11 @@ pub struct PrejoinState {
     /// flow-owned state so a refused join lands back here with it
     /// intact, like the name.
     pub passcode: RwSignal<String>,
+    /// Explicit AEC / noise-suppression constraints (issue #34),
+    /// seeded from the per-browser localStorage prefs and re-applied
+    /// on every acquisition. Owned here so the in-call controls —
+    /// which re-acquire the mic live — read the same choice.
+    pub audio: RwSignal<audio_settings::AudioSettings>,
     /// Camera/mic acquisition failure; `None` while media works.
     pub media_error: RwSignal<Option<String>>,
     /// Meeting info from `GET /api/meetings/{code}`, for the title and
@@ -61,6 +67,7 @@ impl PrejoinState {
             cam_on: RwSignal::new(true),
             mic_on: RwSignal::new(true),
             passcode: RwSignal::new(String::new()),
+            audio: RwSignal::new(audio_settings::load()),
             media_error: RwSignal::new(None),
             meeting: RwSignal::new(None),
             joinability: RwSignal::new(None),
@@ -78,8 +85,9 @@ fn acquire(state: PrejoinState) {
     state.media_error.set(None);
     let camera_id = state.camera_id.get_untracked();
     let mic_id = state.mic_id.get_untracked();
+    let audio = state.audio.get_untracked();
     spawn_local(async move {
-        match media::request_media(camera_id.as_deref(), mic_id.as_deref()).await {
+        match media::request_media(camera_id.as_deref(), mic_id.as_deref(), audio).await {
             Ok(stream) => {
                 media::set_track_kind_enabled(&stream, "audio", state.mic_on.get_untracked());
                 media::set_track_kind_enabled(&stream, "video", state.cam_on.get_untracked());
@@ -491,6 +499,17 @@ pub fn Prejoin(
                             </For>
                         </select>
                     </label>
+
+                    // Echo suppression is strictly client-side (issue
+                    // #34): explicit constraints on every acquisition,
+                    // user toggles, per-browser persistence. A flip
+                    // re-acquires the mic right here, so the user can
+                    // hear the difference before joining.
+                    <audio_settings::AudioSettingsControls
+                        settings=state.audio
+                        on_change=Callback::new(move |_: audio_settings::AudioSettings| acquire(state))
+                    />
+                    <p class="audio-hint">"Hearing echo on speakers? A headset is the most reliable fix."</p>
 
                     // A call is media-first: until getUserMedia has
                     // produced a local stream there is nothing to

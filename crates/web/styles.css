@@ -609,6 +609,43 @@ button:disabled {
   margin-top: var(--sp-2);
 }
 
+/* ---------- audio settings (issue #34) ---------- */
+
+/* The AEC / noise-suppression toggles: prejoin panel (block) and the
+   in-call footer (inline, no bottom margin). */
+.audio-settings {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+}
+
+.audio-setting {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.audio-setting input {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--on-air);
+}
+
+.audio-hint {
+  margin: calc(-1 * var(--sp-2)) 0 var(--sp-4);
+  font-size: var(--fs-sm);
+}
+
+.call-controls .audio-settings {
+  margin: 0;
+}
+
 /* ---------- the call ---------- */
 
 .call {
