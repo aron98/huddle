@@ -117,6 +117,7 @@ impl Room {
             PeerStats {
                 rx_frames: p.rx_frames,
                 tx_frames: p.tx_frames,
+                dropped_frames: p.dropped_frames,
                 keyframes_requested: p.keyframes_requested,
                 bytes_rx: l.bytes_rx,
                 bytes_tx: l.bytes_tx,
@@ -382,8 +383,7 @@ impl Room {
                 continue;
             };
             if let Err(e) = target.forward_media(mid_out, data) {
-                tracing::warn!("forward to peer {pid} failed, disconnecting: {e}");
-                target.disconnect();
+                target.handle_forward_error(e);
             }
         }
     }

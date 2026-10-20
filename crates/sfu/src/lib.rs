@@ -33,6 +33,11 @@ pub struct PeerStats {
     pub rx_frames: u64,
     /// Media frames sent to this peer.
     pub tx_frames: u64,
+    /// Media frames shed toward this peer because its str0m egress
+    /// queue overflowed (`WriteWithoutPoll` backpressure). The frames
+    /// were dropped by str0m before hitting the wire; the peer stays
+    /// connected.
+    pub dropped_frames: u64,
     /// Keyframe (FIR/PLI) requests enqueued toward this peer. New
     /// subscribers trigger one per source; the SRTCP wire form is
     /// encrypted, so tests assert on this counter instead.
