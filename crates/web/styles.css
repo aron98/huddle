@@ -812,6 +812,18 @@ button:disabled {
   font-size: var(--fs-sm);
 }
 
+/* Screen tiles whose share carries computer/tab audio wear a badge, so
+   viewers can tell the sound they hear belongs to the share (it plays
+   through the screen tile itself, not the sharer's camera tile). The
+   same badge marks the sharer's own picture-in-picture. */
+.screen-audio-badge {
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-pill);
+  background: var(--on-air);
+  color: var(--well);
+  font-size: var(--fs-xs);
+}
+
 /* The sharer's picture-in-picture: their own capture, floating above
    the stage with the stop control in reach. */
 .share-pip {

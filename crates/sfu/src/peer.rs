@@ -175,6 +175,11 @@ pub(crate) struct Peer {
     /// marked as the screen track. `false` is also set when a share
     /// stops, so a late offer never creates a phantom screen.
     screen_pending: bool,
+    /// Companion to `screen_pending` for share audio: the next remote
+    /// audio m-line armed while a share is pending is the screen's
+    /// sound (the mic m-line is negotiated in the initial offer, before
+    /// any share can be announced). Cleared when the share stops.
+    screen_audio_pending: bool,
     pub rx_frames: u64,
     pub tx_frames: u64,
     /// Media frames shed because this peer's str0m egress queue
@@ -228,6 +233,7 @@ impl Peer {
             video_muted: false,
             rids_by_mid: HashMap::new(),
             screen_pending: false,
+            screen_audio_pending: false,
             rx_frames: 0,
             tx_frames: 0,
             dropped_frames: 0,
@@ -550,6 +556,7 @@ impl Peer {
     /// negotiation).
     pub(crate) fn set_sharing(&mut self, sharing: bool) {
         self.screen_pending = sharing;
+        self.screen_audio_pending = sharing;
         if !sharing {
             for entry in &self.tracks_in {
                 if entry.track.screen && entry.track.active() {
@@ -621,13 +628,23 @@ impl Peer {
             }
             Event::MediaAdded(m) => {
                 // The client announces a share before adding the m-line,
-                // so the next remote video m-line is the screen. Order
-                // is guaranteed: the Sharing message reaches the room
-                // before the offer that carries the new m-line.
-                let screen = self.screen_pending && matches!(m.kind, MediaKind::Video);
-                if screen {
-                    self.screen_pending = false;
-                }
+                // so the next remote video m-line is the screen — and,
+                // when the picked source carries sound, the next audio
+                // m-line is the share's audio (the mic is negotiated in
+                // the initial offer, before any share). Order is
+                // guaranteed: the Sharing message reaches the room
+                // before the offer that carries the new m-lines.
+                let screen = match m.kind {
+                    MediaKind::Video if self.screen_pending => {
+                        self.screen_pending = false;
+                        true
+                    }
+                    MediaKind::Audio if self.screen_audio_pending => {
+                        self.screen_audio_pending = false;
+                        true
+                    }
+                    _ => false,
+                };
                 let rids = if screen {
                     Vec::new()
                 } else {
