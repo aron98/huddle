@@ -21,6 +21,10 @@ pub struct MeetingDto {
     /// one-off. `starts_at` is the first occurrence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RecurrenceRule>,
+    /// Whether joining requires a passcode. The passcode value itself is
+    /// never sent over the wire — only this flag is.
+    #[serde(default)]
+    pub has_passcode: bool,
 }
 
 /// Curated recurrence frequencies for recurring meetings (issue 16). A
@@ -118,6 +122,11 @@ pub struct CreateMeetingRequest {
     /// Make the meeting a recurring series instead of a one-off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<RecurrenceRule>,
+    /// Optional passcode required to join the meeting. Transported in
+    /// plain text (TLS carries the connection); the server compares it
+    /// in constant time. Absent or `null` means no passcode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passcode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -139,6 +148,14 @@ pub struct UpdateMeetingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(deserialize_with = "double_option")]
     pub repeat: Option<Option<RecurrenceRule>>,
+    /// Set, change, or remove the join passcode: absent leaves it
+    /// unchanged, `null` removes it, a string sets it.
+    #[serde(
+        default,
+        with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub passcode: Option<Option<String>>,
 }
 
 /// Distinguish "field absent" (`None`) from "field present but `null`"
@@ -214,7 +231,53 @@ impl CreateMeetingRequest {
         if let Some(rule) = &self.repeat {
             rule.validate(self.starts_at)?;
         }
+        if let Some(passcode) = &self.passcode {
+            validate_passcode(passcode)?;
+        }
         Ok(())
+    }
+}
+
+/// Maximum passcode length, shared by create and update validation.
+pub const PASSCODE_MAX_LEN: usize = 128;
+
+/// Validate a passcode value: trimmed, non-empty, bounded length.
+/// Shared by the create request and the server's update path so both
+/// agree on what a usable passcode is.
+pub fn validate_passcode(passcode: &str) -> Result<(), &'static str> {
+    let trimmed = passcode.trim();
+    if trimmed.is_empty() {
+        return Err("passcode must not be empty");
+    }
+    if trimmed.len() > PASSCODE_MAX_LEN {
+        return Err("passcode must be at most 128 characters");
+    }
+    Ok(())
+}
+
+/// Serde for the tri-state `Option<Option<T>>`: an absent field means
+/// "leave unchanged", an explicit `null` means "remove", and a value
+/// means "set". A plain `Option<T>` cannot tell absent from null.
+mod double_option {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<Option<String>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(inner) => serializer.serialize_some(inner),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // The field is present (serde already checked that), so a `null`
+        // inside it is the explicit "remove" request: `Some(None)`.
+        Ok(Some(Option::<String>::deserialize(deserializer)?))
     }
 }
 
@@ -241,6 +304,7 @@ mod tests {
             starts_at: OffsetDateTime::UNIX_EPOCH,
             ends_at: OffsetDateTime::UNIX_EPOCH,
             repeat: None,
+            passcode: None,
         };
         assert_eq!(req.validate(), Err("title must not be empty"));
     }
@@ -252,6 +316,7 @@ mod tests {
             starts_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2),
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             repeat: None,
+            passcode: None,
         };
         assert_eq!(req.validate(), Err("ends_at must be after starts_at"));
     }
@@ -306,6 +371,7 @@ mod tests {
             title: "Standup".into(),
             starts_at: OffsetDateTime::UNIX_EPOCH,
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            passcode: None,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,
@@ -337,6 +403,61 @@ mod tests {
     }
 
     #[test]
+    fn create_request_validates_passcode() {
+        let blank = CreateMeetingRequest {
+            title: "Standup".into(),
+            starts_at: OffsetDateTime::UNIX_EPOCH,
+            ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            repeat: None,
+            passcode: Some("   ".into()),
+        };
+        assert_eq!(blank.validate(), Err("passcode must not be empty"));
+
+        let too_long = CreateMeetingRequest {
+            passcode: Some("x".repeat(PASSCODE_MAX_LEN + 1)),
+            ..blank
+        };
+        assert_eq!(
+            too_long.validate(),
+            Err("passcode must be at most 128 characters")
+        );
+
+        let fine = CreateMeetingRequest {
+            passcode: Some("  sekrit  ".into()),
+            ..too_long
+        };
+        assert_eq!(fine.validate(), Ok(()));
+    }
+
+    #[test]
+    fn update_request_passcode_is_tri_state() {
+        // Absent → `None`: leave the passcode unchanged.
+        let unchanged: UpdateMeetingRequest = serde_json::from_str(r#"{"title": "New"}"#).unwrap();
+        assert_eq!(unchanged.passcode, None);
+
+        // Explicit null → `Some(None)`: remove the passcode.
+        let removed: UpdateMeetingRequest = serde_json::from_str(r#"{"passcode": null}"#).unwrap();
+        assert_eq!(removed.passcode, Some(None));
+
+        // A value → `Some(Some(..))`: set the passcode.
+        let set: UpdateMeetingRequest = serde_json::from_str(r#"{"passcode": "sekrit"}"#).unwrap();
+        assert_eq!(set.passcode, Some(Some("sekrit".into())));
+
+        // And each state serializes back to its wire shape.
+        assert_eq!(serde_json::to_value(&set).unwrap()["passcode"], "sekrit");
+        assert_eq!(
+            serde_json::to_value(&removed).unwrap()["passcode"],
+            serde_json::Value::Null
+        );
+        assert!(
+            serde_json::to_value(&unchanged)
+                .unwrap()
+                .get("passcode")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn meeting_response_defaults_upcoming_occurrences() {
         // Old payloads (before issue 16) deserialize with no recurrence:
         // `repeat` and `upcoming_occurrences` both default.
@@ -354,5 +475,28 @@ mod tests {
         let parsed: MeetingResponse = serde_json::from_str(payload).unwrap();
         assert_eq!(parsed.meeting.repeat, None);
         assert!(parsed.upcoming_occurrences.is_empty());
+    }
+
+    #[test]
+    fn meeting_dto_has_passcode_flag_is_additive() {
+        // Payloads that predate the flag still parse, as `false`.
+        let legacy: MeetingDto = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "code": "H7KD-PM2X-QR4T",
+                "title": "Standup",
+                "starts_at": "1970-01-01T00:00:00Z",
+                "ends_at": "1970-01-01T00:00:00Z",
+                "cancelled": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!legacy.has_passcode);
+
+        let set = MeetingDto {
+            has_passcode: true,
+            ..legacy
+        };
+        assert_eq!(serde_json::to_value(&set).unwrap()["has_passcode"], true);
     }
 }

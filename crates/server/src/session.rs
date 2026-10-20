@@ -367,6 +367,7 @@ mod tests {
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: None,
+                passcode: None,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -388,6 +389,7 @@ mod tests {
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: Some(rule),
+                passcode: None,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await

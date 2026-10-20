@@ -309,6 +309,7 @@ fn Dashboard() -> impl IntoView {
             starts_at,
             ends_at,
             repeat: repeat_rule,
+            passcode: None,
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));

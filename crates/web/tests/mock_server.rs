@@ -56,6 +56,7 @@ fn meeting_dto(code: &str) -> MeetingDto {
         ends_at: now + time::Duration::hours(1),
         cancelled: false,
         repeat: None,
+        has_passcode: false,
     }
 }
 

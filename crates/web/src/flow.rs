@@ -86,7 +86,8 @@ impl JoinError {
                 | ErrorCode::Internal
                 | ErrorCode::Unauthorized
                 | ErrorCode::RecordingActive
-                | ErrorCode::MeetingNotLive => JoinError::Server(server.message.clone()),
+                | ErrorCode::MeetingNotLive
+                | ErrorCode::PasscodeRequired => JoinError::Server(server.message.clone()),
             },
             // A transport error before the Welcome means the handshake
             // never completed: the server is unreachable from here.

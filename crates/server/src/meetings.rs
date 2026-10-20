@@ -43,6 +43,8 @@ impl From<Meeting> for MeetingDto {
             ends_at: m.ends_at,
             cancelled: m.cancelled,
             repeat: m.repeat,
+            // Wired to the stored passcode once the column lands (issue #13).
+            has_passcode: false,
         }
     }
 }
@@ -469,6 +471,7 @@ mod tests {
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
             repeat: None,
+            passcode: None,
         }
     }
 
@@ -519,6 +522,7 @@ mod tests {
                 starts_at: OffsetDateTime::now_utc() + Duration::hours(2),
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 repeat: None,
+                passcode: None,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -549,6 +553,7 @@ mod tests {
                 ends_at: None,
                 cancelled: None,
                 repeat: None,
+                passcode: None,
             },
         )
         .await
