@@ -7,7 +7,7 @@ use crate::api;
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
-use crate::rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient};
+use crate::rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient, RtcError};
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
@@ -178,6 +178,24 @@ impl SessionSignals {
             _ => None,
         }
     }
+}
+
+/// Tear the local share down along the normal stop path: drop the
+/// track-end watcher, clear the UI flag, remove the track and
+/// renegotiate. Shared by the stop button and the server's directed
+/// stand-down when someone else preempts our share. The resulting
+/// `Sharing{false}` echo is broadcast by the engine, so viewers
+/// everywhere wind the old share down too.
+async fn wind_down_share(
+    client: &mut RtcClient<BrowserSignalingStream, BrowserPeerConnection>,
+    screen_end_guard: &mut Option<media::TrackEndGuard>,
+    signals: SessionSignals,
+) -> Result<(), RtcError> {
+    // Dropping the watcher detaches `onended`; the session loop keeps
+    // no share state of its own.
+    screen_end_guard.take();
+    signals.sharing.set(false);
+    client.stop_screen_share().await
 }
 
 /// One join attempt: connect, join, publish, then pump server messages
@@ -374,6 +392,19 @@ async fn run_session(
                     }
                     // A stopped share withdraws the owner's screen tile.
                     if let ServerMessage::Sharing { id, sharing: false } = &msg {
+                        // Directed at us while we still think we are
+                        // the sharer: someone preempted us. Run the
+                        // normal stop path so our track comes off and
+                        // the wind-down reaches everyone via the echo.
+                        let preempted = signals.sharing.get_untracked()
+                            && client.you().is_some_and(|you| you.id == *id);
+                        if preempted
+                            && let Err(e) =
+                                wind_down_share(&mut client, &mut screen_end_guard, signals).await
+                        {
+                            signals.connection_lost(e.to_string());
+                            break;
+                        }
                         let screen = format!("{id}-screen");
                         signals
                             .remote_streams
@@ -423,7 +454,29 @@ async fn run_session(
                                     // drops it — one share watcher at a time.
                                     screen_end_guard.replace(guard);
                                     match client.start_screen_share().await {
-                                        Ok(()) => signals.sharing.set(true),
+                                        Ok(()) => {
+                                            // A directed stand-down can be
+                                            // swallowed by publish's internal
+                                            // pump while our share offer was
+                                            // in flight — we were preempted
+                                            // mid-start. The roster is the
+                                            // truth: only claim the share if
+                                            // it still says we are sharing.
+                                            let still_sharing =
+                                                client.you().is_some_and(|you| you.sharing);
+                                            if still_sharing {
+                                                signals.sharing.set(true);
+                                            } else if let Err(e) = wind_down_share(
+                                                &mut client,
+                                                &mut screen_end_guard,
+                                                signals,
+                                            )
+                                            .await
+                                            {
+                                                signals.connection_lost(e.to_string());
+                                                break;
+                                            }
+                                        }
                                         Err(e) => {
                                             screen_end_guard.take();
                                             signals.sharing.set(false);
@@ -442,11 +495,9 @@ async fn run_session(
                             }
                         }
                         ScreenCommand::Stop => {
-                            // Dropping the watcher detaches `onended`; the
-                            // task keeps no share state of its own.
-                            screen_end_guard.take();
-                            signals.sharing.set(false);
-                            if let Err(e) = client.stop_screen_share().await {
+                            if let Err(e) =
+                                wind_down_share(&mut client, &mut screen_end_guard, signals).await
+                            {
                                 signals.connection_lost(e.to_string());
                                 break;
                             }

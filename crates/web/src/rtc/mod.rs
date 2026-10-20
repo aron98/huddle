@@ -321,6 +321,13 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 if let Some(p) = self.roster.iter_mut().find(|p| p.id == id) {
                     p.sharing = sharing;
                 }
+                // `you` is a Welcome-time snapshot; keep it in sync so a
+                // sharer can tell whether a start survived (a preemption
+                // that lands mid-start flips this back to false before
+                // `publish` returns).
+                if let Some(you) = self.you.as_mut().filter(|you| you.id == id) {
+                    you.sharing = sharing;
+                }
                 Ok(())
             }
             ServerMessage::Recording { active } => {
