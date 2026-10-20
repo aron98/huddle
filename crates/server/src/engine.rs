@@ -753,6 +753,14 @@ impl Engine {
 
     /// Update a participant's share state, mirror it into the room so
     /// the SFU stops/resumes screen forwarding, and tell everyone.
+    ///
+    /// Single active share: when a new participant starts sharing,
+    /// every other current sharer is stood down — their roster flag is
+    /// cleared, the SFU stops their screen forwarding immediately, and
+    /// they get a directed `Sharing{false}` so their client runs its
+    /// normal stop path (drop track, renegotiate, broadcast the wind
+    /// down). Viewers learn about the switch through that echo plus
+    /// the new sharer's broadcast.
     fn set_sharing(&mut self, code: &str, id: Uuid, sharing: bool) {
         let Some(inst) = self.meetings.get_mut(code) else {
             return;
@@ -763,6 +771,29 @@ impl Engine {
         p.sharing = sharing;
         if let Err(e) = inst.room.set_sharing(id, sharing) {
             tracing::debug!(peer = %id, "room set_sharing: {e}");
+        }
+        let preempted: Vec<Uuid> = if sharing {
+            inst.participants
+                .values()
+                .filter(|p| p.sharing && p.id != id)
+                .map(|p| p.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for prev in preempted {
+            if let Some(p) = inst.participants.get_mut(&prev) {
+                p.sharing = false;
+            }
+            if let Err(e) = inst.room.set_sharing(prev, false) {
+                tracing::debug!(peer = %prev, "room set_sharing: {e}");
+            }
+            if let Some(out) = inst.outs.get(&prev) {
+                let _ = out.send(ServerMessage::Sharing {
+                    id: prev,
+                    sharing: false,
+                });
+            }
         }
         let msg = ServerMessage::Sharing { id, sharing };
         for out in inst.outs.values() {
@@ -1137,6 +1168,78 @@ mod tests {
             .find(|p| p.name == "alice")
             .expect("alice in roster");
         assert!(alice_in_roster.sharing);
+    }
+
+    #[tokio::test]
+    async fn second_sharer_preempts_the_first() {
+        let (engine, _keep) = test_engine(8);
+        let (alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let (bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        let (_carol, mut carol_rx) = join(&engine, "ABCD-EFGH-JKLM", "carol").await;
+        next(&mut carol_rx).await; // welcome
+        next(&mut bob_rx).await; // welcome
+        next(&mut bob_rx).await; // carol joined
+        next(&mut alice_rx).await; // welcome
+        next(&mut alice_rx).await; // bob joined
+        next(&mut alice_rx).await; // carol joined
+
+        // Alice starts sharing; the echo goes to everyone (incl. her).
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, true);
+        for rx in [&mut alice_rx, &mut bob_rx, &mut carol_rx] {
+            let msg = next(rx).await;
+            let ServerMessage::Sharing { id, sharing: s } = msg else {
+                panic!("expected sharing, got {msg:?}");
+            };
+            assert_eq!(id, alice);
+            assert!(s);
+        }
+
+        // Bob preempts: alice first gets the directed stand-down, then
+        // everyone (incl. alice and bob) hears that bob is sharing.
+        engine.sharing("ABCD-EFGH-JKLM".into(), bob, true);
+        let msg = next(&mut alice_rx).await;
+        let ServerMessage::Sharing { id, sharing: s } = msg else {
+            panic!("expected directed stand-down, got {msg:?}");
+        };
+        assert_eq!(id, alice);
+        assert!(!s);
+        for rx in [&mut alice_rx, &mut bob_rx, &mut carol_rx] {
+            let msg = next(rx).await;
+            let ServerMessage::Sharing { id, sharing: s } = msg else {
+                panic!("expected sharing, got {msg:?}");
+            };
+            assert_eq!(id, bob);
+            assert!(s);
+        }
+
+        // The preempted client runs its stop path; the resulting echo
+        // is broadcast so viewers everywhere wind the old share down.
+        engine.sharing("ABCD-EFGH-JKLM".into(), alice, false);
+        for rx in [&mut alice_rx, &mut bob_rx, &mut carol_rx] {
+            let msg = next(rx).await;
+            let ServerMessage::Sharing { id, sharing: s } = msg else {
+                panic!("expected sharing, got {msg:?}");
+            };
+            assert_eq!(id, alice);
+            assert!(!s);
+        }
+
+        // A late joiner sees only bob as the active sharer.
+        let (_dave, mut dave_rx) = join(&engine, "ABCD-EFGH-JKLM", "dave").await;
+        let welcome = next(&mut dave_rx).await;
+        let ServerMessage::Welcome { roster, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        let bob_in_roster = roster
+            .iter()
+            .find(|p| p.name == "bob")
+            .expect("bob in roster");
+        assert!(bob_in_roster.sharing);
+        let alice_in_roster = roster
+            .iter()
+            .find(|p| p.name == "alice")
+            .expect("alice in roster");
+        assert!(!alice_in_roster.sharing);
     }
 
     #[tokio::test]
