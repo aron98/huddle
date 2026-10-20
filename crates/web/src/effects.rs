@@ -194,6 +194,12 @@ impl Effects {
         self.outgoing.get_untracked()
     }
 
+    /// Like [`Effects::outgoing`], but reactive: for preview effects
+    /// that must re-run when the outgoing stream first appears.
+    pub fn outgoing_tracked(&self) -> Option<MediaStream> {
+        self.outgoing.get()
+    }
+
     /// The video track the sender should currently carry — what
     /// `replaceTrack` gets on every blur transition.
     pub fn video_out(&self) -> Option<MediaStreamTrack> {

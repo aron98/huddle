@@ -48,6 +48,8 @@ pub struct PrejoinState {
     pub join_error: RwSignal<Option<JoinError>>,
     /// The link's code matches no meeting (GET returned 404).
     pub missing: RwSignal<bool>,
+    /// Background-blur state for the camera (see `effects.rs`).
+    pub effects: crate::effects::Effects,
 }
 
 impl Default for PrejoinState {
@@ -73,6 +75,7 @@ impl PrejoinState {
             joinability: RwSignal::new(None),
             join_error: RwSignal::new(None),
             missing: RwSignal::new(false),
+            effects: crate::effects::Effects::new(),
         }
     }
 }
@@ -102,6 +105,7 @@ fn acquire(state: PrejoinState) {
             Ok(stream) => {
                 media::set_track_kind_enabled(&stream, "audio", state.mic_on.get_untracked());
                 media::set_track_kind_enabled(&stream, "video", state.cam_on.get_untracked());
+                state.effects.attach_source(&stream);
                 state.stream.set(Some(stream));
             }
             Err(e) => state.media_error.set(Some(e)),
@@ -197,9 +201,15 @@ pub fn Prejoin(
         });
     }
 
-    // Show the acquired stream in the preview element.
+    // Show the acquired stream in the preview element. The outgoing
+    // stream (blurred video while blur is on) is preferred once it
+    // exists; its in-place track swaps propagate automatically.
     Effect::new(move |_| {
-        let Some(stream) = state.stream.get() else {
+        let Some(stream) = state
+            .effects
+            .outgoing_tracked()
+            .or_else(|| state.stream.get())
+        else {
             return;
         };
         let Some(element) = document().get_element_by_id("preview") else {
@@ -241,6 +251,15 @@ pub fn Prejoin(
         if let Some(stream) = state.stream.get_untracked() {
             media::set_track_kind_enabled(&stream, "audio", state.mic_on.get_untracked());
         }
+    };
+    // Blur is async (model load on first toggle); a failed toggle just
+    // surfaces the notice instead of unwinding the page.
+    let toggle_blur = move |_| {
+        let effects = state.effects;
+        let target = !effects.blur_on.get_untracked();
+        spawn_local(async move {
+            let _ = effects.set_blur(target).await;
+        });
     };
 
     let cameras = Memo::new(move |_| {
@@ -435,7 +454,28 @@ pub fn Prejoin(
                         >
                             {move || if state.mic_on.get() { "Mic on" } else { "Mic off" }}
                         </button>
+                        <button
+                            class="btn toggle"
+                            class:is-off=move || !state.effects.blur_on.get()
+                            data-testid="prejoin-toggle-blur"
+                            on:click=toggle_blur
+                        >
+                            {move || if state.effects.blur_on.get() { "Blur on" } else { "Blur off" }}
+                        </button>
                     </div>
+                    {move || {
+                        state
+                            .effects
+                            .notice
+                            .get()
+                            .map(|n| {
+                                view! {
+                                    <p class="field-error" data-testid="effects-notice" role="status">
+                                        {n}
+                                    </p>
+                                }
+                            })
+                    }}
                 </div>
 
                 <form class="prejoin-panel" on:submit=submit>
