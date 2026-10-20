@@ -87,6 +87,17 @@ fn acquire(state: PrejoinState) {
     let mic_id = state.mic_id.get_untracked();
     let audio = state.audio.get_untracked();
     spawn_local(async move {
+        // Stop the current capture first: while a track is open the
+        // browser keeps the per-device audio processing (AEC/NS) it
+        // started with, and a concurrent getUserMedia inherits the
+        // old settings instead of the requested ones (issue #34).
+        // This also keeps switched-away devices released.
+        if let Some(old) = state.stream.get_untracked() {
+            for track in media::tracks_of(&old) {
+                track.stop();
+            }
+            state.stream.set(None);
+        }
         match media::request_media(camera_id.as_deref(), mic_id.as_deref(), audio).await {
             Ok(stream) => {
                 media::set_track_kind_enabled(&stream, "audio", state.mic_on.get_untracked());

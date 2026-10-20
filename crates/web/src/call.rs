@@ -458,10 +458,20 @@ async fn run_session(
                         // A constraint change needs a fresh acquisition:
                         // re-acquire the mic and swap it into the live
                         // sender (replaceTrack needs no renegotiation).
-                        // Failure is a status message, not a call ender —
-                        // the old track keeps flowing.
+                        // The old capture is stopped FIRST: while it is
+                        // open, the browser keeps the per-device audio
+                        // processing (AEC/NS) it started with, and a
+                        // concurrent getUserMedia inherits those settings
+                        // instead of the requested ones (issue #34).
+                        // Failure is a status message, not a call ender.
                         if let Some(local) = local.as_ref() {
                             let mic_id = signals.prejoin.mic_id.get_untracked();
+                            for old in media::tracks_of(local) {
+                                if old.kind() == "audio" {
+                                    local.remove_track(&old);
+                                    old.stop();
+                                }
+                            }
                             match media::request_mic(mic_id.as_deref(), settings).await {
                                 Ok(track) => {
                                     // Carry the mute state across the swap.
@@ -470,12 +480,6 @@ async fn run_session(
                                     }
                                     match client.peer_mut().replace_mic_track(&track).await {
                                         Ok(()) => {
-                                            for old in media::tracks_of(local) {
-                                                if old.kind() == "audio" {
-                                                    local.remove_track(&old);
-                                                    old.stop();
-                                                }
-                                            }
                                             local.add_track(&track);
                                             // The Web Audio graph bound the old
                                             // track; rebuild it for the new one.
