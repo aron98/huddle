@@ -37,6 +37,11 @@ enum UiAction {
     Chat {
         body: String,
     },
+    /// Turn background blur on/off (the effects pipeline).
+    SetBlur(bool),
+    /// The blur pipeline swapped the outgoing video track; replace it
+    /// on the live sender via `replaceTrack`.
+    PublishCamera,
     /// Focus a participant's camera tile (`Some`) or clear the focus
     /// (`None`). Drives the simulcast layer policy: the focused origin
     /// upgrades to the high layer, everyone else stays low.
@@ -290,7 +295,16 @@ async fn run_session(
     // stale entry rather than append: Leptos keyed-<For> does not
     // re-render same-key children, and the old tile's video element must
     // be torn down and rebound to the new stream to show anything.
-    let local_id = local.as_ref().map(|s| s.id());
+    // Background blur: the effects module owns the "outgoing" stream —
+    // raw audio plus whichever video track is current (processed while
+    // blur is on, raw otherwise). Publishing it means the sender starts
+    // on the processed track when blur was enabled in prejoin; later
+    // swaps go through replaceTrack, not renegotiation.
+    if let Some(local) = &local {
+        signals.prejoin.effects.attach_source(local);
+    }
+    let outgoing = signals.prejoin.effects.outgoing();
+    let local_id = outgoing.as_ref().map(|s| s.id());
     {
         let streams = signals.remote_streams;
         peer.set_on_remote_stream(move |id, stream| {
@@ -303,8 +317,8 @@ async fn run_session(
             });
         });
     }
-    if let Some(local) = &local {
-        peer.attach_stream(local).await;
+    if let Some(outgoing) = &outgoing {
+        peer.attach_stream(outgoing).await;
     }
 
     let mut client = RtcClient::new(signaling, peer);
@@ -371,6 +385,16 @@ async fn run_session(
     // channel the buttons use; clone the sender before the speaking
     // watcher below moves it into its closure.
     let screen_ui_tx = ui_tx.clone();
+
+    // Blur transitions swap the outgoing video track; the session task
+    // is the only side that may touch the sender, so route the swap
+    // through the same channel the buttons use.
+    {
+        let publish_tx = ui_tx.clone();
+        signals.prejoin.effects.set_on_change(move || {
+            let _ = publish_tx.unbounded_send(UiAction::PublishCamera);
+        });
+    }
 
     // Best-effort speaking detection: watch our own level and report
     // flips through the session. Failure is non-fatal — the call just
@@ -623,6 +647,30 @@ async fn run_session(
                             break;
                         }
                     }
+                    UiAction::SetBlur(on) => {
+                        let effects = signals.prejoin.effects;
+                        // Errors surface via effects.notice; a failed
+                        // toggle never ends the call.
+                        let _ = effects.set_blur(on).await;
+                        signals.status.set(effects.notice.get_untracked());
+                    }
+                    UiAction::PublishCamera => {
+                        // Blur on/off/auto-disable changed the outgoing
+                        // video track; replaceTrack swaps it without
+                        // touching the SDP (m-line, simulcast rids and
+                        // msid all stay).
+                        if let Some(track) = signals.prejoin.effects.video_out()
+                            && let Err(e) = client.peer_mut().replace_camera_track(&track).await
+                        {
+                            signals
+                                .status
+                                .set(Some(format!("Background blur could not be switched ({e})")));
+                        } else {
+                            signals
+                                .status
+                                .set(signals.prejoin.effects.notice.get_untracked());
+                        }
+                    }
                     UiAction::Leave => {
                         let _ = client.leave().await;
                         signals.ui_tx_slot.set(None);
@@ -825,7 +873,13 @@ fn CallView(
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
 ) -> impl IntoView {
-    let local = prejoin.stream.get_untracked();
+    // Prefer the effects module's outgoing stream: with blur on it
+    // carries the processed track, and its in-place swaps re-render
+    // through the same binding.
+    let local = prejoin
+        .effects
+        .outgoing()
+        .or_else(|| prejoin.stream.get_untracked());
     let meeting_title = move || {
         prejoin
             .meeting
@@ -886,17 +940,23 @@ fn CallView(
         }
     };
     let toggle_cam = {
-        let local = local.clone();
         move |_| {
             cam_on.update(|v| *v = !*v);
             let muted = !cam_on.get_untracked();
-            if let Some(stream) = &local {
-                media::set_track_kind_enabled(stream, "video", !muted);
-            }
+            // Mute acts on the RAW camera track (the shim black-fills
+            // while it is disabled), not on the processed one.
+            prejoin.effects.set_camera_enabled(!muted);
             send(UiAction::Mute {
                 audio_muted: None,
                 video_muted: Some(muted),
             });
+        }
+    };
+    let blur_on = prejoin.effects.blur_on;
+    let toggle_blur = {
+        move |_| {
+            let target = !blur_on.get_untracked();
+            send(UiAction::SetBlur(target));
         }
     };
     let leave = { move |_| send(UiAction::Leave) };
@@ -1142,6 +1202,14 @@ fn CallView(
                     on:click=toggle_cam
                 >
                     {move || if cam_on.get() { "Camera on" } else { "Camera off" }}
+                </button>
+                <button
+                    class="btn toggle"
+                    class:is-off=move || !blur_on.get()
+                    data-testid="toggle-blur"
+                    on:click=toggle_blur
+                >
+                    {move || if blur_on.get() { "Blur on" } else { "Blur off" }}
                 </button>
                 <button
                     class="btn toggle"

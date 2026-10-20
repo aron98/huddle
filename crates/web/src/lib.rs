@@ -16,6 +16,8 @@ pub mod api;
 pub mod audio_settings;
 #[cfg(target_arch = "wasm32")]
 pub mod call;
+#[cfg(target_arch = "wasm32")]
+pub mod effects;
 pub mod flow;
 #[cfg(target_arch = "wasm32")]
 pub mod media;

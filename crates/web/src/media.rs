@@ -8,6 +8,101 @@ use web_sys::{
     MediaStreamConstraints, MediaStreamTrack, Navigator,
 };
 
+/// Best-effort async delay: resolves after `ms` milliseconds. Never
+/// fails — without a window there is nothing to wait on, so resolve
+/// immediately.
+async fn delay(ms: i32) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let promise =
+        js_sys::Promise::new(&mut move |resolve: js_sys::Function, _: js_sys::Function| {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        });
+    let _ = JsFuture::from(promise).await;
+}
+
+/// Whether `track` reports the requested audio-processing config.
+/// `None` means the browser does not report these settings at all —
+/// unverifiable rather than wrong. web-sys 0.3.x only ships deprecated
+/// builder-style setters for `MediaTrackSettings`, so the values are
+/// read straight off the JS object.
+fn audio_processing_matches(track: &MediaStreamTrack, audio: AudioSettings) -> Option<bool> {
+    let settings = track.get_settings();
+    let get_bool = |key: &str| -> Option<bool> {
+        js_sys::Reflect::get(settings.as_ref(), &JsValue::from_str(key))
+            .ok()?
+            .as_bool()
+    };
+    let mut verified = false;
+    for (key, want) in [
+        ("echoCancellation", audio.echo_cancellation),
+        ("noiseSuppression", audio.noise_suppression),
+    ] {
+        match get_bool(key) {
+            Some(v) if v != want => return Some(false),
+            Some(_) => verified = true,
+            None => {}
+        }
+    }
+    verified.then_some(true)
+}
+
+/// How often a mismatching acquisition is retried, and how long to
+/// give the browser to finish releasing the device between attempts.
+const PROCESSING_RETRIES: u32 = 5;
+const PROCESSING_BACKOFF_MS: i32 = 100;
+
+/// getUserMedia with a post-hoc check that the audio-processing
+/// constraints actually applied.
+///
+/// Chrome keeps per-device audio-processing state while a capture is
+/// open, and a stopped track releases its device asynchronously — a
+/// re-acquisition issued immediately after stopping the previous
+/// capture can inherit the previous echo-cancellation /
+/// noise-suppression config instead of the requested one (observed:
+/// `echoCancellation: true` requested right after stopping an
+/// AEC-disabled capture returns a track reporting `false`). Verify the
+/// result; on a mismatch, release the fresh capture and retry after a
+/// short backoff. If the browser still does not apply — or does not
+/// report — the requested values, fail open with the last acquired
+/// stream: a working microphone with inherited processing beats no
+/// microphone at all.
+async fn get_user_media_verified(
+    devices: &MediaDevices,
+    constraints: &MediaStreamConstraints,
+    audio: AudioSettings,
+) -> Result<MediaStream, String> {
+    let mut attempt = 0;
+    loop {
+        let promise = devices
+            .get_user_media_with_constraints(constraints)
+            .map_err(|e| format!("cannot call getUserMedia: {e:?}"))?;
+        let stream = JsFuture::from(promise)
+            .await
+            .map_err(|e| format!("getUserMedia denied or failed: {e:?}"))?;
+        let stream = stream
+            .dyn_into::<MediaStream>()
+            .map_err(|e| format!("getUserMedia returned {e:?}"))?;
+
+        let mismatched = tracks_of(&stream)
+            .iter()
+            .find(|t| t.kind() == "audio")
+            .and_then(|t| audio_processing_matches(t, audio))
+            == Some(false);
+
+        if !mismatched || attempt >= PROCESSING_RETRIES {
+            return Ok(stream);
+        }
+
+        for track in tracks_of(&stream) {
+            track.stop();
+        }
+        delay(PROCESSING_BACKOFF_MS).await;
+        attempt += 1;
+    }
+}
+
 /// An input device the user can pick in the prejoin page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -32,8 +127,6 @@ pub async fn request_media(
     mic_id: Option<&str>,
     audio: AudioSettings,
 ) -> Result<MediaStream, String> {
-    let devices = media_devices()?;
-
     let constraints = MediaStreamConstraints::new();
     constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
     match camera_id {
@@ -41,15 +134,8 @@ pub async fn request_media(
         None => constraints.set_video_bool(true),
     }
 
-    let promise = devices
-        .get_user_media_with_constraints(&constraints)
-        .map_err(|e| format!("cannot call getUserMedia: {e:?}"))?;
-    let stream = JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("getUserMedia denied or failed: {e:?}"))?;
-    stream
-        .dyn_into::<MediaStream>()
-        .map_err(|e| format!("getUserMedia returned {e:?}"))
+    let devices = media_devices()?;
+    get_user_media_verified(&devices, &constraints, audio).await
 }
 
 /// Acquire only the microphone, with the same explicit audio
@@ -59,20 +145,11 @@ pub async fn request_mic(
     mic_id: Option<&str>,
     audio: AudioSettings,
 ) -> Result<MediaStreamTrack, String> {
-    let devices = media_devices()?;
-
     let constraints = MediaStreamConstraints::new();
     constraints.set_audio(&audio_settings::mic_constraint(mic_id, audio));
 
-    let promise = devices
-        .get_user_media_with_constraints(&constraints)
-        .map_err(|e| format!("cannot call getUserMedia: {e:?}"))?;
-    let stream = JsFuture::from(promise)
-        .await
-        .map_err(|e| format!("getUserMedia denied or failed: {e:?}"))?;
-    let stream = stream
-        .dyn_into::<MediaStream>()
-        .map_err(|e| format!("getUserMedia returned {e:?}"))?;
+    let devices = media_devices()?;
+    let stream = get_user_media_verified(&devices, &constraints, audio).await?;
     tracks_of(&stream)
         .into_iter()
         .find(|t| t.kind() == "audio")

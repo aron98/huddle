@@ -205,6 +205,9 @@ pub struct BrowserPeerConnection {
     /// Screen-share state shared with the [`ScreenShareHandle`] the UI
     /// holds; see [`BrowserPeerConnection::screen_share_handle`].
     screen: SharedScreenState,
+    /// Sender of the published camera, kept for `replaceTrack` swaps
+    /// (blur on/off) — m-line, simulcast rids and msid all stay put.
+    camera_sender: Rc<RefCell<Option<RtcRtpSender>>>,
     _on_ice_candidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _on_track: Closure<dyn FnMut(RtcTrackEvent)>,
 }
@@ -367,6 +370,7 @@ impl BrowserPeerConnection {
             local_candidates,
             on_remote_stream,
             screen: Rc::new(RefCell::new(ScreenState::default())),
+            camera_sender: Rc::new(RefCell::new(None)),
             _on_ice_candidate: on_ice_candidate,
             _on_track: on_track,
         })
@@ -428,6 +432,16 @@ impl BrowserPeerConnection {
         ))
     }
 
+    /// Swap the live camera track (blur on/off). `replaceTrack` keeps
+    /// the m-line, its simulcast rids, and the msid — no renegotiation.
+    pub async fn replace_camera_track(&self, track: &MediaStreamTrack) -> Result<(), PeerError> {
+        let Some(sender) = self.camera_sender.borrow().clone() else {
+            return Err(PeerError::Failed("camera not published".to_owned()));
+        };
+        let promise = sender.replace_track(Some(track));
+        JsFuture::from(promise).await.map_err(js_error).map(drop)
+    }
+
     /// Publish the camera as two simulcast layers: full resolution (the
     /// high layer) and a quarter-scale thumbnail (the low layer), rids
     /// ordered high → low to mirror the SFU's layer convention.
@@ -471,6 +485,7 @@ impl BrowserPeerConnection {
             .pc
             .add_transceiver_with_media_stream_track_and_init(track, &init);
         let sender = transceiver.sender();
+        *self.camera_sender.borrow_mut() = Some(sender.clone());
 
         // Tune the layer budgets via setParameters: 500 kbps for the full
         // layer, 100 for the quarter-scale thumbnail. The tight high-layer
