@@ -16,9 +16,11 @@
 
 pub mod error;
 mod peer;
+mod recorder;
 mod room;
 
 pub use error::SfuError;
+pub use recorder::{RecordedFrame, RecorderSink};
 pub use room::{Room, SfuOutput};
 
 /// Alias for the participant identity used across signaling and the SFU.

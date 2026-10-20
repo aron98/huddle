@@ -5,7 +5,8 @@
 # - `web` watches the web crate and rebuilds crates/web/dist on every change;
 # - `server` serves that directory via HUDDLE_WEB_DIR, so UI edits show up on
 #   the next browser refresh (server code changes need a container restart);
-# - `coturn` is the TURN companion from the architecture doc (dev credentials).
+# - `coturn` is the TURN companion from the architecture doc (dev credentials);
+# - `mux` (profile `recording`) post-processes meeting recordings; see below.
 #
 # Both `server` and `coturn` use host networking (Linux only): WebRTC media
 # is UDP from arbitrary client ports, which double NAT (docker bridge +
@@ -55,6 +56,29 @@ services:
     network_mode: host
     volumes:
       - ./deploy/coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+  # Recording sidecar (issue #15). The server records each take as
+  # length-framed per-track RTP under the shared data volume,
+  #   {data_dir}/recordings/{meeting_id}/{recording_id}/
+  # and this service muxes a finished take into a single playable .mp4:
+  # video tiles (xstack) plus mixed audio (amix). It shares the server's
+  # data volume and needs no networking — the RTP replay is loopback
+  # inside the container. Run it on demand, once a recording has stopped:
+  #   MEETING_ID=<uuid> RECORDING_ID=<uuid> \
+  #     docker compose --profile recording run --rm mux
+  # The recording UUIDs come from the REST status endpoint,
+  #   GET /api/meetings/{code}/recording
+  # HUDDLE_MUX_SPEED (default 8) replays the capture faster than real
+  # time; lower it if a long recording drops datagrams during demux.
+  mux:
+    build: deploy/recording
+    profiles: ["recording"]
+    volumes:
+      - ./data:/workspace/data
+    environment:
+      MEETING_ID: ${MEETING_ID:?set MEETING_ID to the recorded meeting's uuid}
+      RECORDING_ID: ${RECORDING_ID:?set RECORDING_ID to the take's uuid}
+      DATA_DIR: /workspace/data
 
 volumes:
   cargo-registry:

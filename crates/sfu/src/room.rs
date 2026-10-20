@@ -10,6 +10,7 @@ use crate::PeerId;
 use crate::PeerStats;
 use crate::error::SfuError;
 use crate::peer::{Peer, PollOutcome, TrackIn};
+use crate::recorder::{RecordedFrame, RecorderSink};
 
 use std::sync::Arc;
 
@@ -39,6 +40,10 @@ pub enum SfuOutput {
 pub struct Room {
     media_addr: SocketAddr,
     peers: HashMap<PeerId, Peer>,
+    /// The recording tap, if the meeting is being recorded. Held as an
+    /// `Arc` so dropping it (stop recording / empty meeting) is the
+    /// recorder's shutdown signal; `None` taps nothing.
+    recorder: Option<Arc<dyn RecorderSink>>,
 }
 
 impl Room {
@@ -50,7 +55,15 @@ impl Room {
         Room {
             media_addr,
             peers: HashMap::new(),
+            recorder: None,
         }
+    }
+
+    /// Install (or remove) the recording tap. Frames that pass the
+    /// forwarding gate are handed to `recorder` until it is swapped out
+    /// or dropped — the sink treats the drop as end-of-recording.
+    pub fn set_recorder(&mut self, recorder: Option<Arc<dyn RecorderSink>>) {
+        self.recorder = recorder;
     }
 
     /// The media socket address peers are told to send to.
@@ -350,6 +363,8 @@ impl Room {
             }
         }
 
+        self.record_frame(origin, data);
+
         let targets: Vec<(PeerId, Mid)> = self
             .peers
             .iter()
@@ -387,5 +402,35 @@ impl Room {
         {
             tracing::warn!("keyframe relay to peer {origin} failed: {e}");
         }
+    }
+
+    /// Tap `origin`'s frame into the recording sink, if one is installed.
+    ///
+    /// Called after the forwarding gate, so a recording contains exactly
+    /// what other participants receive (muted sources record nothing).
+    /// Fail-open: an absent sink — or a track we cannot resolve — records
+    /// nothing and never disturbs the forwarding path.
+    fn record_frame(&self, origin: PeerId, data: &MediaData) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        let Some(track) = self
+            .peers
+            .get(&origin)
+            .and_then(|peer| peer.track_in(data.mid))
+        else {
+            return;
+        };
+        recorder.record(RecordedFrame {
+            origin,
+            kind: track.kind,
+            screen: track.screen,
+            pt: *data.pt,
+            seq: data.seq_range.start().as_u16(),
+            timestamp: data.time.numer(),
+            contiguous: data.contiguous,
+            keyframe: data.is_keyframe(),
+            payload: data.data.clone(),
+        });
     }
 }

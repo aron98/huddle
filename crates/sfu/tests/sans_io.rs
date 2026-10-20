@@ -6,10 +6,11 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use huddle_protocol::VideoLayer;
-use huddle_sfu::{PeerId, Room, SfuError, SfuOutput};
+use huddle_sfu::{PeerId, RecordedFrame, RecorderSink, Room, SfuError, SfuOutput};
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Rid, Simulcast, SimulcastLayer};
@@ -927,4 +928,110 @@ fn screen_shares_ignore_layer_preferences() {
         low_before,
         "low layer still flowed after switching away"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Recording tap
+// ---------------------------------------------------------------------------
+
+/// A recording sink for tests: collects every tapped frame.
+#[derive(Default)]
+struct Tap {
+    frames: Mutex<Vec<RecordedFrame>>,
+}
+
+impl Tap {
+    fn len(&self) -> usize {
+        self.frames.lock().unwrap().len()
+    }
+}
+
+impl RecorderSink for Tap {
+    fn record(&self, frame: RecordedFrame) {
+        self.frames.lock().unwrap().push(frame);
+    }
+}
+
+#[test]
+fn recorder_taps_exactly_the_forwarded_media() {
+    let tap = Arc::new(Tap::default());
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs.iter().all(|c| c.connected)
+    });
+
+    // a shares their screen so the room carries audio + screen video.
+    room.set_sharing(a.id, true).unwrap();
+    let screen_mid = a.share_screen(&mut room);
+    let b_id = b.id;
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 2
+    });
+
+    // Recording on: both of a's tracks land in the tap, with the track
+    // metadata and the full depayloaded frame.
+    room.set_recorder(Some(tap.clone()));
+    a.send_audio(3);
+    a.send_screen_frames(screen_mid, 3);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let frames = tap.frames.lock().unwrap();
+        let audio = frames.iter().filter(|f| f.kind == MediaKind::Audio).count();
+        let video = frames.iter().filter(|f| f.kind == MediaKind::Video).count();
+        drop(frames);
+        if (audio >= 3 && video >= 3) || Instant::now() > deadline {
+            break;
+        }
+        step(&mut room, &mut [&mut a, &mut b]);
+    }
+    let frames = tap.frames.lock().unwrap();
+    assert!(
+        frames.iter().all(|f| f.origin == a.id),
+        "frames from unknown origins: {:?}",
+        frames.iter().map(|f| f.origin).collect::<Vec<_>>()
+    );
+    let audio = frames
+        .iter()
+        .find(|f| f.kind == MediaKind::Audio)
+        .expect("audio frames were tapped");
+    assert!(!audio.screen);
+    assert_eq!(audio.payload.as_ref(), &[0x11_u8; 40]);
+    let screen = frames
+        .iter()
+        .find(|f| f.kind == MediaKind::Video)
+        .expect("screen frames were tapped");
+    assert!(screen.screen);
+    assert_eq!(screen.payload.as_ref(), &[0x22_u8; 120]);
+    let audio_count = frames.iter().filter(|f| f.kind == MediaKind::Audio).count();
+    drop(frames);
+    assert!(audio_count >= 3, "only {audio_count} audio frames tapped");
+
+    // The tap sits after the forwarding gate: muting a's audio at the
+    // SFU must silence the recording too — it records exactly what
+    // other participants receive. The screen track stays live.
+    room.set_mute(a.id, Some(true), None).unwrap();
+    a.send_audio(5);
+    a.send_screen_frames(screen_mid, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(600));
+    let frames = tap.frames.lock().unwrap();
+    assert_eq!(
+        frames.iter().filter(|f| f.kind == MediaKind::Audio).count(),
+        audio_count,
+        "muted audio leaked into the recording"
+    );
+    let video = frames.iter().filter(|f| f.kind == MediaKind::Video).count();
+    drop(frames);
+    assert!(video >= 4, "screen frames stopped being recorded");
+
+    // Removing the tap stops recording.
+    let before = tap.len();
+    room.set_recorder(None);
+    a.send_audio(5);
+    a.send_screen_frames(screen_mid, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(600));
+    assert_eq!(tap.len(), before, "frames recorded after removal");
 }
