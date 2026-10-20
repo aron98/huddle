@@ -150,6 +150,14 @@ impl Effects {
                     let _ = this.set_blur(true).await;
                 }
             });
+        } else if self.blur_on.get_untracked() {
+            // Persisted preference says blur is on but no pipeline is
+            // running yet (fresh page load, prejoin just acquired media):
+            // auto-restore the effect.
+            let this = *self;
+            spawn_local(async move {
+                let _ = this.set_blur(true).await;
+            });
         }
     }
 
@@ -245,13 +253,16 @@ impl Effects {
         if self.busy.get_untracked() {
             return Ok(()); // a toggle is already in flight
         }
-        if self.pipeline.get_untracked().is_some() == on {
-            return Ok(()); // already there
+        if on && self.pipeline.get_untracked().is_some() {
+            return Ok(()); // already running
         }
         self.busy.set(true);
         let result = if on {
             self.activate().await
         } else {
+            // Always reset on "off", even without a pipeline: a failed
+            // restore can leave the preference on with no pipeline, and
+            // the toggle must still read back as off.
             self.deactivate(None);
             Ok(())
         };
