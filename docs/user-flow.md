@@ -16,7 +16,7 @@ flowchart TD
     Landing["Landing  /"]
     Login["Login  /login"]
     Dashboard["Dashboard  /meetings"]
-    Prejoin["Prejoin  /m/{code}\nname, camera preview, devices"]
+    Prejoin["Prejoin  /m/{code}\nname, passcode when required,\ncamera preview, devices"]
     Joining["Joining\nWS connect + join + publish"]
     InCall["In call\nmedia, roster, chat"]
     Left["Left\npost-leave page, rejoin"]
@@ -67,16 +67,17 @@ Landing (/) ──login──> Login (/login) ──> Dashboard (/meetings)
 
 | State | Where the user is | What is honest to show |
 | --- | --- | --- |
-| `Prejoin` | `/m/{code}`: name, camera preview, device pickers | Meeting title + when it opens (fetched from `GET /api/meetings/{code}`), camera loading state, camera errors with retry |
+| `Prejoin` | `/m/{code}`: name, passcode (when the meeting has one), camera preview, device pickers | Meeting title + when it opens (fetched from `GET /api/meetings/{code}`), camera loading state, camera errors with retry |
 | `Joining` | join clicked, handshake in flight | A distinct loading page; the prejoin page must not stay interactive |
 | `InCall` | media flows, roster + chat live | Roster, tiles, transient in-call notices |
 | `Left` | the user clicked Leave | A designed post-leave page: what the meeting was, Rejoin, back-to-dashboard |
 | `ConnectionLost` | the WS dropped or a send failed mid-call | A page distinct from `Left`: the reason, Reconnect, back-to-dashboard |
 
 Failure exits are *return transitions*: every join-time failure returns to
-`Prejoin` with a distinct, actionable message (and, for a taken name, an
-inline error on the name field). Mid-call failures terminate into
-`ConnectionLost`. Only the user's own Leave button terminates into `Left`.
+`Prejoin` with a distinct, actionable message (and, for a taken name or a
+wrong/missing passcode, an inline error on the offending field). Mid-call
+failures terminate into `ConnectionLost`. Only the user's own Leave button
+terminates into `Left`.
 
 ## Every join failure path, mapped
 
@@ -92,6 +93,7 @@ client maps each one to a distinct `JoinError` in `flow.rs`:
 | `MeetingEnded` | `Ended` | "This meeting has ended" |
 | `MeetingCancelled` | `Cancelled` | "This meeting was cancelled" |
 | `NameTaken` | `NameTaken` | **inline field error** under the name input, keeping everything the user typed |
+| `PasscodeRequired` (missing or wrong passcode) | `PasscodeRequired` | **inline field error** under the passcode field ("This meeting needs a passcode"), keeping everything the user typed |
 | `CapacityReached` ("this meeting is full") | `Full` | "This meeting is full" + ask the organizer to make room |
 | `InvalidMessage` / `Internal` / `Unauthorized` | `Server(msg)` | "Couldn't join" + the server's message + Try again |
 | protocol version mismatch (`Welcome`) | `ProtocolVersion(v)` | "This server speaks a newer protocol" + update hint |

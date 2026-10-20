@@ -221,6 +221,7 @@ fn Login() -> impl IntoView {
 fn Dashboard() -> impl IntoView {
     use huddle_protocol::{
         CreateMeetingRequest, Joinability, MeetingResponse, RecurrenceRule, RepeatFrequency,
+        UpdateMeetingRequest,
     };
     use time::format_description::well_known::Rfc3339;
 
@@ -232,6 +233,7 @@ fn Dashboard() -> impl IntoView {
     let starts = RwSignal::new(String::new());
     let ends = RwSignal::new(String::new());
     let repeat = RwSignal::new("never".to_owned());
+    let create_passcode = RwSignal::new(String::new());
 
     // Refresh the owned-meetings list in the background.
     fn refresh(meetings: RwSignal<Vec<MeetingResponse>>) {
@@ -304,12 +306,13 @@ fn Dashboard() -> impl IntoView {
             }),
             _ => None,
         };
+        let passcode = create_passcode.get_untracked().trim().to_owned();
         let request = CreateMeetingRequest {
             title: title.get_untracked().trim().to_owned(),
             starts_at,
             ends_at,
             repeat: repeat_rule,
-            passcode: None,
+            passcode: (!passcode.is_empty()).then_some(passcode),
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));
@@ -328,6 +331,7 @@ fn Dashboard() -> impl IntoView {
                     starts.set(String::new());
                     ends.set(String::new());
                     repeat.set("never".to_owned());
+                    create_passcode.set(String::new());
                     refresh(meetings);
                 }
                 Ok((_, text)) => status.set(Some(format!("Could not create the meeting: {text}"))),
@@ -365,6 +369,34 @@ fn Dashboard() -> impl IntoView {
         );
         let _ = window().navigator().clipboard().write_text(&url);
         status.set(Some("Join link copied.".to_owned()));
+    };
+    // Set (Some) or remove (None) a meeting's passcode. The tri-state
+    // wire format does the heavy lifting: absent means unchanged, so a
+    // single-field PATCH never touches the title or times.
+    let set_passcode = move |code: String, passcode: Option<String>| {
+        let message = if passcode.is_some() {
+            "Passcode saved."
+        } else {
+            "Passcode removed."
+        }
+        .to_owned();
+        let Ok(body) = serde_json::to_string(&UpdateMeetingRequest {
+            passcode: passcode.map(Some),
+            ..Default::default()
+        }) else {
+            status.set(Some("Could not encode the passcode.".to_owned()));
+            return;
+        };
+        spawn_local(async move {
+            match api::fetch_text("PATCH", &format!("/api/meetings/{code}"), Some(body)).await {
+                Ok((200, _)) => {
+                    status.set(Some(message));
+                    refresh(meetings);
+                }
+                Ok((_, text)) => status.set(Some(format!("Could not save the passcode: {text}"))),
+                Err(e) => status.set(Some(format!("Could not save the passcode: {e}"))),
+            }
+        });
     };
 
     view! {
@@ -444,6 +476,15 @@ fn Dashboard() -> impl IntoView {
                                     <option value="weekdays">"Weekdays (Mon–Fri)"</option>
                                     <option value="monthly">"Monthly"</option>
                                 </select>
+                                "Passcode (optional)"
+                                <input
+                                    type="password"
+                                    placeholder="Leave empty for an open meeting"
+                                    autocomplete="off"
+                                    data-testid="create-passcode"
+                                    prop:value=create_passcode
+                                    on:input=move |ev| create_passcode.set(event_target_value(&ev))
+                                />
                             </label>
                             <button class="btn primary" type="submit" data-testid="create-btn">
                                 "Create meeting"
@@ -572,6 +613,33 @@ fn Dashboard() -> impl IntoView {
                                         let code = code.clone();
                                         move |_| cancel(code.clone())
                                     };
+                                    // Per-row passcode draft. The row closure
+                                    // re-runs only when the list refreshes,
+                                    // at which point the saved state is the
+                                    // truth anyway.
+                                    let draft = RwSignal::new(String::new());
+                                    let passcode_input_testid = format!("passcode-input-{code}");
+                                    let passcode_save_testid = format!("passcode-save-{code}");
+                                    let passcode_remove_testid = format!("passcode-remove-{code}");
+                                    let passcode_testid = format!("passcode-state-{code}");
+                                    let save_passcode_click = {
+                                        let code = code.clone();
+                                        move |_| {
+                                            let value = draft.get_untracked().trim().to_owned();
+                                            if value.is_empty() {
+                                                status.set(Some(
+                                                    "Enter a passcode first.".to_owned(),
+                                                ));
+                                                return;
+                                            }
+                                            set_passcode(code.clone(), Some(value));
+                                        }
+                                    };
+                                    let remove_passcode_click = {
+                                        let code = code.clone();
+                                        move |_| set_passcode(code.clone(), None)
+                                    };
+                                    let has_passcode = current.meeting.has_passcode;
                                     let row_testid = format!("meeting-row-{code}");
                                     let join_href = format!("/m/{code}");
                                     let ics_href = format!("/api/meetings/{code}/ics");
@@ -620,6 +688,46 @@ fn Dashboard() -> impl IntoView {
                                                 })}
                                             </div>
                                             <span class=state_class>{state}</span>
+                                            <div class="meeting-row-passcode">
+                                                <span
+                                                    class="chip"
+                                                    data-testid=passcode_testid
+                                                >
+                                                    {if has_passcode {
+                                                        "Passcode on"
+                                                    } else {
+                                                        "Open"
+                                                    }}
+                                                </span>
+                                                <input
+                                                    type="password"
+                                                    placeholder="New passcode"
+                                                    autocomplete="off"
+                                                    data-testid=passcode_input_testid
+                                                    prop:value=draft
+                                                    on:input=move |ev| {
+                                                        draft.set(event_target_value(&ev))
+                                                    }
+                                                />
+                                                <button
+                                                    class="btn small"
+                                                    data-testid=passcode_save_testid
+                                                    on:click=save_passcode_click
+                                                >
+                                                    "Save"
+                                                </button>
+                                                {has_passcode.then(move || {
+                                                    view! {
+                                                        <button
+                                                            class="btn small"
+                                                            data-testid=passcode_remove_testid
+                                                            on:click=remove_passcode_click
+                                                        >
+                                                            "Remove"
+                                                        </button>
+                                                    }
+                                                })}
+                                            </div>
                                             <div class="meeting-row-actions">
                                                 <a class="btn primary small" href=join_href>
                                                     "Join"
