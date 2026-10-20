@@ -4,7 +4,8 @@ use crate::audio_settings::{self, AudioSettings};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    MediaDeviceKind, MediaDevices, MediaStream, MediaStreamConstraints, MediaStreamTrack, Navigator,
+    DisplayMediaStreamConstraints, MediaDeviceKind, MediaDevices, MediaStream,
+    MediaStreamConstraints, MediaStreamTrack, Navigator,
 };
 
 /// An input device the user can pick in the prejoin page.
@@ -251,23 +252,44 @@ pub async fn watch_speaking(
     })
 }
 
-/// Acquire a screen-capture stream and return it with its video track.
+/// A screen capture split into its publishable tracks.
+///
+/// `video` is always present; `audio` is the computer/tab sound the user
+/// kept in the browser's share picker, when there is one.
+pub struct ScreenCapture {
+    pub stream: MediaStream,
+    pub video: MediaStreamTrack,
+    pub audio: Option<MediaStreamTrack>,
+}
+
+/// Acquire a screen-capture stream and return it with its tracks.
 ///
 /// The e2e harness (`?test=1`) runs on a headless display with nothing to
 /// capture, so there the fake camera stands in for a screen; real users go
-/// through the browser's `getDisplayMedia` picker.
-pub async fn request_screen() -> Result<(MediaStream, MediaStreamTrack), String> {
-    let test_mode = web_sys::window()
+/// through the browser's `getDisplayMedia` picker, which offers audio
+/// alongside the video — the picker shows its own share-sound checkbox and
+/// simply omits the audio track when the user leaves it unchecked.
+///
+/// The fake test stream always carries an audio track; it only surfaces
+/// when the harness also asks for `screen-audio=1`, so the default e2e
+/// share path stays video-only.
+pub async fn request_screen() -> Result<ScreenCapture, String> {
+    let query = web_sys::window()
         .and_then(|w| w.location().search().ok())
-        .is_some_and(|s| s.contains("test=1"));
+        .unwrap_or_default();
+    let test_mode = query.contains("test=1");
+    let test_audio = query.contains("screen-audio=1");
     let stream = if test_mode {
         // The audio constraints are irrelevant for the screen stand-in
         // (only the video track is used), so plain defaults go in.
         request_media(None, None, AudioSettings::default()).await?
     } else {
         let devices = media_devices()?;
+        let constraints = DisplayMediaStreamConstraints::new();
+        constraints.set_audio_bool(true);
+        constraints.set_video_bool(true);
         let promise = devices
-            .get_display_media()
+            .get_display_media_with_constraints(&constraints)
             .map_err(|e| format!("cannot call getDisplayMedia: {e:?}"))?;
         let value = JsFuture::from(promise)
             .await
@@ -276,11 +298,21 @@ pub async fn request_screen() -> Result<(MediaStream, MediaStreamTrack), String>
             .dyn_into::<MediaStream>()
             .map_err(|e| format!("getDisplayMedia returned {e:?}"))?
     };
-    let track = tracks_of(&stream)
-        .into_iter()
+    let tracks = tracks_of(&stream);
+    let video = tracks
+        .iter()
         .find(|t| t.kind() == "video")
+        .cloned()
         .ok_or_else(|| "screen capture has no video track".to_owned())?;
-    Ok((stream, track))
+    let audio = tracks
+        .into_iter()
+        .find(|t| t.kind() == "audio")
+        .filter(|_| !test_mode || test_audio);
+    Ok(ScreenCapture {
+        stream,
+        video,
+        audio,
+    })
 }
 
 /// Fires `on_end` when `track` ends — the browser's own stop-sharing

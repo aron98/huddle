@@ -116,6 +116,46 @@ impl TestClient {
         mid
     }
 
+    /// A share that carries computer/tab audio: ONE offer with both
+    /// screen m-lines (video first, then audio), exactly like the
+    /// browser's single createOffer after two addTransceiver calls.
+    fn share_screen_with_audio(
+        &mut self,
+        room: &mut Room,
+    ) -> (str0m::media::Mid, str0m::media::Mid) {
+        let mut changes = self.rtc.sdp_api();
+        let video = changes.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let audio = changes.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let (offer, pending) = changes.apply().unwrap();
+        let answer = room
+            .answer_sdp_offer(self.id, &offer.to_sdp_string())
+            .unwrap();
+        let answer = SdpAnswer::from_sdp_string(&answer).unwrap();
+        self.rtc.sdp_api().accept_answer(pending, answer).unwrap();
+        (video, audio)
+    }
+
+    /// Send `n` opus frames on a share-audio m-line, each payload
+    /// starting with `marker` so receivers can tell it from mic audio.
+    fn send_screen_audio_frames(&mut self, mid: str0m::media::Mid, marker: u8, n: usize) {
+        let pt = self
+            .rtc
+            .codec_config()
+            .iter()
+            .find(|p| p.spec().codec == Codec::Opus)
+            .unwrap()
+            .pt();
+        for i in 0..n {
+            let time = MediaTime::from_millis(20 * i as u64);
+            let data = vec![marker; 40];
+            self.rtc
+                .writer(mid)
+                .unwrap()
+                .write(pt, Instant::now(), time, data)
+                .unwrap();
+        }
+    }
+
     /// Add a simulcast camera m-line with three send layers ("high",
     /// "mid", "low" in the sender's encoding order, highest quality
     /// first) and offer it to the room, as a browser configured with
@@ -795,6 +835,103 @@ fn reshare_on_a_new_transceiver_reopens_subscribers() {
     drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
         cs[1].media_rx > before
     });
+}
+
+/// Marker byte for share-audio frames (mic frames use 0x11).
+const SCREEN_AUDIO: u8 = 0x33;
+
+#[test]
+fn screen_share_audio_is_negotiated_forwarded_and_stateful() {
+    // A share that also carries the computer's sound: the SFU must
+    // negotiate and forward the extra audio m-line like any other,
+    // label it with the screen msid (so it lands on the screen tile,
+    // not the sharer's camera tile), keep it flowing through a mic
+    // mute, and wind it down/re-open it together with the video.
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    a.join(&mut room);
+    b.join(&mut room);
+    a.send_audio(5);
+    b.send_audio(5);
+    drive(&mut room, &mut [&mut a, &mut b], |_, cs| {
+        cs.iter().all(|c| c.connected) && cs.iter().all(|c| c.media_rx > 0)
+    });
+
+    let (a_id, b_id) = (a.id, b.id);
+    room.set_sharing(a_id, true).unwrap();
+    let (screen, screen_sound) = a.share_screen_with_audio(&mut room);
+    let screen_msid = format!("a=msid:{a_id}-screen");
+
+    // b ends up subscribed to all three of a's tracks (mic + screen
+    // video + screen audio), and the fan-out offers carry the screen
+    // msid on BOTH screen m-lines — possibly split over two offers if
+    // the pending-offer gate serializes them.
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        r.peer_tracks(b_id).unwrap().1 == 3
+            && cs[1]
+                .server_offers
+                .iter()
+                .map(|o| o.matches(&screen_msid).count())
+                .sum::<usize>()
+                >= 2
+    });
+
+    // Both screen tracks deliver: the share's sound reaches b on its
+    // own marker, never mixed into the mic m-line.
+    let sound_before = b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0);
+    a.send_screen_frames(screen, 10);
+    a.send_screen_audio_frames(screen_sound, SCREEN_AUDIO, 10);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0) > sound_before,
+        "share audio did not flow to the subscriber"
+    );
+
+    // The mic mute gates the mic m-line only: a screen track's
+    // forwarding answers to the share state, not the mute.
+    let mic_before = b.media_rx_markers.get(&0x11).copied().unwrap_or(0);
+    let sound_before = b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0);
+    room.set_mute(a_id, Some(true), None).unwrap();
+    a.send_audio(10);
+    a.send_screen_audio_frames(screen_sound, SCREEN_AUDIO, 10);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(
+        b.media_rx_markers.get(&0x11).copied().unwrap_or(0),
+        mic_before,
+        "muted mic audio leaked to b"
+    );
+    assert!(
+        b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0) > sound_before,
+        "share audio stopped while only the mic was muted"
+    );
+
+    // Stopping the share (the engine's Sharing{false} path) winds BOTH
+    // screen tracks down together. The browser drops the senders too
+    // (removeTrack flips the m-lines to recvonly) — mirror that so the
+    // stopped m-lines don't look like a live share in later offers.
+    room.set_sharing(a_id, false).unwrap();
+    a.set_screen_direction(&mut room, screen, Direction::RecvOnly);
+    a.set_screen_direction(&mut room, screen_sound, Direction::RecvOnly);
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 1
+    });
+
+    // A re-share on brand-new transceivers (the browser's reshare
+    // path) re-opens both m-lines and the sound flows again.
+    room.set_sharing(a_id, true).unwrap();
+    let (screen2, sound2) = a.share_screen_with_audio(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, _| {
+        r.peer_tracks(b_id).unwrap().1 == 3
+    });
+    let sound_before = b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0);
+    a.send_screen_frames(screen2, 10);
+    a.send_screen_audio_frames(sound2, SCREEN_AUDIO, 10);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers.get(&SCREEN_AUDIO).copied().unwrap_or(0) > sound_before,
+        "re-shared audio did not flow"
+    );
 }
 
 /// Simulcast markers: one byte per layer, first payload byte on the wire.

@@ -220,10 +220,15 @@ type RemoteStreamCallback = Rc<RefCell<Option<Box<dyn FnMut(&str, MediaStream)>>
 /// acquired, the task attaches it during `add_screen_track`.
 #[derive(Default)]
 struct ScreenState {
-    /// Track + carrying stream staged by the UI, awaiting attachment.
+    /// Video track + carrying stream staged by the UI, awaiting attachment.
     staged: Option<(MediaStreamTrack, MediaStream)>,
+    /// Computer/tab audio staged alongside the video, when the capture
+    /// has one.
+    staged_audio: Option<(MediaStreamTrack, MediaStream)>,
     /// The sender created by the last `add_screen_track`.
     sender: Option<RtcRtpSender>,
+    /// The sender for the share's audio track, when one was attached.
+    audio_sender: Option<RtcRtpSender>,
 }
 
 type SharedScreenState = Rc<RefCell<ScreenState>>;
@@ -240,6 +245,13 @@ impl ScreenShareHandle {
     /// `add_screen_track` attaches it to the peer connection.
     pub fn stage(&self, track: MediaStreamTrack, stream: MediaStream) {
         self.0.borrow_mut().staged = Some((track, stream));
+    }
+
+    /// Stage the share's computer/tab audio track: `add_screen_track`
+    /// attaches it on a second sendonly transceiver so it travels on
+    /// its own m-line, exactly like the screen video.
+    pub fn stage_audio(&self, track: MediaStreamTrack, stream: MediaStream) {
+        self.0.borrow_mut().staged_audio = Some((track, stream));
     }
 }
 
@@ -605,15 +617,43 @@ impl PeerConnection for BrowserPeerConnection {
             .pc
             .add_transceiver_with_media_stream_track_and_init(&track, &init);
         self.screen.borrow_mut().sender = Some(transceiver.sender());
+
+        // The share's computer/tab audio, when the user kept one in the
+        // picker: a second sendonly transceiver — never `addTrack`, for
+        // the same m-line-hijacking reason as above — so it gets its
+        // own m-line and the SFU forwards it like any other audio mid.
+        // Both transceivers reference the same capture stream, so the
+        // two m-lines carry the same msid and the SFU re-labels them
+        // with its own `{origin}-screen` id on the way out.
+        // NOTE: hoist the `take()` out of the `if let` scrutinee — the
+        // scrutinee's temporary `borrow_mut()` would otherwise stay
+        // alive for the whole block and the second `borrow_mut()` below
+        // would panic ("RefCell already borrowed") in the browser.
+        let staged_audio = self.screen.borrow_mut().staged_audio.take();
+        if let Some((audio, audio_stream)) = staged_audio {
+            let init = RtcRtpTransceiverInit::new();
+            init.set_direction(RtcRtpTransceiverDirection::Sendonly);
+            let streams = js_sys::Array::new();
+            streams.push(&audio_stream);
+            init.set_streams(&streams);
+            let transceiver = self
+                .pc
+                .add_transceiver_with_media_stream_track_and_init(&audio, &init);
+            self.screen.borrow_mut().audio_sender = Some(transceiver.sender());
+        }
         Ok(())
     }
 
     async fn remove_screen_track(&mut self) -> Result<(), PeerError> {
         let mut screen = self.screen.borrow_mut();
-        // Clear any staged-but-never-attached track too, so a fresh share
-        // stages on a clean slate.
+        // Clear any staged-but-never-attached tracks too, so a fresh
+        // share stages on a clean slate.
         screen.staged = None;
+        screen.staged_audio = None;
         if let Some(sender) = screen.sender.take() {
+            self.pc.remove_track(&sender);
+        }
+        if let Some(sender) = screen.audio_sender.take() {
             self.pc.remove_track(&sender);
         }
         Ok(())

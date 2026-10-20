@@ -511,11 +511,17 @@ async fn run_session(
                             // Acquire the capture first: a denied picker
                             // is a UI hiccup, not a call ender.
                             match media::request_screen().await {
-                                Ok((stream, track)) => {
-                                    client
-                                        .peer_mut()
-                                        .screen_share_handle()
-                                        .stage(track.clone(), stream.clone());
+                                Ok(capture) => {
+                                    let stream = capture.stream.clone();
+                                    let track = capture.video.clone();
+                                    let handle = client.peer_mut().screen_share_handle();
+                                    handle.stage(track.clone(), stream.clone());
+                                    // Share the computer/tab sound too when the
+                                    // user kept it in the picker: it rides its
+                                    // own sendonly m-line alongside the video.
+                                    if let Some(audio) = capture.audio.clone() {
+                                        handle.stage_audio(audio, stream.clone());
+                                    }
                                     let stop_tx = screen_ui_tx.clone();
                                     let guard = media::watch_track_ended(&track, move || {
                                         let _ = stop_tx.unbounded_send(
@@ -685,6 +691,7 @@ fn VideoTile(
     screen: bool,
     focused: bool,
     on_click: Option<Callback<()>>,
+    #[prop(optional)] share_audio: bool,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
     Effect::new(move |_| {
@@ -709,6 +716,13 @@ fn VideoTile(
             on:click=move |_| if let Some(cb) = &on_click { cb.run(()) }
         >
             <video node_ref=video_ref autoplay muted playsinline></video>
+            {share_audio.then(|| {
+                view! {
+                    <span class="screen-audio-badge" data-testid="screen-audio-badge">
+                        "audio"
+                    </span>
+                }
+            })}
             <figcaption>{label}</figcaption>
         </figure>
     }
@@ -724,13 +738,28 @@ fn SharePip(
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
 ) -> impl IntoView {
     let video_ref = NodeRef::<leptos::html::Video>::new();
+    let video_stream = stream.clone();
     Effect::new(move |_| {
         if let Some(video) = video_ref.get() {
             video.set_muted(true);
-            video.set_src_object(Some(&stream));
+            video.set_src_object(Some(&video_stream));
             crate::play_silently(&video);
         }
     });
+    // Computer/tab audio sharing: only when the capture kept an audio
+    // track. The toggle flips the track's `enabled` flag — exactly like
+    // the mic mute — so no renegotiation is involved: the m-line stays
+    // up and viewers simply get silence while it is off.
+    let has_share_audio = media::tracks_of(&stream)
+        .iter()
+        .any(|t| t.kind() == "audio");
+    let share_audio_on =
+        RwSignal::new(has_share_audio && media::track_kind_enabled(&stream, "audio"));
+    let toggle_share_audio = move |_| {
+        let next = !share_audio_on.get_untracked();
+        media::set_track_kind_enabled(&stream, "audio", next);
+        share_audio_on.set(next);
+    };
     let stop = move |_| {
         if let Some(tx) = ui_tx_slot.get_untracked() {
             let _ = tx.unbounded_send(UiAction::ShareScreen(ScreenCommand::Stop));
@@ -740,7 +769,23 @@ fn SharePip(
         <figure class="share-pip" data-testid="share-pip">
             <video node_ref=video_ref autoplay muted playsinline></video>
             <figcaption>
-                <span>"Sharing your screen"</span>
+                <span>
+                    "Sharing your screen"
+                    {has_share_audio.then(|| {
+                        view! { <span class="screen-audio-badge" data-testid="share-audio-badge">"audio"</span> }
+                    })}
+                </span>
+                {has_share_audio.then(|| {
+                    view! {
+                        <button
+                            class="btn small"
+                            data-testid="share-audio-toggle"
+                            on:click=toggle_share_audio
+                        >
+                            {move || if share_audio_on.get() { "audio on" } else { "audio off" }}
+                        </button>
+                    }
+                })}
                 <button class="btn small danger" data-testid="share-pip-stop" on:click=stop>
                     "Stop"
                 </button>
@@ -984,6 +1029,17 @@ fn CallView(
                                 } else {
                                     (Oco::from(base.clone()), Oco::from(format!("tile-{base}")))
                                 };
+                                // The SFU forwards share audio on the same
+                                // `{origin}-screen` msid, so an audio track in
+                                // the stream means the share carries sound
+                                // (it plays through this tile's video element,
+                                // never the speaker's camera tile). Track ids
+                                // are deliberately not read — see the ontrack
+                                // note in `BrowserPeerConnection::new`.
+                                let share_audio = is_screen
+                                    && media::tracks_of(&s.1)
+                                        .iter()
+                                        .any(|t| t.kind() == "audio");
                                 view! {
                                     <VideoTile
                                         stream=s.1.clone()
@@ -994,6 +1050,7 @@ fn CallView(
                                         screen=is_screen
                                         focused=is_focused
                                         on_click=on_click
+                                        share_audio=share_audio
                                     />
                                 }
                             }}
