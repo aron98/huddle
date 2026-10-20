@@ -228,7 +228,18 @@ async fn try_join(
             )
         })?;
 
-    match meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()) {
+    let cancelled = meetings::cancelled_occurrences(state.pool(), meeting.id)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "occurrence lookup failed");
+            (ErrorCode::Internal, "meeting lookup failed".into())
+        })?;
+    match meetings::joinability_with(
+        &meeting,
+        &cancelled,
+        state.config(),
+        OffsetDateTime::now_utc(),
+    ) {
         Joinability::Open => {}
         Joinability::NotYet { .. } => {
             return Err((
@@ -291,6 +302,7 @@ mod tests {
     use crate::config::Config;
     use crate::state::AppState;
     use huddle_protocol::CreateMeetingRequest;
+    use huddle_protocol::{RecurrenceRule, RepeatFrequency};
     use std::net::{IpAddr, SocketAddr, UdpSocket};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -354,6 +366,28 @@ mod tests {
                 title: "Test call".into(),
                 starts_at: now + time::Duration::minutes(starts_in_min),
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
+                repeat: None,
+            };
+            let meeting = meetings::create(self.state.pool(), &req, None, now)
+                .await
+                .unwrap();
+            meeting.code.clone()
+        }
+
+        /// A recurring series: `starts_in_min`/`lasts_min` describe the
+        /// first occurrence, `rule` the repetition.
+        async fn create_recurring_meeting(
+            &self,
+            starts_in_min: i64,
+            lasts_min: i64,
+            rule: RecurrenceRule,
+        ) -> String {
+            let now = OffsetDateTime::now_utc();
+            let req = CreateMeetingRequest {
+                title: "Test series".into(),
+                starts_at: now + time::Duration::minutes(starts_in_min),
+                ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
+                repeat: Some(rule),
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -808,6 +842,85 @@ mod tests {
         )
         .await;
         expect_error(&mut ws, ErrorCode::MeetingEnded).await;
+    }
+
+    // --- recurring series (issue 16) ---------------------------------------
+
+    fn weekly(count: Option<u32>) -> RecurrenceRule {
+        RecurrenceRule {
+            frequency: RepeatFrequency::Weekly,
+            until: None,
+            count,
+        }
+    }
+
+    #[tokio::test]
+    async fn recurring_meeting_joins_at_the_current_occurrence() {
+        let server = TestServer::start().await;
+        // Started a week and ten minutes ago: the second occurrence is
+        // happening now, so the join window is open even though the
+        // first occurrence is long over.
+        let code = server
+            .create_recurring_meeting(-7 * 24 * 60 - 10, 60, weekly(None))
+            .await;
+        let alice = TestClient::connect(&server, &code, "alice").await;
+        alice.pump.stop();
+    }
+
+    #[tokio::test]
+    async fn recurring_meeting_rejects_between_occurrences() {
+        let server = TestServer::start().await;
+        // Three days into a weekly, one-hour series: between the first
+        // (over) and second (four days out) occurrence.
+        let code = server
+            .create_recurring_meeting(-3 * 24 * 60, 60, weekly(None))
+            .await;
+        let mut ws = ws_connect(&server.base).await;
+        send_json(
+            &mut ws,
+            serde_json::json!({ "type": "join", "meeting_code": code, "name": "alice" }),
+        )
+        .await;
+        expect_error(&mut ws, ErrorCode::MeetingNotYetOpen).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_occurrence_blocks_join_but_keeps_the_series() {
+        let server = TestServer::start().await;
+        // Happening now, with exactly one more occurrence next week.
+        let code = server
+            .create_recurring_meeting(-10, 60, weekly(Some(2)))
+            .await;
+        let pool = server.state.pool();
+        let meeting = meetings::get_by_code(pool, &code).await.unwrap().unwrap();
+        let next_week = meeting.starts_at + time::Duration::days(7);
+
+        // Cancelling a future occurrence leaves the current one open.
+        meetings::cancel_occurrence(pool, &code, next_week)
+            .await
+            .unwrap()
+            .unwrap();
+        let alice = TestClient::connect(&server, &code, "alice").await;
+        alice.pump.stop();
+
+        // Cancelling the occurrence happening now closes the join —
+        // with no future occurrence left, the series reads as
+        // cancelled for the moment.
+        meetings::cancel_occurrence(pool, &code, meeting.starts_at)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut ws = ws_connect(&server.base).await;
+        send_json(
+            &mut ws,
+            serde_json::json!({ "type": "join", "meeting_code": code, "name": "alice" }),
+        )
+        .await;
+        expect_error(&mut ws, ErrorCode::MeetingCancelled).await;
+
+        // But the series itself was never cancelled.
+        let fetched = meetings::get_by_code(pool, &code).await.unwrap().unwrap();
+        assert!(!fetched.cancelled);
     }
 
     #[tokio::test]

@@ -7,9 +7,13 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use huddle_protocol::{CreateMeetingRequest, Joinability, MeetingDto, UpdateMeetingRequest};
+use huddle_protocol::{
+    CreateMeetingRequest, Joinability, MeetingDto, OccurrenceDto, RecurrenceRule,
+    UpdateMeetingRequest,
+};
 
 use crate::config::Config;
+use crate::recurrence;
 
 /// One meeting row, domain-typed (UTC times, parsed codes).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +28,9 @@ pub struct Meeting {
     pub organizer_id: Option<Uuid>,
     pub cancelled: bool,
     pub created_at: OffsetDateTime,
+    /// The series rule when this meeting recurs; `None` for a one-off.
+    /// `starts_at` is the first occurrence.
+    pub repeat: Option<RecurrenceRule>,
 }
 
 impl From<Meeting> for MeetingDto {
@@ -35,6 +42,7 @@ impl From<Meeting> for MeetingDto {
             starts_at: m.starts_at,
             ends_at: m.ends_at,
             cancelled: m.cancelled,
+            repeat: m.repeat,
         }
     }
 }
@@ -105,7 +113,54 @@ fn row_to_meeting(row: &SqliteRow) -> Result<Meeting, MeetingError> {
             row.try_get::<String, _>("created_at")?.as_str(),
             "created_at",
         )?,
+        repeat: row_repeat(row)?,
     })
+}
+
+/// Parse the recurrence columns. A NULL rule means a one-off (orphaned
+/// `rrule_until`/`rrule_count` with no rule are ignored); a rule string
+/// outside the closed set the server writes is corrupt.
+fn row_repeat(row: &SqliteRow) -> Result<Option<RecurrenceRule>, MeetingError> {
+    let Some(raw) = row.try_get::<Option<String>, _>("rrule")? else {
+        return Ok(None);
+    };
+    let frequency = recurrence::parse_stored_rule(&raw)
+        .ok_or_else(|| MeetingError::Corrupt(format!("rrule: {raw}")))?;
+    let until = row
+        .try_get::<Option<String>, _>("rrule_until")?
+        .map(|raw| from_text(&raw, "rrule_until"))
+        .transpose()?;
+    let count = row
+        .try_get::<Option<i64>, _>("rrule_count")?
+        .map(i64::try_into)
+        .transpose()
+        .map_err(|_| MeetingError::Corrupt("rrule_count: out of range".into()))?;
+    Ok(Some(RecurrenceRule {
+        frequency,
+        until,
+        count,
+    }))
+}
+
+/// The persisted form of a rule, split across the three `meetings`
+/// columns: the closed-set `rrule` string, the RFC 3339 `rrule_until`,
+/// and the `rrule_count`.
+type StoredRepeat = (Option<String>, Option<String>, Option<i64>);
+
+/// Serialize a rule into the three storage columns. The rule itself
+/// has already been validated (`CreateMeetingRequest::validate` or the
+/// explicit check in `update_by_code`).
+fn repeat_columns(repeat: &Option<RecurrenceRule>) -> Result<StoredRepeat, MeetingError> {
+    let Some(rule) = repeat else {
+        return Ok((None, None, None));
+    };
+    let rrule = recurrence::stored_rule(rule.frequency).to_owned();
+    let rrule_until = rule
+        .until
+        .map(to_text)
+        .transpose()
+        .map_err(|e| MeetingError::Corrupt(e.to_string()))?;
+    Ok((Some(rrule), rrule_until, rule.count.map(i64::from)))
 }
 
 /// Create a meeting with a fresh, collision-checked code. `organizer_id`
@@ -124,14 +179,15 @@ pub async fn create(
     let starts_at = to_text(req.starts_at).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
     let ends_at = to_text(req.ends_at).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
     let created_at = to_text(now).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
+    let (rrule, rrule_until, rrule_count) = repeat_columns(&req.repeat)?;
 
     // Codes are random; a collision burns the insert on the UNIQUE index,
     // so just retry with a fresh code.
     for _ in 0..5 {
         let code = generate_code();
         let result = sqlx::query(
-            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&code)
@@ -140,6 +196,9 @@ pub async fn create(
         .bind(&ends_at)
         .bind(organizer_id.map(|id| id.to_string()))
         .bind(&created_at)
+        .bind(&rrule)
+        .bind(&rrule_until)
+        .bind(rrule_count)
         .execute(pool)
         .await;
 
@@ -159,7 +218,7 @@ pub async fn create(
 /// Look up a meeting by its (normalized) code.
 pub async fn get_by_code(pool: &SqlitePool, code: &str) -> Result<Option<Meeting>, MeetingError> {
     let row = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count
          FROM meetings WHERE code = ?1",
     )
     .bind(normalize_code(code))
@@ -175,7 +234,7 @@ pub async fn list_for_organizer(
     organizer_id: Uuid,
 ) -> Result<Vec<Meeting>, MeetingError> {
     let rows = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count
          FROM meetings WHERE organizer_id = ?1 ORDER BY starts_at ASC",
     )
     .bind(organizer_id.to_string())
@@ -210,16 +269,36 @@ pub async fn update_by_code(
     if meeting.ends_at <= meeting.starts_at {
         return Err(MeetingError::Invalid);
     }
+    // Absent leaves the rule unchanged; explicit `null` clears it back
+    // to a one-off; a rule replaces it. Either way the rule is
+    // validated against the (possibly just changed) series start.
+    match req.repeat {
+        None => {}
+        Some(None) => meeting.repeat = None,
+        Some(Some(rule)) => {
+            if rule.validate(meeting.starts_at).is_err() {
+                return Err(MeetingError::Invalid);
+            }
+            meeting.repeat = Some(rule);
+        }
+    }
 
     let starts_at = to_text(meeting.starts_at).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
     let ends_at = to_text(meeting.ends_at).map_err(|e| MeetingError::Corrupt(e.to_string()))?;
-    sqlx::query("UPDATE meetings SET title = ?1, starts_at = ?2, ends_at = ?3 WHERE code = ?4")
-        .bind(&meeting.title)
-        .bind(starts_at)
-        .bind(ends_at)
-        .bind(&meeting.code)
-        .execute(pool)
-        .await?;
+    let (rrule, rrule_until, rrule_count) = repeat_columns(&meeting.repeat)?;
+    sqlx::query(
+        "UPDATE meetings SET title = ?1, starts_at = ?2, ends_at = ?3, rrule = ?4, rrule_until = ?5, rrule_count = ?6
+         WHERE code = ?7",
+    )
+    .bind(&meeting.title)
+    .bind(starts_at)
+    .bind(ends_at)
+    .bind(rrule)
+    .bind(rrule_until)
+    .bind(rrule_count)
+    .bind(&meeting.code)
+    .execute(pool)
+    .await?;
 
     Ok(Some(meeting))
 }
@@ -238,12 +317,57 @@ pub async fn set_cancelled(
     get_by_code(pool, code).await
 }
 
-/// Joinability of a meeting at `now`, honoring the configured window.
-pub fn joinability(meeting: &Meeting, config: &Config, now: OffsetDateTime) -> Joinability {
+/// Joinability of a (possibly recurring) meeting at `now`, honoring
+/// per-occurrence cancellations. A one-off keeps the classic single
+/// window; a series is joinable when `now` falls inside any open
+/// occurrence's window. A cancelled occurrence only reports
+/// `Cancelled` when it is the one happening now — a series with a
+/// live future occurrence stays joinable-later, not cancelled.
+pub fn joinability_with(
+    meeting: &Meeting,
+    cancelled_occurrences: &[OffsetDateTime],
+    config: &Config,
+    now: OffsetDateTime,
+) -> Joinability {
     if meeting.cancelled {
         return Joinability::Cancelled;
     }
-    let (opens_at, closes_at) = config.join_window(meeting.starts_at, meeting.ends_at);
+    let Some(rule) = &meeting.repeat else {
+        let (opens_at, closes_at) = config.join_window(meeting.starts_at, meeting.ends_at);
+        return single_window(opens_at, closes_at, now);
+    };
+
+    let duration = meeting.ends_at - meeting.starts_at;
+    let mut cancelled_now = false;
+    for start in recurrence::occurrence_starts(rule, meeting.starts_at) {
+        let (opens_at, closes_at) = config.join_window(start, start + duration);
+        if cancelled_occurrences.contains(&start) {
+            if opens_at <= now && now <= closes_at {
+                cancelled_now = true;
+            }
+            continue;
+        }
+        if now < opens_at {
+            return Joinability::NotYet { opens_at };
+        }
+        if now <= closes_at {
+            return Joinability::Open;
+        }
+    }
+    if cancelled_now {
+        Joinability::Cancelled
+    } else {
+        Joinability::Ended
+    }
+}
+
+/// The single-meeting window logic, factored so both the one-off path
+/// and each occurrence of a series use identical arithmetic.
+fn single_window(
+    opens_at: OffsetDateTime,
+    closes_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Joinability {
     if now < opens_at {
         Joinability::NotYet { opens_at }
     } else if now <= closes_at {
@@ -251,6 +375,81 @@ pub fn joinability(meeting: &Meeting, config: &Config, now: OffsetDateTime) -> J
     } else {
         Joinability::Ended
     }
+}
+
+/// The concrete upcoming occurrences of a series — not yet ended,
+/// marked with their per-occurrence cancel state — up to `limit`.
+/// One-off meetings have none.
+pub fn upcoming_occurrences(
+    meeting: &Meeting,
+    cancelled: &[OffsetDateTime],
+    now: OffsetDateTime,
+    limit: usize,
+) -> Vec<OccurrenceDto> {
+    let Some(rule) = &meeting.repeat else {
+        return Vec::new();
+    };
+    let duration = meeting.ends_at - meeting.starts_at;
+    recurrence::occurrence_starts(rule, meeting.starts_at)
+        .into_iter()
+        .map(|start| OccurrenceDto {
+            starts_at: start,
+            ends_at: start + duration,
+            cancelled: cancelled.contains(&start),
+        })
+        .filter(|occurrence| occurrence.ends_at >= now)
+        .take(limit)
+        .collect()
+}
+
+/// The cancelled occurrence starts of a meeting series, ascending.
+pub async fn cancelled_occurrences(
+    pool: &SqlitePool,
+    meeting_id: Uuid,
+) -> Result<Vec<OffsetDateTime>, MeetingError> {
+    let rows = sqlx::query(
+        "SELECT starts_at FROM cancelled_occurrences WHERE meeting_id = ?1 ORDER BY starts_at ASC",
+    )
+    .bind(meeting_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            from_text(
+                row.try_get::<String, _>("starts_at")?.as_str(),
+                "occurrence starts_at",
+            )
+        })
+        .collect()
+}
+
+/// Cancel a single occurrence of a recurring series: the date joins
+/// the series' cancelled set, the series itself stays intact.
+/// `None` for an unknown code. The occurrence must be a real start
+/// time of the series (clients send back exactly what
+/// [`upcoming_occurrences`] handed them).
+pub async fn cancel_occurrence(
+    pool: &SqlitePool,
+    code: &str,
+    occurrence: OffsetDateTime,
+) -> Result<Option<Vec<OffsetDateTime>>, MeetingError> {
+    let Some(meeting) = get_by_code(pool, code).await? else {
+        return Ok(None);
+    };
+    let Some(rule) = &meeting.repeat else {
+        return Err(MeetingError::Invalid);
+    };
+    if !recurrence::occurrence_starts(rule, meeting.starts_at).contains(&occurrence) {
+        return Err(MeetingError::Invalid);
+    }
+    sqlx::query(
+        "INSERT OR IGNORE INTO cancelled_occurrences (meeting_id, starts_at) VALUES (?1, ?2)",
+    )
+    .bind(meeting.id.to_string())
+    .bind(to_text(occurrence).map_err(|e| MeetingError::Corrupt(e.to_string()))?)
+    .execute(pool)
+    .await?;
+    Ok(Some(cancelled_occurrences(pool, meeting.id).await?))
 }
 
 #[cfg(test)]
@@ -269,6 +468,7 @@ mod tests {
             title: title.into(),
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
+            repeat: None,
         }
     }
 
@@ -318,6 +518,7 @@ mod tests {
                 title: "Broken".into(),
                 starts_at: OffsetDateTime::now_utc() + Duration::hours(2),
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
+                repeat: None,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -347,6 +548,7 @@ mod tests {
                 starts_at: Some(new_start),
                 ends_at: None,
                 cancelled: None,
+                repeat: None,
             },
         )
         .await
@@ -435,17 +637,18 @@ mod tests {
             organizer_id: None,
             cancelled: false,
             created_at: start,
+            repeat: None,
         };
         assert!(matches!(
-            joinability(&meeting, &config, start - Duration::minutes(6)),
+            joinability_with(&meeting, &[], &config, start - Duration::minutes(6)),
             Joinability::NotYet { .. }
         ));
         assert_eq!(
-            joinability(&meeting, &config, start - Duration::minutes(4)),
+            joinability_with(&meeting, &[], &config, start - Duration::minutes(4)),
             Joinability::Open
         );
         assert_eq!(
-            joinability(&meeting, &config, start + Duration::hours(2)),
+            joinability_with(&meeting, &[], &config, start + Duration::hours(2)),
             Joinability::Ended
         );
     }
@@ -462,10 +665,321 @@ mod tests {
             organizer_id: None,
             cancelled: true,
             created_at: OffsetDateTime::now_utc(),
+            repeat: None,
         };
         assert_eq!(
-            joinability(&meeting, &config, OffsetDateTime::now_utc()),
+            joinability_with(&meeting, &[], &config, OffsetDateTime::now_utc()),
             Joinability::Cancelled
+        );
+    }
+
+    // --- recurring series ---------------------------------------------------
+
+    use huddle_protocol::RepeatFrequency;
+
+    /// A weekly series starting at `starts_at` with a one-hour slot.
+    fn series(starts_at: OffsetDateTime, count: Option<u32>) -> Meeting {
+        Meeting {
+            id: Uuid::new_v4(),
+            code: generate_code(),
+            title: "test".into(),
+            starts_at,
+            ends_at: starts_at + Duration::hours(1),
+            organizer_id: None,
+            cancelled: false,
+            created_at: OffsetDateTime::now_utc(),
+            repeat: Some(RecurrenceRule {
+                frequency: RepeatFrequency::Weekly,
+                until: None,
+                count,
+            }),
+        }
+    }
+
+    fn weekly_req(
+        starts_in: Duration,
+        lasts: Duration,
+        count: Option<u32>,
+    ) -> CreateMeetingRequest {
+        let now = OffsetDateTime::now_utc();
+        CreateMeetingRequest {
+            title: "Series".into(),
+            starts_at: now + starts_in,
+            ends_at: now + starts_in + lasts,
+            repeat: Some(RecurrenceRule {
+                frequency: RepeatFrequency::Weekly,
+                until: None,
+                count,
+            }),
+        }
+    }
+
+    #[test]
+    fn recurring_series_opens_at_the_current_occurrence() {
+        let config = Config::default();
+        let now = OffsetDateTime::now_utc();
+        // Started a week and ten minutes ago: the second occurrence is
+        // happening now (it began ten minutes ago, so its window —
+        // opening five minutes early — is open).
+        let meeting = series(now - Duration::days(7) - Duration::minutes(10), None);
+        assert_eq!(
+            joinability_with(&meeting, &[], &config, now),
+            Joinability::Open
+        );
+    }
+
+    #[test]
+    fn recurring_series_waits_between_occurrences() {
+        let config = Config::default();
+        let now = OffsetDateTime::now_utc();
+        // Three days into a weekly series: the first occurrence is
+        // over, the next is four days out.
+        let meeting = series(now - Duration::days(3), None);
+        let next_start = now + Duration::days(4);
+        assert_eq!(
+            joinability_with(&meeting, &[], &config, now),
+            Joinability::NotYet {
+                opens_at: next_start - Duration::minutes(5),
+            }
+        );
+    }
+
+    #[test]
+    fn recurring_series_ends_after_the_last_occurrence() {
+        let config = Config::default();
+        let now = OffsetDateTime::now_utc();
+        // A single-occurrence series whose window closed long ago.
+        let meeting = series(now - Duration::days(7), Some(1));
+        assert_eq!(
+            joinability_with(&meeting, &[], &config, now),
+            Joinability::Ended
+        );
+    }
+
+    #[test]
+    fn cancelled_current_occurrence_without_a_future_one_is_cancelled() {
+        let config = Config::default();
+        let now = OffsetDateTime::now_utc();
+        // Happening now, and it is the only occurrence.
+        let start = now - Duration::minutes(10);
+        let meeting = series(start, Some(1));
+        assert_eq!(
+            joinability_with(&meeting, &[start], &config, now),
+            Joinability::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancelled_current_occurrence_with_a_future_one_waits() {
+        let config = Config::default();
+        let now = OffsetDateTime::now_utc();
+        // The occurrence happening now is cancelled, but the series
+        // continues: the next one is still in the future.
+        let start = now - Duration::minutes(10);
+        let meeting = series(start, None);
+        assert!(matches!(
+            joinability_with(&meeting, &[start], &config, now),
+            Joinability::NotYet { .. }
+        ));
+    }
+
+    #[test]
+    fn upcoming_occurrences_start_after_now_and_mark_cancellations() {
+        let now = OffsetDateTime::now_utc();
+        // Two days into a weekly series: the in-flight occurrence has
+        // already ended (start + 1h < now), so the first upcoming
+        // occurrence is in five days; the cap keeps it at five.
+        let start = now - Duration::days(2);
+        let meeting = series(start, None);
+        let cancelled = [start + Duration::days(7)];
+        let upcoming = upcoming_occurrences(&meeting, &cancelled, now, 5);
+        let expected: Vec<_> = (1..=5)
+            .map(|weeks| start + Duration::days(7 * weeks))
+            .collect();
+        assert_eq!(
+            upcoming.iter().map(|o| o.starts_at).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(upcoming[0].cancelled, "the cancelled one is marked");
+        assert!(upcoming[1..].iter().all(|o| !o.cancelled));
+        assert_eq!(
+            upcoming[0].ends_at,
+            start + Duration::days(7) + Duration::hours(1)
+        );
+
+        // One-off meetings have no upcoming occurrences.
+        let single = Meeting {
+            repeat: None,
+            ..series(start, None)
+        };
+        assert!(upcoming_occurrences(&single, &[], now, 5).is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeat_round_trips_through_storage() {
+        let pool = pool().await;
+        let req = weekly_req(Duration::hours(1), Duration::hours(1), Some(5));
+        let meeting = create(&pool, &req, None, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert_eq!(meeting.repeat, req.repeat);
+
+        let fetched = get_by_code(&pool, &meeting.code).await.unwrap().unwrap();
+        assert_eq!(fetched.repeat, req.repeat);
+    }
+
+    #[tokio::test]
+    async fn update_sets_clears_and_replaces_the_recurrence() {
+        let pool = pool().await;
+        let meeting = create(
+            &pool,
+            &req(Duration::hours(1), Duration::hours(1), "One-off"),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meeting.repeat, None);
+
+        // Absent: unchanged (the rule stays unset).
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                title: Some("Still one-off".into()),
+                ..UpdateMeetingRequest::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.repeat, None);
+
+        // Present: the series is set.
+        let rule = RecurrenceRule {
+            frequency: RepeatFrequency::Daily,
+            until: None,
+            count: Some(10),
+        };
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                repeat: Some(Some(rule.clone())),
+                ..UpdateMeetingRequest::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.repeat, Some(rule.clone()));
+
+        // `null`: cleared back to a one-off.
+        let updated = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                repeat: Some(None),
+                ..UpdateMeetingRequest::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.repeat, None);
+
+        // A rule that excludes the series start is refused.
+        let err = update_by_code(
+            &pool,
+            &meeting.code,
+            UpdateMeetingRequest {
+                repeat: Some(Some(RecurrenceRule {
+                    frequency: RepeatFrequency::Weekly,
+                    until: Some(updated.starts_at - Duration::hours(1)),
+                    count: None,
+                })),
+                ..UpdateMeetingRequest::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MeetingError::Invalid));
+    }
+
+    #[tokio::test]
+    async fn cancel_occurrence_marks_one_date_and_keeps_the_series() {
+        let pool = pool().await;
+        let meeting = create(
+            &pool,
+            &weekly_req(Duration::hours(1), Duration::hours(1), None),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(meeting.repeat.is_some());
+
+        let cancelled = cancel_occurrence(&pool, &meeting.code, meeting.starts_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec![meeting.starts_at]);
+
+        // Idempotent: the same date does not duplicate.
+        let cancelled = cancel_occurrence(&pool, &meeting.code, meeting.starts_at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled, vec![meeting.starts_at]);
+
+        // The series itself is untouched.
+        let fetched = get_by_code(&pool, &meeting.code).await.unwrap().unwrap();
+        assert!(!fetched.cancelled);
+        assert!(fetched.repeat.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancel_occurrence_rejects_non_recurring_and_bad_dates() {
+        let pool = pool().await;
+
+        // A one-off has no occurrences to cancel.
+        let single = create(
+            &pool,
+            &req(Duration::hours(1), Duration::hours(1), "One-off"),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let err = cancel_occurrence(&pool, &single.code, single.starts_at)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MeetingError::Invalid));
+
+        // A date the series never lands on (off by one day).
+        let recurring = create(
+            &pool,
+            &weekly_req(Duration::hours(1), Duration::hours(1), None),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        let err = cancel_occurrence(
+            &pool,
+            &recurring.code,
+            recurring.starts_at + Duration::days(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, MeetingError::Invalid));
+
+        // Unknown code: nothing to cancel, not an error.
+        assert!(
+            cancel_occurrence(&pool, "ZZZZ-ZZZZ-ZZZZ", OffsetDateTime::now_utc())
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 }

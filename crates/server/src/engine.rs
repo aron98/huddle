@@ -900,6 +900,7 @@ mod tests {
             starts_at: time::OffsetDateTime::now_utc(),
             ends_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
             cancelled: false,
+            repeat: None,
         }
     }
 

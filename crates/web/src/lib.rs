@@ -219,7 +219,9 @@ fn Login() -> impl IntoView {
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn Dashboard() -> impl IntoView {
-    use huddle_protocol::{CreateMeetingRequest, Joinability, MeetingResponse};
+    use huddle_protocol::{
+        CreateMeetingRequest, Joinability, MeetingResponse, RecurrenceRule, RepeatFrequency,
+    };
     use time::format_description::well_known::Rfc3339;
 
     let organizer_email = RwSignal::<Option<String>>::new(None);
@@ -229,6 +231,7 @@ fn Dashboard() -> impl IntoView {
     let title = RwSignal::new(String::new());
     let starts = RwSignal::new(String::new());
     let ends = RwSignal::new(String::new());
+    let repeat = RwSignal::new("never".to_owned());
 
     // Refresh the owned-meetings list in the background.
     fn refresh(meetings: RwSignal<Vec<MeetingResponse>>) {
@@ -278,10 +281,34 @@ fn Dashboard() -> impl IntoView {
                 return;
             }
         };
+        let repeat_rule = match repeat.get_untracked().as_str() {
+            "daily" => Some(RecurrenceRule {
+                frequency: RepeatFrequency::Daily,
+                until: None,
+                count: None,
+            }),
+            "weekly" => Some(RecurrenceRule {
+                frequency: RepeatFrequency::Weekly,
+                until: None,
+                count: None,
+            }),
+            "weekdays" => Some(RecurrenceRule {
+                frequency: RepeatFrequency::Weekdays,
+                until: None,
+                count: None,
+            }),
+            "monthly" => Some(RecurrenceRule {
+                frequency: RepeatFrequency::Monthly,
+                until: None,
+                count: None,
+            }),
+            _ => None,
+        };
         let request = CreateMeetingRequest {
             title: title.get_untracked().trim().to_owned(),
             starts_at,
             ends_at,
+            repeat: repeat_rule,
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));
@@ -299,6 +326,7 @@ fn Dashboard() -> impl IntoView {
                     title.set(String::new());
                     starts.set(String::new());
                     ends.set(String::new());
+                    repeat.set("never".to_owned());
                     refresh(meetings);
                 }
                 Ok((_, text)) => status.set(Some(format!("Could not create the meeting: {text}"))),
@@ -315,6 +343,17 @@ fn Dashboard() -> impl IntoView {
                 Ok((200, _)) => refresh(meetings),
                 Ok((_, text)) => status.set(Some(format!("Could not cancel: {text}"))),
                 Err(e) => status.set(Some(format!("Could not cancel: {e}"))),
+            }
+        });
+    };
+    // Cancel a single date of a recurring series; the series stays live.
+    let cancel_occurrence = move |code: String, starts_at: String| {
+        spawn_local(async move {
+            let path = format!("/api/meetings/{code}/occurrences/{starts_at}");
+            match api::fetch_text("DELETE", &path, None).await {
+                Ok((200, _)) => refresh(meetings),
+                Ok((_, text)) => status.set(Some(format!("Could not cancel the date: {text}"))),
+                Err(e) => status.set(Some(format!("Could not cancel the date: {e}"))),
             }
         });
     };
@@ -391,6 +430,20 @@ fn Dashboard() -> impl IntoView {
                                     on:input=move |ev| ends.set(event_target_value(&ev))
                                 />
                             </label>
+                            <label class="field">
+                                "Repeats"
+                                <select
+                                    data-testid="create-repeat"
+                                    prop:value=repeat
+                                    on:change=move |ev| repeat.set(event_target_value(&ev))
+                                >
+                                    <option value="never">"Never"</option>
+                                    <option value="daily">"Daily"</option>
+                                    <option value="weekly">"Weekly"</option>
+                                    <option value="weekdays">"Weekdays (Mon–Fri)"</option>
+                                    <option value="monthly">"Monthly"</option>
+                                </select>
+                            </label>
                             <button class="btn primary" type="submit" data-testid="create-btn">
                                 "Create meeting"
                             </button>
@@ -436,6 +489,76 @@ fn Dashboard() -> impl IntoView {
                                             ("cancelled", "chip chip-cancelled")
                                         }
                                     };
+                                    // Recurring rows: a repeat label, the next
+                                    // occurrence, and per-date cancel buttons.
+                                    let repeat_label = current.meeting.repeat.as_ref().map(
+                                        |rule| match rule.frequency {
+                                            RepeatFrequency::Daily => "repeats daily",
+                                            RepeatFrequency::Weekly => "repeats weekly",
+                                            RepeatFrequency::Weekdays => {
+                                                "repeats every weekday"
+                                            }
+                                            RepeatFrequency::Monthly => "repeats monthly",
+                                        },
+                                    );
+                                    let next_occurrence = current
+                                        .upcoming_occurrences
+                                        .iter()
+                                        .find(|o| !o.cancelled)
+                                        .map(|o| {
+                                            let raw = o
+                                                .starts_at
+                                                .format(&Rfc3339)
+                                                .unwrap_or_default();
+                                            api::rfc3339_to_local(&raw)
+                                        });
+                                    let occurrences_testid = format!("occurrences-{code}");
+                                    // Each handler owns its own clones: the row
+                                    // closure re-runs, so nothing may be captured
+                                    // by borrow.
+                                    let occurrence_items = current
+                                        .upcoming_occurrences
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(index, o)| {
+                                            let raw = o
+                                                .starts_at
+                                                .format(&Rfc3339)
+                                                .unwrap_or_default();
+                                            let local = api::rfc3339_to_local(&raw);
+                                            let testid =
+                                                format!("cancel-occurrence-{code}-{index}");
+                                            if o.cancelled {
+                                                view! {
+                                                    <li class="occurrence-item muted">
+                                                        {format!("{local} — cancelled")}
+                                                    </li>
+                                                }
+                                                    .into_any()
+                                            } else {
+                                                let click = {
+                                                    let code = code.clone();
+                                                    let raw = raw.clone();
+                                                    move |_| cancel_occurrence(code.clone(), raw.clone())
+                                                };
+                                                view! {
+                                                    <li class="occurrence-item">
+                                                        <span>{local}</span>
+                                                        <button
+                                                            class="btn danger small"
+                                                            data-testid=testid
+                                                            on:click=click
+                                                        >
+                                                            "Cancel this date"
+                                                        </button>
+                                                    </li>
+                                                }
+                                                    .into_any()
+                                            }
+                                        })
+                                        .collect::<Vec<_>>();
+                                    let show_occurrences = !current.meeting.cancelled
+                                        && current.meeting.repeat.is_some();
                                     // Each handler owns its own clone of the
                                     // code: the row closure can be re-run, so
                                     // nothing may be captured by borrow.
@@ -467,6 +590,33 @@ fn Dashboard() -> impl IntoView {
                                                     "Meeting code "
                                                     <code>{code}</code>
                                                 </p>
+                                                {repeat_label.map(|label| {
+                                                    view! {
+                                                        <p class="meeting-repeat muted">
+                                                            {label}
+                                                        </p>
+                                                    }
+                                                })}
+                                                {show_occurrences.then(move || {
+                                                    view! {
+                                                        <div class="occurrence-list">
+                                                            <p class="muted">
+                                                                {match next_occurrence {
+                                                                    Some(next) => {
+                                                                        format!("Next: {next}")
+                                                                    }
+                                                                    None => {
+                                                                        "No upcoming occurrences"
+                                                                            .to_owned()
+                                                                    }
+                                                                }}
+                                                            </p>
+                                                            <ul data-testid=occurrences_testid>
+                                                                {occurrence_items}
+                                                            </ul>
+                                                        </div>
+                                                    }
+                                                })}
                                             </div>
                                             <span class=state_class>{state}</span>
                                             <div class="meeting-row-actions">

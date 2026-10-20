@@ -3,13 +3,14 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rust_embed::RustEmbed;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use huddle_protocol::{
@@ -46,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/meetings/{code}/ics", get(meeting_ics))
         .route(
+            "/api/meetings/{code}/occurrences/{starts_at}",
+            delete(cancel_meeting_occurrence),
+        )
+        .route(
             "/api/meetings/{code}/recording",
             get(recording_status)
                 .post(start_recording)
@@ -66,6 +71,35 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
+/// How many upcoming occurrences a response carries for a series —
+/// enough to render the dashboard's next-occurrence headline and a
+/// per-occurrence cancel button row, without shipping a year of
+/// expansion.
+const UPCOMING_LIMIT: usize = 5;
+
+/// The full `MeetingResponse` shape: joinability computed with the
+/// series' per-occurrence cancellations, plus the concrete upcoming
+/// occurrences.
+async fn meeting_response(
+    state: &AppState,
+    meeting: crate::meetings::Meeting,
+    now: OffsetDateTime,
+) -> Result<MeetingResponse, ApiErr> {
+    let cancelled = meetings::cancelled_occurrences(state.pool(), meeting.id)
+        .await
+        .map_err(ApiErr::internal)?;
+    Ok(MeetingResponse {
+        joinability: meetings::joinability_with(&meeting, &cancelled, state.config(), now),
+        upcoming_occurrences: meetings::upcoming_occurrences(
+            &meeting,
+            &cancelled,
+            now,
+            UPCOMING_LIMIT,
+        ),
+        meeting: meeting.into(),
+    })
+}
+
 async fn create_meeting(
     state: State<AppState>,
     headers: HeaderMap,
@@ -82,13 +116,8 @@ async fn create_meeting(
     )
     .await
     .map_err(ApiErr::from_meeting_err)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(MeetingResponse {
-            joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
-            meeting: meeting.into(),
-        }),
-    ))
+    let response = meeting_response(&state, meeting, OffsetDateTime::now_utc()).await?;
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_meeting(
@@ -99,10 +128,9 @@ async fn get_meeting(
         .await
         .map_err(ApiErr::internal)?
         .ok_or(ApiErr::not_found())?;
-    Ok(Json(MeetingResponse {
-        joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
-        meeting: meeting.into(),
-    }))
+    Ok(Json(
+        meeting_response(&state, meeting, OffsetDateTime::now_utc()).await?,
+    ))
 }
 
 async fn update_meeting(
@@ -116,10 +144,9 @@ async fn update_meeting(
         .await
         .map_err(ApiErr::from_meeting_err)?
         .ok_or_else(ApiErr::not_found)?;
-    Ok(Json(MeetingResponse {
-        joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
-        meeting: meeting.into(),
-    }))
+    Ok(Json(
+        meeting_response(&state, meeting, OffsetDateTime::now_utc()).await?,
+    ))
 }
 
 async fn cancel_meeting(
@@ -132,10 +159,34 @@ async fn cancel_meeting(
         .await
         .map_err(ApiErr::internal)?
         .ok_or_else(ApiErr::not_found)?;
-    Ok(Json(MeetingResponse {
-        joinability: meetings::joinability(&meeting, state.config(), OffsetDateTime::now_utc()),
-        meeting: meeting.into(),
-    }))
+    Ok(Json(
+        meeting_response(&state, meeting, OffsetDateTime::now_utc()).await?,
+    ))
+}
+
+/// Cancel a single occurrence of a recurring series (owner only):
+/// the series stays intact, the date joins the cancelled set. The
+/// timestamp must be one the series actually lands on — clients send
+/// back the exact `starts_at` from `upcoming_occurrences`.
+async fn cancel_meeting_occurrence(
+    state: State<AppState>,
+    headers: HeaderMap,
+    Path((code, starts_at)): Path<(String, String)>,
+) -> Result<Json<MeetingResponse>, ApiErr> {
+    require_owner(&state, &headers, &code).await?;
+    let occurrence = OffsetDateTime::parse(&starts_at, &Rfc3339)
+        .map_err(|_| ApiErr::bad_request("invalid occurrence timestamp"))?;
+    meetings::cancel_occurrence(state.pool(), &code, occurrence)
+        .await
+        .map_err(ApiErr::from_meeting_err)?
+        .ok_or_else(ApiErr::not_found)?;
+    let meeting = meetings::get_by_code(state.pool(), &code)
+        .await
+        .map_err(ApiErr::internal)?
+        .ok_or_else(ApiErr::not_found)?;
+    Ok(Json(
+        meeting_response(&state, meeting, OffsetDateTime::now_utc()).await?,
+    ))
 }
 
 /// The organizer's dashboard: every meeting they created, soonest first.
@@ -150,13 +201,13 @@ async fn my_meetings(
         .await
         .map_err(ApiErr::internal)?;
     let now = OffsetDateTime::now_utc();
-    let responses = meetings
-        .into_iter()
-        .map(|meeting| MeetingResponse {
-            joinability: meetings::joinability(&meeting, state.config(), now),
-            meeting: meeting.into(),
-        })
-        .collect();
+    // One cancelled-occurrences query per meeting (N+1): dashboards
+    // are small and the alternative is a join nobody needs yet.
+    let mut responses = Vec::with_capacity(meetings.len());
+    for meeting in meetings {
+        let response = meeting_response(&state, meeting, now).await?;
+        responses.push(response);
+    }
     Ok(Json(responses))
 }
 
@@ -204,7 +255,10 @@ async fn meeting_ics(state: State<AppState>, Path(code): Path<String>) -> Result
         .await
         .map_err(ApiErr::internal)?
         .ok_or_else(ApiErr::not_found)?;
-    let body = ics::build_ics(&meeting, &state.config().base_url).map_err(|e| {
+    let cancelled = meetings::cancelled_occurrences(state.pool(), meeting.id)
+        .await
+        .map_err(ApiErr::internal)?;
+    let body = ics::build_ics(&meeting, &cancelled, &state.config().base_url).map_err(|e| {
         tracing::error!(error = %e, "ics generation failure");
         ApiErr(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -454,6 +508,16 @@ impl ApiErr {
             ApiError {
                 code: ErrorCode::Unauthorized,
                 message: "this meeting belongs to another organizer".into(),
+            },
+        )
+    }
+
+    fn bad_request(message: &str) -> Self {
+        Self(
+            StatusCode::BAD_REQUEST,
+            ApiError {
+                code: ErrorCode::InvalidMessage,
+                message: message.into(),
             },
         )
     }
@@ -1427,6 +1491,206 @@ mod tests {
             ics.contains(&format!("/m/{}", created.meeting.code)),
             "join link must be in the calendar: {ics}"
         );
+    }
+
+    // --- recurring meetings (issue 16) -------------------------------------
+
+    /// Create a weekly recurring meeting over the REST API and return
+    /// the created response.
+    async fn create_recurring_via(
+        app: &Router,
+        title: &str,
+        starts_in_min: i64,
+        lasts_min: i64,
+        count: u64,
+    ) -> MeetingResponse {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": title,
+            "starts_at": (now + time::Duration::minutes(starts_in_min)).format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(starts_in_min + lasts_min)).format(&Rfc3339).unwrap(),
+            "repeat": { "frequency": "weekly", "count": count },
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).expect("create returns a meeting")
+    }
+
+    #[tokio::test]
+    async fn recurring_create_reports_the_series_and_upcoming_occurrences() {
+        let state = test_state().await;
+        let app = router(state.clone());
+
+        let created = create_recurring_via(&app, "Weekly sync", 10, 60, 5).await;
+        assert_eq!(
+            created.meeting.repeat,
+            Some(huddle_protocol::RecurrenceRule {
+                frequency: huddle_protocol::RepeatFrequency::Weekly,
+                until: None,
+                count: Some(5),
+            })
+        );
+        // All five occurrences start in the future: all are upcoming.
+        assert_eq!(created.upcoming_occurrences.len(), 5);
+        assert!(!created.upcoming_occurrences.iter().any(|o| o.cancelled));
+        assert_eq!(
+            created.upcoming_occurrences[0].starts_at,
+            created.meeting.starts_at
+        );
+
+        // One-off meetings keep an empty occurrence list.
+        let (_, body) = create_meeting_via(router(state.clone()), "One-off").await;
+        let single: MeetingResponse = serde_json::from_str(&body).unwrap();
+        assert!(single.meeting.repeat.is_none());
+        assert!(single.upcoming_occurrences.is_empty());
+    }
+
+    #[tokio::test]
+    async fn occurrence_cancel_cancels_one_date_and_keeps_the_series() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let created = create_recurring_via(&app, "Weekly sync", 10, 60, 5).await;
+        let code = created.meeting.code.clone();
+        let starts_at = created.meeting.starts_at.format(&Rfc3339).unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/meetings/{code}/occurrences/{starts_at}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let cancelled: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+
+        // The occurrence is marked, the series is not.
+        assert!(!cancelled.meeting.cancelled);
+        assert_eq!(cancelled.upcoming_occurrences.len(), 5);
+        let first = &cancelled.upcoming_occurrences[0];
+        assert_eq!(first.starts_at, created.meeting.starts_at);
+        assert!(first.cancelled);
+        assert!(
+            !cancelled
+                .upcoming_occurrences
+                .iter()
+                .skip(1)
+                .any(|o| o.cancelled)
+        );
+
+        // A timestamp the series never lands on is a 400.
+        let bogus = (OffsetDateTime::now_utc() + time::Duration::days(3))
+            .format(&Rfc3339)
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::delete(format!("/api/meetings/{code}/occurrences/{bogus}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn occurrence_cancel_rejects_garbage_timestamps_and_unknown_codes() {
+        let app = router(test_state().await);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete("/api/meetings/ZZZZ-ZZZZ-ZZZZ/occurrences/not-a-timestamp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let response = app
+            .oneshot(
+                Request::delete(format!("/api/meetings/ZZZZ-ZZZZ-ZZZZ/occurrences/{now}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn occurrence_cancel_is_owner_gated() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let bob = session_cookie_for(&state, &app, "bob@example.com").await;
+
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Alice's series",
+            "starts_at": (now + time::Duration::minutes(10)).format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(70)).format(&Rfc3339).unwrap(),
+            "repeat": { "frequency": "weekly", "count": 3 },
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, &alice)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        let code = created.meeting.code;
+        let starts_at = created.meeting.starts_at.format(&Rfc3339).unwrap();
+
+        for (label, cookie) in [("anonymous", None), ("bob", Some(&bob))] {
+            let mut request =
+                Request::delete(format!("/api/meetings/{code}/occurrences/{starts_at}"))
+                    .body(Body::empty())
+                    .unwrap();
+            if let Some(cookie) = cookie {
+                request
+                    .headers_mut()
+                    .insert(header::COOKIE, cookie.parse().unwrap());
+            }
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{label} must not cancel alice's occurrence"
+            );
+        }
+
+        // Alice herself may.
+        let response = app
+            .oneshot(
+                Request::delete(format!("/api/meetings/{code}/occurrences/{starts_at}"))
+                    .header(header::COOKIE, &alice)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
