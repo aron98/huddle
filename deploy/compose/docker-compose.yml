@@ -1,0 +1,86 @@
+# Production Huddle stack: huddle (SFU + web + built-in TLS) + coturn.
+#
+# This is the secure-by-default example that goes with
+# docs/deploy/docker-compose.md. The compose file at the repo ROOT is the
+# development stack (trunk watch, hot reload) — do not use it in production.
+#
+# Copy .env.example to .env and fill in real values before `docker compose up`.
+# All commands are documented in docs/deploy/docker-compose.md.
+
+name: huddle
+
+services:
+  huddle:
+    # The repo Dockerfile builds the release image: web client built with
+    # trunk and baked into the binary via rust-embed, single static server
+    # binary on debian:bookworm-slim (+ ca-certificates only).
+    build:
+      context: ../..
+    image: huddle:local
+    restart: unless-stopped
+    # Host networking: the SFU advertises a directly-reachable UDP candidate.
+    # Docker bridge NAT makes WebRTC UDP flaky; built-in ACME also needs the
+    # real 443. With host networking the process binds ports directly and the
+    # host firewall (ufw/nftables) applies normally.
+    network_mode: host
+    # Container hardening: read-only root filesystem, no new privileges, and
+    # only the capability needed to bind :443 (CAP_NET_BIND_SERVICE). Media
+    # on 40000/udp and everything else use unprivileged ports.
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # Huddle reads all configuration from HUDDLE_* env vars
+      # (defaults <- huddle.toml <- env); see crates/server/src/config.rs.
+      HUDDLE_BIND: 0.0.0.0:443          # ACME TLS-ALPN-01 requires the serving port
+      HUDDLE_BASE_URL: https://${HUDDLE_DOMAIN:?set HUDDLE_DOMAIN in .env}
+      HUDDLE_PUBLIC_IP: ${HUDDLE_PUBLIC_IP:?set HUDDLE_PUBLIC_IP in .env}
+      HUDDLE_MEDIA_PORT: "40000"       # SFU UDP media port
+      HUDDLE_DATA_DIR: /data           # SQLite + ACME cache + recordings (volume below)
+      HUDDLE_SESSION_SECRET: ${HUDDLE_SESSION_SECRET:?set HUDDLE_SESSION_SECRET in .env}
+      HUDDLE_STATS_TOKEN: ${HUDDLE_STATS_TOKEN:?set HUDDLE_STATS_TOKEN in .env}
+      HUDDLE_RATE_LIMIT_PER_MIN: "30"  # per-IP sliding window; 0 disables
+      # Built-in TLS (ADR 008): in-process ACME against Let's Encrypt,
+      # cert/account cache persisted in <data_dir>/acme-cache.
+      HUDDLE_TLS_MODE: acme
+      HUDDLE_TLS_DOMAINS: ${HUDDLE_DOMAIN:?set HUDDLE_DOMAIN in .env}
+      # TURN servers advertised to clients. Static username/credential pairs
+      # only (config.rs IceServerConfig) — they must match coturn's lt-cred-mech
+      # user below. Figment array-of-structs value syntax (TOML-ish, not JSON).
+      # Drop the turns: URL if you did not configure coturn TLS.
+      HUDDLE_ICE_SERVERS: '[{urls=["turn:${TURN_DOMAIN:?set TURN_DOMAIN in .env}:3478?transport=udp","turn:${TURN_DOMAIN}:3478?transport=tcp","turns:${TURN_DOMAIN}:5349?transport=tcp"],username="huddle",credential="${TURN_PASSWORD:?set TURN_PASSWORD in .env}"}]'
+    volumes:
+      - huddle-data:/data
+    # NOTE: no healthcheck — the runtime image ships without curl/wget by
+    # design (debian:bookworm-slim + ca-certificates only). Monitor /api/health
+    # from outside the container; see docs/deploy/docker-compose.md.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      # Uncomment for TURN over TLS (5349/tcp); provision certs on the host,
+      # see docs/deploy/ubuntu-vps.md section "coturn".
+      # - ./certs:/etc/coturn/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  huddle-data:

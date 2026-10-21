@@ -1,0 +1,3 @@
+# Secrets and TLS material — never commit.
+.env
+certs/
