@@ -20,6 +20,8 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
+use crate::turn::{TurnRestAuth, is_turn_url};
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -89,6 +91,13 @@ pub struct Config {
     /// humans and throttles credential-stuffing and connection floods;
     /// `0` disables the limiter entirely.
     pub rate_limit_per_min: usize,
+    /// TURN REST API auth (issue #59): when `[turn].shared_secret` is
+    /// set, the server mints time-limited coturn credentials at join
+    /// time and advertises them on every `turn:`/`turns:` ICE server,
+    /// overriding the static `[[ice_servers]]` pairs. `None` (the
+    /// default) keeps static pairs exactly as before. See
+    /// [`TurnConfig`].
+    pub turn: Option<TurnConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,6 +107,47 @@ pub struct IceServerConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub credential: Option<String>,
+}
+
+/// TURN REST API settings, as configured in `huddle.toml` (issue #59):
+///
+/// ```toml
+/// [turn]
+/// shared_secret = "…" # the same value as coturn's static-auth-secret
+/// credential_ttl_min = 1440
+/// ```
+///
+/// The section is optional: without it (and without
+/// `HUDDLE_TURN_SHARED_SECRET`) huddle advertises the static
+/// `[[ice_servers]]` username/credential pairs exactly as before. With
+/// a secret, coturn should run with `use-auth-secret` and
+/// `static-auth-secret` set to the same value; huddle then replaces
+/// the static pairs on `turn:`/`turns:` servers with credentials that
+/// expire `credential_ttl_min` after each join. See
+/// [`Config::turn_selection`] for the validation rules.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TurnConfig {
+    /// Shared secret mirrored from coturn's `static-auth-secret`. Once
+    /// set it wins over any static ICE credential.
+    pub shared_secret: Option<String>,
+    /// Minutes after minting that a credential stays usable for new
+    /// TURN allocations. coturn honors the timestamp only when a
+    /// client requests a new allocation, so an in-flight relay session
+    /// outlives it; reconnects after the TTL simply re-join and get a
+    /// fresh pair.
+    pub credential_ttl_min: u32,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            shared_secret: None,
+            // 24 hours: generous for a credential minted per join,
+            // since expiry only gates new allocations.
+            credential_ttl_min: 1440,
+        }
+    }
 }
 
 /// One SMTP relay, as configured in `huddle.toml`:
@@ -382,6 +432,7 @@ impl Default for Config {
             tls: None,
             stats_token: None,
             rate_limit_per_min: 30,
+            turn: None,
         }
     }
 }
@@ -431,6 +482,7 @@ impl Config {
         Self::apply_oidc_env_with(&mut config, issuer, client_id, secret)?;
         Self::apply_mail_env_with(&mut config, MailEnv::from_env())?;
         Self::apply_tls_env_with(&mut config, TlsEnv::from_env())?;
+        Self::apply_turn_env_with(&mut config, TurnEnv::from_env())?;
         Ok(config)
     }
 
@@ -608,6 +660,49 @@ impl Config {
         })
     }
 
+    /// Resolve and validate the TURN REST API setup (issue #59),
+    /// mirroring [`Config::tls_selection`].
+    ///
+    /// `None` (no `[turn]` section) keeps the static `[[ice_servers]]`
+    /// username/credential pairs exactly as before. A `shared_secret`
+    /// wins over any static pair: every advertised `turn:`/`turns:`
+    /// ICE server gets time-limited credentials minted at join time,
+    /// so coturn can run with `use-auth-secret` and the same
+    /// `static-auth-secret`. An empty section, a zero TTL, or a secret
+    /// with no TURN ICE server to hang it on is a deployment mistake
+    /// worth failing fast on.
+    pub fn turn_selection(&self) -> anyhow::Result<Option<TurnRestAuth>> {
+        let Some(turn) = &self.turn else {
+            return Ok(None);
+        };
+        let Some(shared_secret) = turn.shared_secret.as_ref().filter(|s| !s.trim().is_empty())
+        else {
+            anyhow::bail!(
+                "[turn] is configured but has no shared_secret; set \
+                 turn.shared_secret (or HUDDLE_TURN_SHARED_SECRET) or \
+                 remove the [turn] section"
+            );
+        };
+        if turn.credential_ttl_min == 0 {
+            anyhow::bail!("[turn] credential_ttl_min must be greater than zero");
+        }
+        if !self
+            .ice_servers
+            .iter()
+            .any(|s| s.urls.iter().any(|url| is_turn_url(url)))
+        {
+            anyhow::bail!(
+                "turn.shared_secret is set but no [[ice_servers]] entry \
+                 has a turn:/turns: URL; add the coturn server to \
+                 [[ice_servers]] first"
+            );
+        }
+        Ok(Some(TurnRestAuth {
+            shared_secret: shared_secret.clone(),
+            credential_ttl_min: turn.credential_ttl_min,
+        }))
+    }
+
     /// Whether session cookies should carry the `Secure` attribute.
     ///
     /// Any TLS termination in play — built-in (`[tls]`) or a proxy in
@@ -767,6 +862,33 @@ impl Config {
         Ok(())
     }
 
+    /// Testable core of the `HUDDLE_TURN_*` env handling, mirroring
+    /// [`Config::apply_tls_env_with`]: each set, non-empty value
+    /// overrides the matching `[turn]` TOML field, merging into an
+    /// existing section (or creating one) as needed. Completeness
+    /// checks (a section without a secret, a secret without a TURN
+    /// ICE server) live in [`Config::turn_selection`], which runs on
+    /// every startup anyway.
+    fn apply_turn_env_with(&mut self, env: TurnEnv) -> anyhow::Result<()> {
+        if env.shared_secret.is_none() && env.credential_ttl_min.is_none() {
+            return Ok(());
+        }
+        let mut turn = self.turn.clone().unwrap_or_default();
+        if let Some(v) = env.shared_secret.filter(|v| !v.trim().is_empty()) {
+            turn.shared_secret = Some(v);
+        }
+        if let Some(v) = env.credential_ttl_min {
+            turn.credential_ttl_min = v.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "HUDDLE_TURN_CREDENTIAL_TTL_MIN must be a number of \
+                     minutes, got {v:?}"
+                )
+            })?;
+        }
+        self.turn = Some(turn);
+        Ok(())
+    }
+
     /// The IP browsers should be told to send media to.
     ///
     /// An explicitly configured `public_ip` wins; otherwise the machine's
@@ -868,6 +990,28 @@ impl TlsEnv {
     }
 }
 
+/// The `HUDDLE_TURN_*` variables, collected for
+/// [`Config::apply_turn_env_with`]. Figment's flat env keys cannot
+/// reach nested sections (see the OIDC note on `Config::load`), so —
+/// mirroring `HUDDLE_OIDC_*` and `HUDDLE_TLS_*` — they are applied
+/// explicitly after extraction.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TurnEnv {
+    shared_secret: Option<String>,
+    credential_ttl_min: Option<String>,
+}
+
+impl TurnEnv {
+    /// Collect the variables from the process environment.
+    fn from_env() -> Self {
+        let var = |key: &str| std::env::var_os(key).map(|v| v.to_string_lossy().into_owned());
+        Self {
+            shared_secret: var("HUDDLE_TURN_SHARED_SECRET"),
+            credential_ttl_min: var("HUDDLE_TURN_CREDENTIAL_TTL_MIN"),
+        }
+    }
+}
+
 /// Parse `HUDDLE_TLS_DOMAINS`: a JSON-style array — the same value
 /// syntax figment itself uses for `HUDDLE_ICE_SERVERS` — or a bare
 /// single domain as a convenience.
@@ -935,6 +1079,7 @@ mod tests {
         assert_eq!(config.tls, None);
         assert_eq!(config.stats_token, None);
         assert_eq!(config.rate_limit_per_min, 30);
+        assert_eq!(config.turn, None);
     }
 
     #[test]
@@ -945,6 +1090,154 @@ mod tests {
             .unwrap();
         assert_eq!(config.bind.port(), 9999);
         assert_eq!(config.join_window_grace_min, 15); // untouched default
+    }
+
+    #[test]
+    fn turn_section_selects_rest_auth_over_static_pairs() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [[ice_servers]]
+                urls = ["turn:turn.example.com:3478"]
+                username = "huddle"
+                credential = "static-password"
+
+                [turn]
+                shared_secret = "coturn-secret"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        // The static pair stays configured (it is simply overridden
+        // at join time); the selection carries the secret.
+        assert_eq!(
+            config.ice_servers[0].credential.as_deref(),
+            Some("static-password")
+        );
+        let turn = config.turn_selection().unwrap().unwrap();
+        assert_eq!(turn.shared_secret, "coturn-secret");
+        assert_eq!(turn.credential_ttl_min, 1440, "default TTL is 24 hours");
+    }
+
+    #[test]
+    fn turn_ttl_is_configurable() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [[ice_servers]]
+                urls = ["turn:turn.example.com:3478"]
+
+                [turn]
+                shared_secret = "s"
+                credential_ttl_min = 60
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            config.turn_selection().unwrap().unwrap().credential_ttl_min,
+            60
+        );
+    }
+
+    #[test]
+    fn empty_turn_section_fails() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string("[turn]\n"))
+            .extract()
+            .unwrap();
+        let err = config.turn_selection().unwrap_err().to_string();
+        assert!(err.contains("no shared_secret"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_secret_without_turn_ice_server_fails() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [[ice_servers]]
+                urls = ["stun:stun.example.com:3478"]
+
+                [turn]
+                shared_secret = "s"
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        let err = config.turn_selection().unwrap_err().to_string();
+        assert!(err.contains("no [[ice_servers]] entry"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_zero_ttl_fails() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                r#"
+                [[ice_servers]]
+                urls = ["turn:turn.example.com:3478"]
+
+                [turn]
+                shared_secret = "s"
+                credential_ttl_min = 0
+                "#,
+            ))
+            .extract()
+            .unwrap();
+        let err = config.turn_selection().unwrap_err().to_string();
+        assert!(err.contains("credential_ttl_min"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_env_overrides_and_merges_into_section() {
+        let mut config = Config {
+            turn: Some(TurnConfig {
+                shared_secret: Some("toml-secret".into()),
+                credential_ttl_min: 1440,
+            }),
+            ..Config::default()
+        };
+        config
+            .apply_turn_env_with(TurnEnv {
+                shared_secret: Some("env-secret".into()),
+                credential_ttl_min: Some("60".into()),
+            })
+            .unwrap();
+        let turn = config.turn.unwrap();
+        assert_eq!(turn.shared_secret.as_deref(), Some("env-secret"));
+        assert_eq!(turn.credential_ttl_min, 60);
+    }
+
+    #[test]
+    fn turn_env_rejects_non_numeric_ttl() {
+        let mut config = Config::default();
+        let err = config
+            .apply_turn_env_with(TurnEnv {
+                shared_secret: Some("s".into()),
+                credential_ttl_min: Some("soon".into()),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HUDDLE_TURN_CREDENTIAL_TTL_MIN"), "got: {err}");
+    }
+
+    #[test]
+    fn turn_env_ttl_without_secret_fails_selection() {
+        // A half-configured section must fail loudly rather than
+        // silently disable REST auth.
+        let mut config = Config::default();
+        config
+            .apply_turn_env_with(TurnEnv {
+                shared_secret: None,
+                credential_ttl_min: Some("90".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            config.turn.as_ref().unwrap().credential_ttl_min,
+            90,
+            "ttl alone still creates the section"
+        );
+        let err = config.turn_selection().unwrap_err().to_string();
+        assert!(err.contains("no shared_secret"), "got: {err}");
     }
 
     #[test]

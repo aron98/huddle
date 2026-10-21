@@ -32,6 +32,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::meetings::normalize_code;
+use crate::turn::{TurnRestAuth, is_turn_url};
 
 /// Worst-case poll cadence when no peer asked to be woken earlier.
 const MAX_SLEEP: Duration = Duration::from_millis(50);
@@ -343,6 +344,10 @@ struct Engine {
     media_addr: SocketAddr,
     meetings: HashMap<String, MeetingInstance>,
     ice_servers: Vec<IceServer>,
+    /// TURN REST API auth (issue #59): when set, replaces the static
+    /// credentials on `turn:`/`turns:` ICE servers with a pair minted
+    /// at join time.
+    turn: Option<TurnRestAuth>,
     max_participants: usize,
 }
 
@@ -403,6 +408,9 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
             credential: s.credential.clone(),
         })
         .collect();
+    // Validated here rather than in main so every caller (tests
+    // included) gets the same fail-fast on a broken [turn] section.
+    let turn = config.turn_selection()?;
 
     let engine = Engine {
         rx,
@@ -410,6 +418,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
         media_addr,
         meetings: HashMap::new(),
         ice_servers,
+        turn,
         max_participants: config.max_participants,
     };
     thread::Builder::new()
@@ -671,12 +680,34 @@ impl Engine {
         inst.outs.insert(id, out.clone());
 
         let roster: Vec<Participant> = inst.participants.values().cloned().collect();
+        // TURN REST auth (issue #59): with a shared secret configured,
+        // mint one fresh time-limited pair for this join and apply it
+        // to every turn:/turns: server, overriding any static
+        // username/credential. coturn only checks the timestamp on new
+        // allocations, so sessions in flight outlive the expiry.
+        let ice_servers = match &self.turn {
+            Some(auth) => {
+                let (username, credential) = auth.mint();
+                self.ice_servers
+                    .iter()
+                    .map(|server| {
+                        let mut server = server.clone();
+                        if server.urls.iter().any(|url| is_turn_url(url)) {
+                            server.username = Some(username.clone());
+                            server.credential = Some(credential.clone());
+                        }
+                        server
+                    })
+                    .collect()
+            }
+            None => self.ice_servers.clone(),
+        };
         let _ = out.send(ServerMessage::Welcome {
             protocol_version: PROTOCOL_VERSION,
             you: participant.clone(),
             meeting,
             roster,
-            ice_servers: self.ice_servers.clone(),
+            ice_servers,
             recording: inst.recording(),
             e2ee_enabled,
             e2ee_epoch,
@@ -1105,6 +1136,89 @@ mod tests {
             panic!("expected ParticipantJoined, got {joined:?}");
         };
         assert_eq!(participant.name, "bob");
+    }
+
+    #[tokio::test]
+    async fn join_mints_turn_rest_credentials() {
+        let config = Config {
+            media_port: 0,
+            public_ip: Some(IpAddr::from([127, 0, 0, 1])),
+            ice_servers: vec![
+                crate::config::IceServerConfig {
+                    urls: vec!["turn:turn.example.com:3478".into()],
+                    username: Some("huddle".into()),
+                    credential: Some("static-password".into()),
+                },
+                crate::config::IceServerConfig {
+                    urls: vec!["stun:stun.example.com:3478".into()],
+                    username: None,
+                    credential: None,
+                },
+            ],
+            turn: Some(crate::config::TurnConfig {
+                shared_secret: Some("coturn-secret".into()),
+                credential_ttl_min: 30,
+            }),
+            ..Config::default()
+        };
+        let (engine, _media_addr) = spawn(&config).unwrap();
+        let _keep = Arc::new(());
+
+        let before = time::OffsetDateTime::now_utc();
+        let (_alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let welcome = next(&mut alice_rx).await;
+        let ServerMessage::Welcome { ice_servers, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+
+        assert_eq!(ice_servers.len(), 2);
+        let turn_server = ice_servers
+            .iter()
+            .find(|s| s.urls.iter().any(|url| url.starts_with("turn:")))
+            .unwrap();
+        let stun_server = ice_servers
+            .iter()
+            .find(|s| s.urls.iter().any(|url| url.starts_with("stun:")))
+            .unwrap();
+        // STUN needs no credentials and is left untouched.
+        assert_eq!(stun_server.username, None);
+        assert_eq!(stun_server.credential, None);
+
+        // The TURN pair is replaced: not the static credentials…
+        assert_ne!(turn_server.username.as_deref(), Some("huddle"));
+        assert_ne!(turn_server.credential.as_deref(), Some("static-password"));
+        // …but a timestamp username inside the TTL window…
+        let username = turn_server.username.as_deref().unwrap();
+        let expiry: i64 = username.parse().unwrap();
+        assert!(expiry > before.unix_timestamp(), "already expired");
+        assert!(
+            expiry <= before.unix_timestamp() + 30 * 60 + 5,
+            "past the TTL"
+        );
+        // …whose credential is exactly the documented HMAC-SHA1.
+        let expected = crate::turn::generate(
+            "coturn-secret",
+            time::OffsetDateTime::from_unix_timestamp(expiry).unwrap(),
+        );
+        assert_eq!(turn_server.credential.as_deref(), Some(expected.1.as_str()));
+
+        // The second joiner gets its own freshly minted, valid pair.
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        let welcome = next(&mut bob_rx).await;
+        let ServerMessage::Welcome { ice_servers, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        let turn_server = ice_servers
+            .iter()
+            .find(|s| s.urls.iter().any(|url| url.starts_with("turn:")))
+            .unwrap();
+        let bob_expiry: i64 = turn_server.username.as_deref().unwrap().parse().unwrap();
+        assert!(bob_expiry > before.unix_timestamp());
+        let expected = crate::turn::generate(
+            "coturn-secret",
+            time::OffsetDateTime::from_unix_timestamp(bob_expiry).unwrap(),
+        );
+        assert_eq!(turn_server.credential.as_deref(), Some(expected.1.as_str()));
     }
 
     #[tokio::test]
