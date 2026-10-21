@@ -2,8 +2,16 @@
 # .Chart.AppVersion, but app releases only publish container images on v*
 # tags (release-image.yml, tag minus the leading v). This workflow keeps the
 # two glued together: on every pushed v* tag it sets the chart's appVersion
-# to the new version, minor-bumps the chart version, lints, and pushes a
-# bot commit to main.
+# to the new version, minor-bumps the chart version, lints, and opens a
+# pull request a maintainer merges.
+#
+# Why a PR and not a bot commit to main: the "Protect main" ruleset rejects
+# direct pushes that are not ruleset bypassers (the first v1.1.0 run failed
+# with GH013). The ruleset also requires status checks, but pushes made
+# with GITHUB_TOKEN never trigger workflow runs, so this PR intentionally
+# carries no check runs — a maintainer with the ruleset bypass merges it.
+# The bump itself is helm-linted in this run, and the diff is Chart.yaml
+# only.
 #
 # Why the commit lands after the tag: the chart is consumed from main, never
 # from the tag, so the sync makes main's chart reference the just-published
@@ -22,6 +30,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: chart-sync
@@ -73,7 +82,9 @@ jobs:
       - name: helm lint
         run: helm lint deploy/helm/huddle
 
-      - name: commit and push
+      - name: open sync pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version="${GITHUB_REF_NAME#v}"
           if git diff --quiet; then
@@ -84,4 +95,17 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add deploy/helm/huddle/Chart.yaml
           git commit -m "chore(helm): sync chart appVersion to ${version}"
-          git push origin HEAD:main
+          # One standing branch head per tag: consecutive tags walk the same
+          # branch, so the PR (if still open) updates instead of multiplying.
+          git push --force origin HEAD:refs/heads/charts/sync-appversion
+          title="chore(helm): sync chart appVersion to ${version}"
+          body="Auto-sync from the ${GITHUB_REF_NAME} tag: chart appVersion → ${version} (image published by release-image.yml), chart version minor-bumped. helm lint passed in the tagging run.
+
+          This PR carries no CI check runs — pushes made with GITHUB_TOKEN do not trigger workflows (the same reason the bot commit never re-runs ci.yml). A maintainer merges it (ruleset bypass)."
+          if ! gh pr view charts/sync-appversion --json number >/dev/null 2>&1; then
+            gh pr create --base main --head charts/sync-appversion --title "$title" --body "$body"
+            echo "opened sync PR for ${version}"
+          else
+            gh pr edit charts/sync-appversion --title "$title" --body "$body"
+            echo "updated existing sync PR for ${version}"
+          fi
