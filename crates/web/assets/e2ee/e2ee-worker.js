@@ -103,6 +103,12 @@ self.onmessage = async (event) => {
     if (msg.send) {
       send = [msg.send.kid, { key: await importKey(msg.send.key), salt: new Uint8Array(msg.send.salt) }];
     }
+    // The importKey awaits above interleave with later onmessage calls;
+    // re-check before committing so a slow, older completion cannot
+    // overwrite a newer table.
+    if (msg.version <= keysVersion) {
+      return;
+    }
     const next = new Map(entries);
     if (send) next.set(send[0], send[1]);
     keyTable.clear();

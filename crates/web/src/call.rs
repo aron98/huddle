@@ -342,9 +342,6 @@ async fn run_session(
             });
         });
     }
-    if let Some(outgoing) = &outgoing {
-        peer.attach_stream(outgoing).await;
-    }
 
     let mut client = RtcClient::new(signaling, peer);
     if let Err(e) = client.join(&code, &name, passcode).await {
@@ -366,11 +363,11 @@ async fn run_session(
     }
 
     // E2EE (issues #27/#28, ADRs 010/011): set up the keying session and
-    // the media transform worker BEFORE the first publish, so no frame
-    // is ever encoded without a sender transform attached. The camera
-    // and mic senders already exist (`attach_stream` above); the worker
-    // drops their frames until the first sender key arrives, so
-    // publishing before the exchange completes is still safe.
+    // the media transform worker BEFORE the local media is attached, so
+    // every sender gets its transform in the same task that creates it
+    // (Chrome 155 wires sender-side transforms same-task only — ADR 011,
+    // D1). The worker drops frames until the first sender key arrives,
+    // so publishing before the exchange completes is still safe.
     let mut e2ee: Option<E2eeSession> = None;
     let mut transform: Option<TransformWorker> = None;
     if client.e2ee_enabled() {
@@ -456,6 +453,12 @@ async fn run_session(
                 .set(Some(format!("E2EE tag transform unavailable ({e})"))),
         }
     }
+    // Now the senders can be created — each creation path attaches its
+    // transform in the same task (Chrome 155, ADR 011 D1).
+    if let Some(outgoing) = &outgoing {
+        client.peer_mut().attach_stream(outgoing).await;
+    }
+
     // Seed the worker with the current key set (the announce above may
     // already have produced our own sender key); the session loop
     // re-syncs whenever keying changes.

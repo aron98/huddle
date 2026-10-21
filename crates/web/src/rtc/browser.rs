@@ -418,13 +418,21 @@ impl BrowserPeerConnection {
     }
 
     /// Enable E2EE media transforms for the rest of this call (issue #28,
-    /// ADR 011): attach a sender transform to every sender that already
-    /// carries a track, remember the worker so senders created later
-    /// (screen shares) and receivers (the `ontrack` closure) attach too.
-    /// Must run before the initial `publish()` so no plaintext frame ever
-    /// leaves in an E2EE meeting; the worker itself drops frames until
-    /// the keying layer delivers a sender key, so the race is safe even
-    /// if a sender sneaks in before this runs.
+    /// ADR 011): remember the worker so senders created later attach their
+    /// transforms at creation time, and receivers (the `ontrack` closure)
+    /// attach when their tracks arrive.
+    ///
+    /// Must run BEFORE the local media is attached
+    /// ([`BrowserPeerConnection::attach_stream`]): Chrome (verified on
+    /// 155) wires a sender-side `RTCRtpScriptTransform` into the media
+    /// pipeline only when the transform is assigned in the SAME task that
+    /// created the sender — `addTrack`/`addTransceiver` and the assignment
+    /// cannot stride across an `await`. Any sender that already carries a
+    /// track when this runs is transformed here as a fallback, but the
+    /// session flow stages the worker first, so the walk normally finds
+    /// nothing. The worker itself drops frames until the keying layer
+    /// delivers a sender key, so a sender created before the first key
+    /// arrives never leaks plaintext.
     pub fn enable_e2ee(&self, worker: TransformWorker) {
         let senders = self.pc.get_senders();
         for i in 0..senders.length() {
@@ -453,7 +461,13 @@ impl BrowserPeerConnection {
                 if track.kind() == "video" {
                     self.publish_camera(&track, stream).await;
                 } else {
-                    self.pc.add_track_0(&track, stream);
+                    let sender = self.pc.add_track_0(&track, stream);
+                    // Same-task transform attach (see `enable_e2ee`): the
+                    // sender was created on the line above and the
+                    // assignment cannot be deferred to a later task.
+                    if let Some(worker) = self.e2ee.borrow().as_ref() {
+                        let _ = worker.attach_to_sender(&sender, "audio");
+                    }
                 }
             }
         }
@@ -499,10 +513,14 @@ impl BrowserPeerConnection {
     /// Rids are fixed at transceiver creation: `setParameters` treats
     /// `rid` as read-only (Chrome rejects any attempt with
     /// `InvalidModificationError`), so `addTransceiver` with
-    /// `sendEncodings` is the only way to arm them. The per-layer bitrate
-    /// budgets then go through `RtpSender::setParameters`, which is the
-    /// mutable knob. Screen shares never go through here — they stay
-    /// single-layer.
+    /// `sendEncodings` is the only way to arm them. The per-layer
+    /// bitrate budgets ride the same creation-time encodings:
+    /// `setParameters` must NEVER be called on a peer connection that
+    /// carries E2EE media transforms — in Chrome (verified on 155) any
+    /// `setParameters` call permanently disables every sender-side
+    /// `RTCRtpScriptTransform` pipeline on the connection, including
+    /// transforms attached afterwards (ADR 011, D1). Screen shares
+    /// never go through here — they stay single-layer.
     ///
     /// Two layers, tightly budgeted: Chrome allocates simulcast
     /// bandwidth top-down and reliably activates only the first two
@@ -518,11 +536,16 @@ impl BrowserPeerConnection {
     /// arrives.
     async fn publish_camera(&self, track: &MediaStreamTrack, stream: &MediaStream) {
         let encodings = js_sys::Array::new();
-        for (rid, scale) in [("high", 1.0_f32), ("low", 4.0)] {
+        // Budgets are part of the creation-time encodings (see the doc
+        // comment above): 500 kbps for the full layer, 100 for the
+        // quarter-scale thumbnail. The tight high-layer cap leaves room
+        // for the low layer inside Chrome's top-down allocation.
+        for (rid, scale, max_bitrate) in [("high", 1.0_f32, 500_000_u32), ("low", 4.0, 100_000)] {
             let encoding = RtcRtpEncodingParameters::new();
             encoding.set_rid(rid);
             encoding.set_active(true);
             encoding.set_scale_resolution_down_by(scale);
+            encoding.set_max_bitrate(max_bitrate);
             encodings.push(&encoding);
         }
         let init = RtcRtpTransceiverInit::new();
@@ -536,29 +559,11 @@ impl BrowserPeerConnection {
             .add_transceiver_with_media_stream_track_and_init(track, &init);
         let sender = transceiver.sender();
         *self.camera_sender.borrow_mut() = Some(sender.clone());
-
-        // Tune the layer budgets via setParameters: 500 kbps for the full
-        // layer, 100 for the quarter-scale thumbnail. The tight high-layer
-        // cap leaves room for the low layer inside Chrome's top-down
-        // allocation (see the doc comment above).
-        //
-        // The encodings come back from `getParameters()` as plain JS
-        // dictionaries, not `RTCRtpEncodingParameters` interface
-        // instances, so `dyn_into` cannot cast them — the bitrates are
-        // set with `Reflect::set` on the raw values instead.
-        let params = sender.get_parameters();
-        if let Some(existing) = params.get_encodings() {
-            for (i, max_bitrate) in [500_000_u32, 100_000].into_iter().enumerate() {
-                let encoding = existing.get(i as u32);
-                let name = JsValue::from("maxBitrate");
-                if js_sys::Reflect::set(&encoding, &name, &JsValue::from(max_bitrate)).is_err() {
-                    leptos::logging::warn!("simulcast encoding {i} has no maxBitrate field");
-                }
-            }
-            let promise = sender.set_parameters_with_parameters(&params);
-            if let Err(e) = JsFuture::from(promise).await {
-                leptos::logging::warn!("simulcast setParameters rejected: {e:?}");
-            }
+        // Same-task transform attach (see `enable_e2ee`): the sender was
+        // created above; deferring the assignment to any later task would
+        // leave the pipeline inert (Chrome 155, ADR 011 D1).
+        if let Some(worker) = self.e2ee.borrow().as_ref() {
+            let _ = worker.attach_to_sender(&sender, "video");
         }
     }
 

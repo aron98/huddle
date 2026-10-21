@@ -38,10 +38,39 @@ the spec mandates main-thread construction of the `RTCRtpScriptTransform`
 handle itself.
 
 Each sender and receiver gets one `RTCRtpScriptTransform` bound to the shared
-worker (instances are not reusable). Sender transforms attach at join, before
-`publish()`; receiver transforms attach in the `ontrack` handler (screen-share
-senders attach when created; `replaceTrack` keeps senders, so transforms
-survive track swaps).
+worker (instances are not reusable). Sender transforms attach **in the same
+JavaScript task that creates the sender**, not afterwards: Chrome (verified on
+155, `chrome-headless-shell`) wires a sender-side transform into the media
+pipeline only for same-task assignments — attaching in any later task (even
+just a `join()` round-trip after `addTrack`, still before any negotiation)
+leaves the pipeline permanently inert: `rtctransform` fires, the worker sees
+the transformer, but no frame is ever enqueued, and media keeps flowing in the
+clear. This was pinned by bisecting vanilla `RTCPeerConnection`s: every
+same-tick attach works, every later-task attach (pre- or post-negotiation,
+against a browser peer or the SFU) is dead. The session flow therefore stages
+the worker (`enable_e2ee`) *before* the mic/camera senders exist, and the
+creation paths (`attach_stream`'s `addTrack`, `publish_camera`'s
+`addTransceiver`, `add_screen_track`) attach their transforms synchronously
+right after creating each sender. Receiver transforms attach in the
+`ontrack` handler as before — receivers are not subject to the same-task
+rule (the receiver pipelines demonstrably process frames in the very setup
+where sender pipelines stayed dead). `replaceTrack` keeps senders, so track
+swaps keep their transforms.
+
+Two further Chrome 155 findings shaped the implementation:
+
+- **`setParameters` permanently disables every sender-side transform on the
+  connection** — pc-wide, even for transforms attached afterwards, and even
+  for an unmodified `getParameters()` → `setParameters()` round trip (only a
+  call made *while frames are already flowing* is harmless). The simulcast
+  layer budgets (500 kbps high / 100 kbps low) therefore ride the
+  *creation-time* `sendEncodings` of `addTransceiver`
+  (`RTCRtpEncodingParameters.maxBitrate`), and `setParameters` is never
+  called on a connection that carries E2EE transforms. Plaintext meetings
+  keep the same budgets; only the mechanism moved.
+- The `sender.transform` assignment *replacing* an already-set transform on
+  a live sender can throw `InvalidStateError` in Chrome, so re-attaching is
+  not a recovery path; the same-task rule must hold from the start.
 
 ### D2: SFrame parameters
 
