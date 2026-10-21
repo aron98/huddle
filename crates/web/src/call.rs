@@ -10,7 +10,9 @@ use crate::e2ee::transform::{TransformWorker, supports_e2ee};
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
-use crate::rtc::{BrowserPeerConnection, BrowserSignalingStream, RtcClient, RtcError};
+use crate::rtc::{
+    BrowserPeerConnection, BrowserSignalingStream, RtcClient, RtcError, signaling_url,
+};
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
@@ -253,11 +255,10 @@ async fn run_session(
     local: Option<MediaStream>,
     signals: SessionSignals,
 ) {
-    let host = window()
-        .location()
-        .host()
-        .unwrap_or_else(|_| "localhost".to_owned());
-    let signaling = match BrowserSignalingStream::connect(&format!("ws://{host}/ws")).await {
+    let location = window().location();
+    let host = location.host().unwrap_or_else(|_| "localhost".to_owned());
+    let protocol = location.protocol().unwrap_or_else(|_| "http:".to_owned());
+    let signaling = match BrowserSignalingStream::connect(&signaling_url(&protocol, &host)).await {
         Ok(s) => s,
         Err(e) => {
             // The transport itself failed before any join message; the

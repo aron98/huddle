@@ -24,6 +24,52 @@ use huddle_protocol::{
 };
 use std::collections::HashSet;
 
+/// Build the signaling WebSocket URL from the page's location. Browsers
+/// refuse `ws://` connections from `https://` pages (mixed content), so the
+/// scheme must mirror the page protocol: `wss` on HTTPS origins, `ws`
+/// otherwise (local dev and the HTTP e2e farm).
+pub fn signaling_url(protocol: &str, host: &str) -> String {
+    let scheme = if protocol == "https:" { "wss" } else { "ws" };
+    format!("{scheme}://{host}/ws")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::signaling_url;
+
+    #[test]
+    fn https_pages_get_wss() {
+        assert_eq!(
+            signaling_url("https:", "meet.example.com"),
+            "wss://meet.example.com/ws"
+        );
+        assert_eq!(
+            signaling_url("https:", "example.com:8443"),
+            "wss://example.com:8443/ws"
+        );
+    }
+
+    #[test]
+    fn http_pages_get_ws() {
+        assert_eq!(
+            signaling_url("http:", "localhost:3000"),
+            "ws://localhost:3000/ws"
+        );
+        assert_eq!(
+            signaling_url("http:", "127.0.0.1:3131"),
+            "ws://127.0.0.1:3131/ws"
+        );
+    }
+
+    #[test]
+    fn non_http_schemes_fall_back_to_ws() {
+        // Unknown/exotic origins (e.g. file:) stay on the plain WebSocket
+        // scheme, matching the pre-fix behaviour for local dev.
+        assert_eq!(signaling_url("file:", "localhost"), "ws://localhost/ws");
+        assert_eq!(signaling_url("", "localhost"), "ws://localhost/ws");
+    }
+}
+
 /// Everything that can go wrong above the two transport boundaries.
 #[derive(Debug, thiserror::Error)]
 pub enum RtcError {
