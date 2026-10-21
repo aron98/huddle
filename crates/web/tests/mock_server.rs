@@ -159,13 +159,22 @@ impl MockState {
             }],
             // Layer preferences are consumed by the SFU with no reply.
             ClientMessage::LayerPreference { .. }
-            // Keying envelopes are relayed by the real server; the mock
-            // only records them.
-            | ClientMessage::E2eeKeying { .. }
             // SDP answers and leaves close out flows that already got
             // their replies elsewhere.
             | ClientMessage::SdpAnswer { .. }
             | ClientMessage::Leave => vec![],
+            // The mock relays keying like the real server does, then
+            // rotates the epoch as a membership change would — the
+            // client must track both (issue #27).
+            ClientMessage::E2eeKeying { to, epoch, payload } => vec![
+                ServerMessage::E2eeKeying {
+                    from: ALICE_ID,
+                    to: *to,
+                    epoch: *epoch,
+                    payload: payload.clone(),
+                },
+                ServerMessage::E2eeEpoch { epoch: *epoch + 1 },
+            ],
         }
     }
 }
@@ -607,4 +616,77 @@ async fn join_error_surfaces_server_code() {
     };
     assert_eq!(server_err.code, ErrorCode::MeetingNotFound);
     assert_eq!(client.state(), huddle_web::rtc::SessionState::Closed);
+}
+
+#[tokio::test]
+async fn e2ee_keying_round_trips_and_epochs_track() {
+    let server = MockServer::start(false).await;
+    let mut client = connect(&server).await;
+    client.join("H7KD-PM2X-QR4T", "bob", None).await.unwrap();
+
+    client
+        .send_e2ee_keying(ALICE_ID, 7, "envelope".into())
+        .await
+        .unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(
+                m,
+                ClientMessage::E2eeKeying { to, epoch, payload }
+                    if *to == ALICE_ID && *epoch == 7 && payload == "envelope"
+            ))
+            .await,
+        "server should see the keying envelope"
+    );
+
+    // The relayed envelope comes back from the sender, then the epoch
+    // rotates — the driver must track the new value.
+    match client.next_server_message().await.unwrap() {
+        ServerMessage::E2eeKeying {
+            from,
+            epoch,
+            payload,
+            ..
+        } => {
+            assert_eq!(from, ALICE_ID);
+            assert_eq!(epoch, 7);
+            assert_eq!(payload, "envelope");
+        }
+        other => panic!("expected relayed keying, got {other:?}"),
+    }
+    match client.next_server_message().await.unwrap() {
+        ServerMessage::E2eeEpoch { epoch } => assert_eq!(epoch, 8),
+        other => panic!("expected an epoch rotation, got {other:?}"),
+    }
+    assert_eq!(client.e2ee_epoch(), 8);
+
+    // Both handled messages were buffered for the e2ee module as well
+    // (that is how they survive publish's inner pump loop).
+    let drained = client.take_pending_e2ee();
+    assert!(
+        matches!(
+            &drained[..],
+            [ServerMessage::E2eeKeying { payload, .. }, ServerMessage::E2eeEpoch { epoch: 8 }]
+                if payload == "envelope"
+        ),
+        "handled keying and rotations are both buffered: {drained:?}"
+    );
+
+    // The driver buffers relayed envelopes for the e2ee module instead
+    // of dropping them — they must survive publish's inner pump loop.
+    client
+        .send_e2ee_keying(CAROL_ID, 8, "second".into())
+        .await
+        .unwrap();
+    let first = client.read_server_message().await.unwrap();
+    client.handle_server_message(first.clone()).await.unwrap();
+    match first {
+        ServerMessage::E2eeKeying { payload, .. } => assert_eq!(payload, "second"),
+        other => panic!("expected relayed keying, got {other:?}"),
+    }
+    let buffered = client.take_pending_e2ee();
+    assert!(
+        matches!(&buffered[..], [ServerMessage::E2eeKeying { payload, .. }] if payload == "second"),
+        "the driver buffers keying for the e2ee module: {buffered:?}"
+    );
 }

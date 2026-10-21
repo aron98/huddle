@@ -412,6 +412,19 @@ pub fn Prejoin(
                     <h1 class="page-title">{heading}</h1>
                     <p class="schedule-hint">
                         {move || schedule_hint().map(|hint| view! { <span class="chip">{hint}</span> })}
+                        {move || {
+                            state
+                                .meeting
+                                .get()
+                                .is_some_and(|m| m.e2ee)
+                                .then(|| {
+                                    view! {
+                                        <span class="chip chip-e2ee" data-testid="prejoin-e2ee">
+                                            "End-to-end encrypted"
+                                        </span>
+                                    }
+                                })
+                        }}
                         "Meeting code "
                         <code>{code.clone()}</code>
                     </p>

@@ -27,6 +27,12 @@ wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 web-sys.workspace = true
 console_error_panic_hook.workspace = true
+# E2EE key exchange (issue #27, ADR 010): safety-number and HKDF
+# derivations are pure Rust so they are unit-testable natively; the
+# browser supplies the raw ECDH secrets via WebCrypto.
+base64 = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # uuid's v4 generator needs a randomness source in the browser.

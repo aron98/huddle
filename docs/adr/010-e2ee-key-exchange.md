@@ -101,11 +101,13 @@ verified-confirmation are encrypted with AES-128-GCM under
 `K_pairwise = HKDF-SHA256(ECDH(our priv, their pub), salt = "", info =
 "huddle-e2ee/v1/pairwise" ‖ fp_low ‖ fp_high)` where `fp_low/fp_high`
 are the two identity fingerprints in sorted order — canonicalized so
-both sides derive the same key. HKDF is implemented on top of WebCrypto
-HMAC-SHA256 (extract + expand, ~30 lines of Rust): the WebCrypto HKDF
-*algorithm* has patchy browser support (notably absent in older
-Safaris), while HMAC-SHA256 is universal. No WASM crypto crate is
-needed anywhere.
+both sides derive the same key. HKDF is implemented in pure Rust
+(`sha2` + `hmac`, ~30 lines, the same RFC 5869 extract-and-expand
+construction, natively unit-testable against the RFC 5869 test
+vectors): the WebCrypto HKDF *algorithm* has patchy browser support
+(notably absent in older Safaris), so it is still avoided. The two
+crates compile to wasm and ship in the bundle; no WASM crypto crate
+is needed anywhere.
 
 ## Decision 3 — Epochs: server-scoped counter, server as labeler (never key holder)
 

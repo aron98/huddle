@@ -1525,13 +1525,16 @@ name = "huddle-web"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "console_error_panic_hook",
  "futures",
+ "hmac",
  "huddle-protocol",
  "js-sys",
  "leptos",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "time",
  "tokio",

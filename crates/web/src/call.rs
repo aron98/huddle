@@ -5,6 +5,7 @@
 
 use crate::api;
 use crate::audio_settings;
+use crate::e2ee::session::{E2eeSession, PeerView};
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
@@ -48,6 +49,11 @@ enum UiAction {
     Focus {
         origin: Option<Uuid>,
     },
+    /// Confirm the out-of-band safety-number comparison for a peer
+    /// (E2EE verification, issue #27).
+    VerifyPeer {
+        id: Uuid,
+    },
     Leave,
 }
 
@@ -88,6 +94,11 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     let recording = RwSignal::new(false);
     // Transient in-call notices (e.g. a denied screen-share picker).
     let status = RwSignal::<Option<String>>::new(None);
+    // E2EE (issue #27): the meeting's trust mode, our own id, and
+    // the roster's per-peer verification state.
+    let e2ee_enabled = RwSignal::new(false);
+    let e2ee_peers = RwSignal::<Vec<PeerView>>::new(Vec::new());
+    let you_id = RwSignal::<Option<Uuid>>::new(None);
     // The live session's action inbox, present only between a
     // successful join and the end of the call.
     let ui_tx_slot = RwSignal::<Option<UnboundedSender<UiAction>>>::new(None);
@@ -107,6 +118,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
             recording,
             status,
             ui_tx_slot,
+            e2ee_enabled,
+            e2ee_peers,
+            you_id,
         };
         move |name: String, local: Option<MediaStream>| {
             // One session at a time: buttons double-firing during the
@@ -146,6 +160,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
                         sharing=sharing
                         share_preview=share_preview
                         focused=focused
+                        e2ee_enabled=e2ee_enabled
+                        e2ee_peers=e2ee_peers
+                        you_id=you_id
                         recording=recording
                         status=status
                         ui_tx_slot=ui_tx_slot
@@ -180,6 +197,9 @@ struct SessionSignals {
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
+    e2ee_enabled: RwSignal<bool>,
+    e2ee_peers: RwSignal<Vec<PeerView>>,
+    you_id: RwSignal<Option<Uuid>>,
 }
 
 impl SessionSignals {
@@ -271,13 +291,14 @@ async fn run_session(
         }
     };
 
-    // Test hook: let e2e reach the peer connection via getStats.
-    if window()
+    // Test hooks (`?test=1`): let e2e reach the peer connection via
+    // getStats, and the E2EE keying state via `__huddleE2eeStats`.
+    let test_mode = window()
         .location()
         .search()
         .unwrap_or_default()
-        .contains("test=1")
-    {
+        .contains("test=1");
+    if test_mode {
         let _ = js_sys::Reflect::set(
             &window().into(),
             &wasm_bindgen::JsValue::from_str("__huddlePc"),
@@ -373,6 +394,31 @@ async fn run_session(
         }
     }
 
+    // E2EE (issue #27, ADR 010): in an E2EE meeting load our
+    // long-term identity, announce it to the roster, and derive
+    // pairwise keys from the peers' announces. Failure only disables
+    // the verification UX — the call itself continues.
+    let mut e2ee: Option<E2eeSession> = None;
+    if client.e2ee_enabled() {
+        signals.e2ee_enabled.set(true);
+        if let Some(you) = client.you().map(|p| p.id) {
+            signals.you_id.set(Some(you));
+            match E2eeSession::start(you, client.e2ee_epoch()).await {
+                Some(mut session) => {
+                    let roster_snapshot = client.roster().to_vec();
+                    session.announce_to_all(&roster_snapshot, &mut client).await;
+                    signals.e2ee_peers.set(session.peer_views());
+                    e2ee = Some(session);
+                }
+                None => signals.status.set(Some(
+                    "End-to-end-encryption key exchange is unavailable in this browser; the call continues without verification."
+                        .to_owned(),
+                )),
+            }
+        }
+    }
+    publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
+
     // The session is live: the controls can reach it, and the flow can
     // move to the in-call view.
     let (ui_tx, mut ui_rx) = futures::channel::mpsc::unbounded::<UiAction>();
@@ -454,10 +500,24 @@ async fn run_session(
                             .remote_streams
                             .update(|list| list.retain(|(stream_id, _)| stream_id != &screen));
                     }
+                    // E2EE: feed the raw message (and anything the
+                    // inner pump loops buffered) through the keying
+                    // state machine; the peer views refresh the
+                    // roster's verification UX.
+                    if let Some(e2ee) = &mut e2ee {
+                        e2ee.handle_server_message(&msg, &mut client).await;
+                        for buffered in client.take_pending_e2ee() {
+                            e2ee.handle_server_message(&buffered, &mut client).await;
+                        }
+                        signals.e2ee_peers.set(e2ee.peer_views());
+                    } else {
+                        let _ = client.take_pending_e2ee();
+                    }
                     signals.roster.set(client.roster().to_vec());
                     signals.speaking.set(client.speaking().clone());
                     signals.chat.set(client.chat_log().to_vec());
                     signals.recording.set(client.recording());
+                    publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
                 }
                 Err(e) => {
                     signals.connection_lost(e.to_string());
@@ -671,6 +731,13 @@ async fn run_session(
                                 .set(signals.prejoin.effects.notice.get_untracked());
                         }
                     }
+                    UiAction::VerifyPeer { id } => {
+                        if let Some(e2ee) = &mut e2ee {
+                            e2ee.confirm_verification(id, &mut client).await;
+                            signals.e2ee_peers.set(e2ee.peer_views());
+                        }
+                        publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
+                    }
                     UiAction::Leave => {
                         let _ = client.leave().await;
                         signals.ui_tx_slot.set(None);
@@ -709,6 +776,70 @@ async fn watch_speaking_for(
             None
         }
     }
+}
+
+/// `?test=1` probe (same convention as `__huddlePc`): expose the E2EE
+/// keying state for e2e assertions — trust mode, epoch, and per-peer
+/// safety numbers + verified marks.
+fn publish_e2ee_probe(test_mode: bool, e2ee: Option<&E2eeSession>, roster: &[Participant]) {
+    if !test_mode {
+        return;
+    }
+    let stats = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("enabled"),
+        &wasm_bindgen::JsValue::from_bool(e2ee.is_some()),
+    );
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("epoch"),
+        &wasm_bindgen::JsValue::from_f64(e2ee.map(E2eeSession::epoch).unwrap_or(0) as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("hasSenderKey"),
+        &wasm_bindgen::JsValue::from_bool(e2ee.is_some_and(|e2ee| e2ee.has_sender_key())),
+    );
+    let peers = js_sys::Array::new();
+    for view in e2ee.map(|e2ee| e2ee.peer_views()).unwrap_or_default() {
+        let peer = js_sys::Object::new();
+        let name = roster
+            .iter()
+            .find(|p| p.id == view.id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("id"),
+            &wasm_bindgen::JsValue::from_str(&view.id.to_string()),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("name"),
+            &wasm_bindgen::JsValue::from_str(&name),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("safetyNumber"),
+            &view
+                .safety_number
+                .map(|number| wasm_bindgen::JsValue::from_str(&number))
+                .unwrap_or(wasm_bindgen::JsValue::NULL),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("verified"),
+            &wasm_bindgen::JsValue::from_bool(view.verified),
+        );
+        peers.push(&peer);
+    }
+    let _ = js_sys::Reflect::set(&stats, &wasm_bindgen::JsValue::from_str("peers"), &peers);
+    let _ = js_sys::Reflect::set(
+        &window().into(),
+        &wasm_bindgen::JsValue::from_str("__huddleE2eeStats"),
+        &stats,
+    );
 }
 
 /// The join handshake's loading page: prejoin is gone, the call is not
@@ -869,6 +1000,9 @@ fn CallView(
     sharing: RwSignal<bool>,
     share_preview: RwSignal<Option<MediaStream>>,
     focused: RwSignal<Option<Uuid>>,
+    e2ee_enabled: RwSignal<bool>,
+    e2ee_peers: RwSignal<Vec<PeerView>>,
+    you_id: RwSignal<Option<Uuid>>,
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
@@ -924,6 +1058,9 @@ fn CallView(
             let _ = tx.unbounded_send(action);
         }
     };
+
+    // The open "verify" dialog: which participant, by id.
+    let verify_open = RwSignal::<Option<Uuid>>::new(None);
 
     let toggle_mic = {
         let local = local.clone();
@@ -1020,6 +1157,19 @@ fn CallView(
                     >
                         <span class="recording-dot" aria-hidden="true"></span>
                         "REC"
+                    </span>
+                })}
+                {move || e2ee_enabled.get().then(|| view! {
+                    // The E2EE trust-mode badge (ADR 010, D6): the
+                    // counterpart of REC — the server enforces that
+                    // they never co-occur.
+                    <span
+                        class="e2ee-indicator"
+                        data-testid="e2ee-indicator"
+                        role="status"
+                        title="This meeting is end-to-end encrypted"
+                    >
+                        "E2EE"
                     </span>
                 })}
                 <p class="call-title">{meeting_title}</p>
@@ -1146,12 +1296,110 @@ fn CallView(
                                     } else {
                                         format!("{} ({mic}, {cam})", current.name)
                                     };
+                                    // The verification affordance (issue #27):
+                                    // a verified chip, a Verify button
+                                    // once the safety number is known, or
+                                    // nothing while the key exchange
+                                    // settles. Never for ourselves.
+                                    let is_self = you_id
+                                        .get()
+                                        .is_some_and(|you| you == current.id);
+                                    let peer_view = e2ee_peers
+                                        .get()
+                                        .into_iter()
+                                        .find(|v| v.id == current.id);
+                                    let verify_ui = (!is_self).then(|| match peer_view {
+                                        Some(v) if v.verified => {
+                                            let verified_testid =
+                                                format!("verified-{}", current.name);
+                                            view! {
+                                                <span
+                                                    class="chip chip-verified"
+                                                    data-testid=verified_testid
+                                                >
+                                                    "verified"
+                                                </span>
+                                            }
+                                                .into_any()
+                                        }
+                                        Some(v) if v.safety_number.is_some() => {
+                                            let verify_testid =
+                                                format!("verify-{}", current.name);
+                                            let verify_click =
+                                                move |_| verify_open.set(Some(current.id));
+                                            view! {
+                                                <button
+                                                    class="btn small"
+                                                    data-testid=verify_testid
+                                                    on:click=verify_click
+                                                >
+                                                    "Verify"
+                                                </button>
+                                            }
+                                                .into_any()
+                                        }
+                                        _ => ().into_any(),
+                                    });
                                     view! {
-                                        <li data-testid=testid>{text}</li>
+                                        <li data-testid=testid>{text} {verify_ui}</li>
                                     }
                                 }}
                             </For>
                         </ul>
+                        {move || {
+                            verify_open
+                                .get()
+                                .map(|id| {
+                                    // The name is looked up live from the roster so
+                                    // the dialog survives edits and re-renders
+                                    // without capturing any Strings.
+                                    let name = roster
+                                        .get()
+                                        .into_iter()
+                                        .find(|p| p.id == id)
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_default();
+                                    let safety = e2ee_peers
+                                        .get()
+                                        .into_iter()
+                                        .find(|v| v.id == id)
+                                        .and_then(|v| v.safety_number.clone());
+                                    let safety_testid = format!("safety-number-{name}");
+                                    let confirm_testid = format!("confirm-verify-{name}");
+                                    let on_confirm = move |_| {
+                                        send(UiAction::VerifyPeer { id });
+                                        verify_open.set(None);
+                                    };
+                                    view! {
+                                        <div class="verify-dialog" data-testid="verify-dialog">
+                                            <p class="verify-title">
+                                                {format!("Verify {name}")}
+                                            </p>
+                                            <p class="safety-number" data-testid=safety_testid>
+                                                {safety.unwrap_or_else(|| "…".to_owned())}
+                                            </p>
+                                            <p class="muted">
+                                                "Read this number to each other out of band (or compare it over another channel). If the numbers match, mark the participant as verified."
+                                            </p>
+                                            <div class="verify-actions">
+                                                <button
+                                                    class="btn primary small"
+                                                    data-testid=confirm_testid
+                                                    on:click=on_confirm
+                                                >
+                                                    "They match — mark verified"
+                                                </button>
+                                                <button
+                                                    class="btn small"
+                                                    on:click=move |_| verify_open.set(None)
+                                                >
+                                                    "Close"
+                                                </button>
+                                            </div>
+                                        </div>
+                                    }
+                                })
+                        }}
                     </section>
 
                     <section class="chat">

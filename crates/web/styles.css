@@ -26,6 +26,8 @@
   --on-air: #ffb454;
   --on-air-dim: rgba(255, 180, 84, 0.16);
   --danger: #f2636a;
+  --e2ee: #4fd7a5;
+  --e2ee-dim: rgba(79, 215, 165, 0.16);
 
   /* Type */
   --font-display: "Futura", "Avenir Next", "Century Gothic",
@@ -1106,4 +1108,56 @@ ul[data-testid="roster"] li:last-child {
     justify-self: stretch;
     overflow-x: auto;
   }
+}
+
+/* E2EE (issue #27, ADR 010): the trust-mode counterpart of the REC
+   badge. Green reads as "protected"; steady (no lamp animation) —
+   the server-enforced interlock guarantees it never co-occurs with
+   REC. */
+.e2ee-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-family: var(--font-display);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--e2ee);
+  border: 1px solid var(--e2ee);
+  border-radius: var(--r-pill);
+  padding: var(--sp-1) var(--sp-3);
+}
+
+.chip-e2ee,
+.chip-verified {
+  color: var(--e2ee);
+  border-color: var(--e2ee);
+  background: var(--e2ee-dim);
+}
+
+/* The safety-number verify dialog (roster affordance). */
+.verify-dialog {
+  margin-top: var(--sp-4);
+  padding: var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--r-m);
+  background: var(--panel-raise);
+}
+
+.verify-title {
+  font-weight: 700;
+  margin: 0 0 var(--sp-2);
+}
+
+.safety-number {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: var(--fs-xl);
+  letter-spacing: 0.08em;
+  color: var(--text);
+  margin: var(--sp-3) 0;
+}
+
+.verify-actions {
+  display: flex;
+  gap: var(--sp-2);
 }

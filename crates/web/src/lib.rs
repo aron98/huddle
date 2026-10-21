@@ -16,6 +16,7 @@ pub mod api;
 pub mod audio_settings;
 #[cfg(target_arch = "wasm32")]
 pub mod call;
+pub mod e2ee;
 #[cfg(target_arch = "wasm32")]
 pub mod effects;
 pub mod flow;
@@ -238,6 +239,8 @@ fn Dashboard() -> impl IntoView {
     let ends = RwSignal::new(String::new());
     let repeat = RwSignal::new("never".to_owned());
     let create_passcode = RwSignal::new(String::new());
+    // The E2EE trust mode is chosen at creation (issue #27, ADR 010).
+    let create_e2ee = RwSignal::new(false);
 
     // Refresh the owned-meetings list in the background.
     fn refresh(meetings: RwSignal<Vec<MeetingResponse>>) {
@@ -317,9 +320,7 @@ fn Dashboard() -> impl IntoView {
             ends_at,
             repeat: repeat_rule,
             passcode: (!passcode.is_empty()).then_some(passcode),
-            // The dashboard E2EE checkbox lands with the web feature
-            // (issue #27); plaintext stays the default until then.
-            e2ee: false,
+            e2ee: create_e2ee.get_untracked(),
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));
@@ -339,6 +340,7 @@ fn Dashboard() -> impl IntoView {
                     ends.set(String::new());
                     repeat.set("never".to_owned());
                     create_passcode.set(String::new());
+                    create_e2ee.set(false);
                     refresh(meetings);
                 }
                 Ok((_, text)) => status.set(Some(format!("Could not create the meeting: {text}"))),
@@ -492,6 +494,16 @@ fn Dashboard() -> impl IntoView {
                                     prop:value=create_passcode
                                     on:input=move |ev| create_passcode.set(event_target_value(&ev))
                                 />
+                            </label>
+                            <label class="field">
+                                "End-to-end encryption"
+                                <input
+                                    type="checkbox"
+                                    data-testid="create-e2ee"
+                                    prop:checked=create_e2ee
+                                    on:change=move |ev| create_e2ee.set(event_target_checked(&ev))
+                                />
+                                " Participants verify each other by a safety number; recording is disabled."
                             </label>
                             <button class="btn primary" type="submit" data-testid="create-btn">
                                 "Create meeting"
@@ -647,6 +659,8 @@ fn Dashboard() -> impl IntoView {
                                         move |_| set_passcode(code.clone(), None)
                                     };
                                     let has_passcode = current.meeting.has_passcode;
+                                    let is_e2ee = current.meeting.e2ee;
+                                    let e2ee_testid = format!("e2ee-state-{code}");
                                     let row_testid = format!("meeting-row-{code}");
                                     let join_href = format!("/m/{code}");
                                     let ics_href = format!("/api/meetings/{code}/ics");
@@ -706,6 +720,13 @@ fn Dashboard() -> impl IntoView {
                                                         "Open"
                                                     }}
                                                 </span>
+                                                {is_e2ee.then(move || {
+                                                    view! {
+                                                        <span class="chip chip-e2ee" data-testid=e2ee_testid>
+                                                            "E2EE"
+                                                        </span>
+                                                    }
+                                                })}
                                                 <input
                                                     type="password"
                                                     placeholder="New passcode"
