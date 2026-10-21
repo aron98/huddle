@@ -15,10 +15,12 @@ pub mod signaling;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 pub use api::{
-    ApiError, CreateMeetingRequest, ENCRYPTED_TITLE_MAX_LEN, ENCRYPTED_TITLE_PREFIX, Joinability,
-    MASKED_TITLE, MeetingDto, MeetingResponse, OccurrenceDto, PASSCODE_MAX_LEN, RecordingDto,
-    RecurrenceRule, RepeatFrequency, TITLE_MAX_LEN, UpdateMeetingRequest, display_title,
-    is_encrypted_title, validate_passcode, validate_title,
+    ApiError, AuthorizationDto, CreateMeetingRequest, DEVICE_GRANT_TYPE,
+    DeviceAuthorizationResponse, ENCRYPTED_TITLE_MAX_LEN, ENCRYPTED_TITLE_PREFIX, Joinability,
+    MASKED_TITLE, MeetingDto, MeetingResponse, OAuthError, OAuthTokenResponse, OccurrenceDto,
+    PASSCODE_MAX_LEN, RecordingDto, RecurrenceRule, RepeatFrequency, Scope, TITLE_MAX_LEN,
+    UpdateMeetingRequest, display_title, is_encrypted_title, scopes_string, validate_passcode,
+    validate_title,
 };
 pub use signaling::{
     ChatMessage, ClientMessage, ErrorCode, IceServer, Participant, ParticipantId, ServerMessage,

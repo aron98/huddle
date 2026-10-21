@@ -330,6 +330,134 @@ pub fn validate_passcode(passcode: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+// --- OAuth authorization server (issue #9, ADR 013) ------------------------
+//
+// huddle acts as its own OAuth authorization server for machine
+// clients (CLIs, agent hosts): the device-authorization flow of
+// RFC 8628 issues scoped, revocable tokens to the REST API below.
+// These are the wire shapes of that surface, shared by the server and
+// the CLI exactly like the meeting DTOs above.
+
+/// One capability an access token may carry. Wire format is the RFC
+/// 6749 `scope` token syntax: `meetings:read`, `meetings:write`.
+///
+/// Scopes are orthogonal on purpose: `meetings:write` does NOT imply
+/// `meetings:read` — a write-only token can create and cancel but
+/// cannot list. Clients that want both ask for both (the CLI does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Scope {
+    #[serde(rename = "meetings:read")]
+    MeetingsRead,
+    #[serde(rename = "meetings:write")]
+    MeetingsWrite,
+}
+
+impl Scope {
+    /// Every scope the server can issue today. Additive over time.
+    pub const ALL: [Scope; 2] = [Scope::MeetingsRead, Scope::MeetingsWrite];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::MeetingsRead => "meetings:read",
+            Scope::MeetingsWrite => "meetings:write",
+        }
+    }
+
+    /// Parse one scope token; `None` for anything unknown.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "meetings:read" => Some(Scope::MeetingsRead),
+            "meetings:write" => Some(Scope::MeetingsWrite),
+            _ => None,
+        }
+    }
+
+    /// Parse a space-separated RFC 6749 `scope` value. `None` when any
+    /// token is unknown or the list is empty.
+    pub fn parse_list(raw: &str) -> Option<Vec<Scope>> {
+        let scopes: Vec<Scope> = raw
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(Scope::parse)
+            .collect::<Option<Vec<_>>>()?;
+        (!scopes.is_empty()).then_some(scopes)
+    }
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Render scopes as an RFC 6749 `scope` value (space-separated).
+pub fn scopes_string(scopes: &[Scope]) -> String {
+    scopes
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The `grant_type` of RFC 8628's token request.
+pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// Success body of `POST /api/oauth/device/register` (RFC 8628 §3.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAuthorizationResponse {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    /// `verification_uri` with the code pre-filled, so an
+    /// already-signed-in browser can approve with one visit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    /// Seconds until the device code expires.
+    pub expires_in: u32,
+    /// Minimum seconds between token polls.
+    pub interval: u32,
+}
+
+/// Success body of `POST /api/oauth/token` (RFC 6749 §5.1 shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthTokenResponse {
+    pub access_token: String,
+    /// Always `Bearer`.
+    pub token_type: String,
+    pub expires_in: u32,
+    /// Present for the device grant (and absent on pure refreshes,
+    /// which keep the same refresh token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// The scopes the access token carries, space-separated.
+    pub scope: String,
+}
+
+/// Error body of the OAuth endpoints (RFC 6749 §5.2 shape):
+/// `{"error": "authorization_pending", ...}`. Distinct from
+/// [`ApiError`] on purpose — OAuth clients speak RFC error codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OAuthError {
+    pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_description: Option<String>,
+}
+
+/// One active client authorization on the organizer's dashboard: the
+/// long-lived credential a device holds, with the human-facing label
+/// (client name) and the scopes it was granted. The token value itself
+/// is never returned — only its server-side identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationDto {
+    pub id: Uuid,
+    pub client_name: String,
+    pub scopes: Vec<Scope>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_used_at: Option<OffsetDateTime>,
+}
+
 /// Serde for the tri-state `Option<Option<T>>`: an absent field means
 /// "leave unchanged", an explicit `null` means "remove", and a value
 /// means "set". A plain `Option<T>` cannot tell absent from null.
@@ -359,6 +487,61 @@ mod double_option {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scopes_round_trip_through_their_rfc_names() {
+        for scope in Scope::ALL {
+            let json = serde_json::to_string(&scope).unwrap();
+            assert_eq!(json, format!("\"{}\"", scope.as_str()));
+            let back: Scope = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, scope);
+            assert_eq!(Scope::parse(scope.as_str()), Some(scope));
+        }
+        assert_eq!(scopes_string(&Scope::ALL), "meetings:read meetings:write");
+    }
+
+    #[test]
+    fn scope_lists_parse_and_reject_garbage() {
+        let scopes = Scope::parse_list("meetings:read  meetings:write").unwrap();
+        assert_eq!(scopes, Scope::ALL);
+        // Empty, unknown, and half-known lists are all refused — a
+        // client asking for a scope we do not issue must fail loudly.
+        assert!(Scope::parse_list("").is_none());
+        assert!(Scope::parse_list("meetings:admin").is_none());
+        assert!(Scope::parse_list("meetings:read meetings:admin").is_none());
+    }
+
+    #[test]
+    fn oauth_wire_shapes_match_the_rfc() {
+        let device = serde_json::json!({
+            "device_code": "dc", "user_code": "ABCD-EFGH",
+            "verification_uri": "https://x/oauth/device",
+            "expires_in": 600, "interval": 5,
+        });
+        let parsed: DeviceAuthorizationResponse = serde_json::from_value(device).unwrap();
+        assert_eq!(parsed.verification_uri_complete, None);
+
+        let token = OAuthTokenResponse {
+            access_token: "at".into(),
+            token_type: "Bearer".into(),
+            expires_in: 1800,
+            refresh_token: Some("rt".into()),
+            scope: "meetings:read meetings:write".into(),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        assert!(json.contains("\"refresh_token\":\"rt\""));
+        let back: OAuthTokenResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, token);
+
+        // The RFC 6749 error body is flat, not the ApiError envelope.
+        let err = serde_json::to_value(OAuthError {
+            error: "authorization_pending".into(),
+            error_description: None,
+        })
+        .unwrap();
+        assert_eq!(err["error"], "authorization_pending");
+        assert!(err.get("error_description").is_none());
+    }
 
     #[test]
     fn joinability_not_yet_shape_is_stable() {
