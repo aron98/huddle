@@ -29,6 +29,8 @@ pub mod rtc;
 use leptos::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use leptos::task::spawn_local;
+#[cfg(target_arch = "wasm32")]
+use uuid::Uuid;
 
 /// Consume a media-play promise so a late rejection (e.g. the tile was
 /// unmounted mid-play) never surfaces as an unhandled page error.
@@ -225,8 +227,8 @@ fn Login() -> impl IntoView {
 #[component]
 fn Dashboard() -> impl IntoView {
     use huddle_protocol::{
-        CreateMeetingRequest, Joinability, MeetingResponse, RecurrenceRule, RepeatFrequency,
-        UpdateMeetingRequest,
+        AuthorizationDto, CreateMeetingRequest, Joinability, MeetingResponse, RecurrenceRule,
+        RepeatFrequency, UpdateMeetingRequest,
     };
     use time::format_description::well_known::Rfc3339;
 
@@ -241,6 +243,9 @@ fn Dashboard() -> impl IntoView {
     let create_passcode = RwSignal::new(String::new());
     // The E2EE trust mode is chosen at creation (issue #27, ADR 010).
     let create_e2ee = RwSignal::new(false);
+    // Agent authorizations (issue #9): the CLI/MCP refresh tokens this
+    // organizer has approved through the OAuth device flow.
+    let authorizations = RwSignal::<Vec<AuthorizationDto>>::new(Vec::new());
 
     // Refresh the owned-meetings list in the background. Encrypted
     // titles (issue #29) are decrypted per row: this is the
@@ -265,6 +270,19 @@ fn Dashboard() -> impl IntoView {
         });
     }
 
+    // Load the organizer's active agent authorizations. Session only on
+    // the server (bearer tokens get 401 here), so a revoked CLI cannot
+    // re-read this list.
+    fn refresh_authorizations(authorizations: RwSignal<Vec<AuthorizationDto>>) {
+        spawn_local(async move {
+            if let Ok((200, body)) = api::fetch_text("GET", "/api/oauth/authorizations", None).await
+                && let Ok(list) = serde_json::from_str::<Vec<AuthorizationDto>>(&body)
+            {
+                authorizations.set(list);
+            }
+        });
+    }
+
     // Initial load: session first, then the list.
     spawn_local(async move {
         match api::fetch_text("GET", "/api/auth/me", None).await {
@@ -279,6 +297,7 @@ fn Dashboard() -> impl IntoView {
         }
         if !signed_out.get_untracked() {
             refresh(meetings);
+            refresh_authorizations(authorizations);
         }
     });
 
@@ -429,6 +448,22 @@ fn Dashboard() -> impl IntoView {
                 }
                 Ok((_, text)) => status.set(Some(format!("Could not save the passcode: {text}"))),
                 Err(e) => status.set(Some(format!("Could not save the passcode: {e}"))),
+            }
+        });
+    };
+    // Revoke an agent authorization: the server deletes the refresh
+    // token row by id, so the agent's next refresh fails immediately
+    // (any access token it still holds lapses within minutes).
+    let revoke_auth = move |id: Uuid| {
+        spawn_local(async move {
+            match api::fetch_text("DELETE", &format!("/api/oauth/authorizations/{id}"), None).await
+            {
+                Ok((200, _)) => {
+                    status.set(Some("Authorization revoked.".to_owned()));
+                    refresh_authorizations(authorizations);
+                }
+                Ok((_, text)) => status.set(Some(format!("Could not revoke: {text}"))),
+                Err(e) => status.set(Some(format!("Could not revoke: {e}"))),
             }
         });
     };
@@ -812,6 +847,86 @@ fn Dashboard() -> impl IntoView {
                                                         </button>
                                                     }
                                                 })}
+                                            </div>
+                                        </li>
+                                    }
+                                }}
+                            </For>
+                        </ul>
+                    </section>
+
+                    <section class="panel" data-testid="authorizations-panel">
+                        <h2 class="section-title">"Agent authorizations"</h2>
+                        <p class="muted">
+                            "CLI and MCP tokens you approved through the device flow. Revoking one signs that agent out immediately."
+                        </p>
+                        {move || {
+                            authorizations
+                                .get()
+                                .is_empty()
+                                .then(|| {
+                                    view! {
+                                        <p class="muted" data-testid="authorizations-empty">
+                                            "No agent authorizations yet."
+                                        </p>
+                                    }
+                                })
+                        }}
+                        <ul data-testid="authorizations-list" class="meeting-list">
+                            <For each={move || authorizations.get()} key=|a| a.id let:a>
+                                {move || {
+                                    // Keyed-`For` children are not re-rendered
+                                    // when the key stays the same, so re-read
+                                    // the signal and find the live item (same
+                                    // pattern as the meeting rows above).
+                                    let current = authorizations
+                                        .get()
+                                        .into_iter()
+                                        .find(|q| q.id == a.id)
+                                        .unwrap_or_else(|| a.clone());
+                                    let id = current.id;
+                                    let scopes = current
+                                        .scopes
+                                        .iter()
+                                        .map(|s| s.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    let created_raw = current
+                                        .created_at
+                                        .format(&Rfc3339)
+                                        .unwrap_or_default();
+                                    let created = api::rfc3339_to_local(&created_raw);
+                                    let last_used = current.last_used_at.map(|at| {
+                                        let raw = at.format(&Rfc3339).unwrap_or_default();
+                                        api::rfc3339_to_local(&raw)
+                                    });
+                                    let row_testid = format!("authorization-row-{id}");
+                                    let revoke_testid = format!("revoke-auth-{id}");
+                                    let revoke_click = move |_| revoke_auth(id);
+                                    view! {
+                                        <li data-testid=row_testid class="meeting-row">
+                                            <div class="meeting-row-main">
+                                                <strong class="meeting-title">
+                                                    {current.client_name.clone()}
+                                                </strong>
+                                                <p class="meeting-code-line">
+                                                    "Scopes "
+                                                    <code>{scopes}</code>
+                                                </p>
+                                                <p class="meeting-repeat muted">
+                                                    "Approved "{created}
+                                                    {last_used
+                                                        .map(|at| format!(" · last used {at}"))}
+                                                </p>
+                                            </div>
+                                            <div class="meeting-row-actions">
+                                                <button
+                                                    class="btn danger small"
+                                                    data-testid=revoke_testid
+                                                    on:click=revoke_click
+                                                >
+                                                    "Revoke"
+                                                </button>
                                             </div>
                                         </li>
                                     }
