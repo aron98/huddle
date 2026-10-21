@@ -30,6 +30,12 @@ use crate::state::AppState;
 /// defaults would let one connection hold hundreds of MB hostage.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
+/// Cap for one E2EE keying payload (ADR 010): the wire form is base64,
+/// so ~22 K characters bound the ~16 KiB of raw ciphertext (a sender
+/// key share) that ever needs to travel. Larger blobs are refused —
+/// they cannot be legitimate keying.
+const MAX_KEYING_PAYLOAD: usize = 22 * 1024;
+
 /// Entry point for the `/ws` route.
 pub async fn ws(
     State(state): State<AppState>,
@@ -152,10 +158,21 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::LayerPreference { origin, layer } => {
                         engine.layer_preference(code.clone(), id, origin, layer);
                     }
-                    // Relayed to the addressed participant once the
-                    // engine-side relay lands (issue #27); a no-op here
-                    // keeps the exhaustive match honest in the meantime.
-                    ClientMessage::E2eeKeying { .. } => {}
+                    // Opaque ciphertext to this server (ADR 010):
+                    // size-capped, never inspected, never persisted;
+                    // the engine relays it only to the addressee.
+                    ClientMessage::E2eeKeying { to, epoch, payload } => {
+                        if payload.len() > MAX_KEYING_PAYLOAD {
+                            send_error(
+                                &mut sender,
+                                ErrorCode::InvalidMessage,
+                                "keying payload too large",
+                            )
+                            .await;
+                            continue;
+                        }
+                        engine.e2ee_keying(code.clone(), id, to, epoch, payload);
+                    }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;

@@ -144,6 +144,17 @@ pub enum EngineCommand {
         code: String,
         reply: oneshot::Sender<Result<(), ErrorCode>>,
     },
+    /// Relay an opaque E2EE keying payload from one participant to
+    /// another. The payload is ciphertext to this server (ADR 010):
+    /// it is never inspected, never persisted, and only delivered to
+    /// the addressed participant.
+    E2eeKeying {
+        code: String,
+        from: Uuid,
+        to: Uuid,
+        epoch: u64,
+        payload: String,
+    },
     /// Remove a participant (graceful leave or socket gone).
     Leave { code: String, id: Uuid },
     /// Collect a snapshot of rooms and peer stats (the `/metrics` pull).
@@ -256,6 +267,17 @@ impl EngineHandle {
         reply_rx
     }
 
+    /// Relay an opaque E2EE keying payload to another participant.
+    pub fn e2ee_keying(&self, code: String, from: Uuid, to: Uuid, epoch: u64, payload: String) {
+        let _ = self.tx.send(EngineCommand::E2eeKeying {
+            code,
+            from,
+            to,
+            epoch,
+            payload,
+        });
+    }
+
     pub fn leave(&self, code: String, id: Uuid) {
         let _ = self.tx.send(EngineCommand::Leave { code, id });
     }
@@ -279,6 +301,15 @@ struct MeetingInstance {
     participants: HashMap<Uuid, Participant>,
     outs: HashMap<Uuid, UnboundedSender<ServerMessage>>,
     names: HashSet<String>,
+    /// The meeting's E2EE trust mode, fixed when the instance is
+    /// created from the first joiner's meeting row. Plaintext
+    /// meetings keep working exactly as before (ADR 010).
+    e2ee: bool,
+    /// The current SFrame epoch label. Starts at 0 and increments on
+    /// every join and leave so leavers never hold keys for the epochs
+    /// that follow them (meeting-scoped forward secrecy). The server
+    /// only labels epochs; all key material lives client-side.
+    e2ee_epoch: u64,
     /// The recording sink, when a recording is running. Held here AND
     /// inside the room: when the instance is dropped (last leave, or
     /// explicit stop clears it) the last `Arc` goes away, which is
@@ -287,12 +318,14 @@ struct MeetingInstance {
 }
 
 impl MeetingInstance {
-    fn new(media_addr: SocketAddr) -> Self {
+    fn new(media_addr: SocketAddr, e2ee: bool) -> Self {
         Self {
             room: Room::new(media_addr),
             participants: HashMap::new(),
             outs: HashMap::new(),
             names: HashSet::new(),
+            e2ee,
+            e2ee_epoch: 0,
             recorder: None,
         }
     }
@@ -531,6 +564,13 @@ impl Engine {
             EngineCommand::StopRecording { code, reply } => {
                 self.stop_recording(&code, reply);
             }
+            EngineCommand::E2eeKeying {
+                code,
+                from,
+                to,
+                epoch,
+                payload,
+            } => self.relay_e2ee_keying(&code, from, to, epoch, payload),
             EngineCommand::Leave { code, id } => self.remove_participant(&code, id),
             EngineCommand::Stats { reply } => {
                 let _ = reply.send(self.collect_stats());
@@ -603,12 +643,21 @@ impl Engine {
         let inst = self
             .meetings
             .entry(code.clone())
-            .or_insert_with(|| MeetingInstance::new(self.media_addr));
+            .or_insert_with(|| MeetingInstance::new(self.media_addr, meeting.e2ee));
         if let Err(e) = inst.room.create_peer(id) {
             tracing::error!(peer = %id, "create_peer failed: {e}");
             reject(reply, ErrorCode::Internal);
             return;
         }
+
+        // Rotation on join (ADR 010): the joiner never shares an epoch
+        // with anyone who left before them, and their own arrival kills
+        // every older key. The Welcome below carries the new label so
+        // the joiner keys itself for the epoch the room is now in.
+        if inst.e2ee {
+            inst.e2ee_epoch += 1;
+        }
+        let (e2ee_enabled, e2ee_epoch) = (inst.e2ee, inst.e2ee_epoch);
 
         let participant = Participant {
             id,
@@ -629,16 +678,18 @@ impl Engine {
             roster,
             ice_servers: self.ice_servers.clone(),
             recording: inst.recording(),
-            // Wired to the meeting's trust mode when the engine-side E2EE
-            // support lands (issue #27); plaintext until then.
-            e2ee_enabled: false,
-            e2ee_epoch: 0,
+            e2ee_enabled,
+            e2ee_epoch,
         });
 
         let joined = ServerMessage::ParticipantJoined { participant };
+        let rotated = e2ee_enabled.then_some(ServerMessage::E2eeEpoch { epoch: e2ee_epoch });
         for (pid, o) in &inst.outs {
             if *pid != id {
                 let _ = o.send(joined.clone());
+                if let Some(msg) = &rotated {
+                    let _ = o.send(msg.clone());
+                }
             }
         }
 
@@ -670,6 +721,30 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Relay an opaque E2EE keying payload from one participant to
+    /// another (ADR 010). The server never sees usable key material:
+    /// the payload is AES-GCM ciphertext under a key only the receiver
+    /// holds. Relaying outside an E2EE meeting, or from/to someone not
+    /// in the room, is a silent drop — a missing receiver usually
+    /// just left (their epoch already rotated without them).
+    fn relay_e2ee_keying(&mut self, code: &str, from: Uuid, to: Uuid, epoch: u64, payload: String) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        if !inst.e2ee || !inst.participants.contains_key(&from) {
+            return;
+        }
+        let Some(out) = inst.outs.get(&to) else {
+            return;
+        };
+        let _ = out.send(ServerMessage::E2eeKeying {
+            from,
+            to,
+            epoch,
+            payload,
+        });
     }
 
     /// Relay a chat message verbatim. The session built it (and persisted
@@ -827,6 +902,12 @@ impl Engine {
             let _ = reply.send(Err(ErrorCode::RecordingActive));
             return;
         }
+        // Interlock (ADR 009/010): the engine refuses independently of
+        // the REST handler — E2EE meetings only ever relay ciphertext.
+        if inst.e2ee {
+            let _ = reply.send(Err(ErrorCode::E2eeActive));
+            return;
+        }
         inst.room.set_recorder(Some(recorder.clone()));
         inst.recorder = Some(recorder);
         let msg = ServerMessage::Recording { active: true };
@@ -866,8 +947,20 @@ impl Engine {
             inst.names.remove(&p.name.to_lowercase());
             inst.outs.remove(&id);
             let msg = ServerMessage::ParticipantLeft { id };
+            let rotate = inst.e2ee.then(|| {
+                // Rotation on leave (ADR 010): every key from the
+                // leaver's epochs dies with them. An emptied room
+                // takes its epoch counter with the instance.
+                inst.e2ee_epoch += 1;
+                ServerMessage::E2eeEpoch {
+                    epoch: inst.e2ee_epoch,
+                }
+            });
             for out in inst.outs.values() {
                 let _ = out.send(msg.clone());
+                if let Some(rotated) = &rotate {
+                    let _ = out.send(rotated.clone());
+                }
             }
         }
         if inst.outs.is_empty() {
@@ -952,6 +1045,32 @@ mod tests {
         let reply = handle.join(id, name.to_owned(), meeting_dto(code), out_tx);
         reply.await.expect("engine alive").expect("join accepted");
         (id, out_rx)
+    }
+
+    fn meeting_dto_e2ee(code: &str) -> MeetingDto {
+        let mut meeting = meeting_dto(code);
+        meeting.e2ee = true;
+        meeting
+    }
+
+    /// Like [`join`], but in E2EE trust mode.
+    async fn join_e2ee(
+        handle: &EngineHandle,
+        code: &str,
+        name: &str,
+    ) -> (Uuid, tokio::sync::mpsc::UnboundedReceiver<ServerMessage>) {
+        let id = Uuid::new_v4();
+        let (out_tx, out_rx) = unbounded_channel();
+        let reply = handle.join(id, name.to_owned(), meeting_dto_e2ee(code), out_tx);
+        reply.await.expect("engine alive").expect("join accepted");
+        (id, out_rx)
+    }
+
+    /// Drain whatever is already queued. Engine replies arrive after
+    /// every broadcast of the same command, so once a join's reply
+    /// came back the queue holds everything that join produced.
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMessage>) {
+        while rx.try_recv().is_ok() {}
     }
 
     async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMessage>) -> ServerMessage {
@@ -1425,5 +1544,184 @@ mod tests {
             .await
             .expect("engine alive");
         assert_eq!(refused.unwrap_err(), ErrorCode::MeetingNotLive);
+    }
+
+    // --- e2ee keying relay (issue #27) --------------------------------------
+
+    #[tokio::test]
+    async fn e2ee_welcome_carries_the_trust_mode_and_epoch() {
+        let (engine, _keep) = test_engine(8);
+        let (_alice, mut alice_rx) = join_e2ee(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let welcome = next(&mut alice_rx).await;
+        let ServerMessage::Welcome {
+            e2ee_enabled,
+            e2ee_epoch,
+            ..
+        } = welcome
+        else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        assert!(e2ee_enabled, "the joiner learns the trust mode");
+        assert_eq!(e2ee_epoch, 1, "the first join rotates the epoch from 0");
+    }
+
+    #[tokio::test]
+    async fn plaintext_meetings_stay_rotation_free() {
+        let (engine, _keep) = test_engine(8);
+        let (_alice, mut alice_rx) = join(&engine, "ABCD-EFGH-JKLM", "alice").await;
+        let welcome = next(&mut alice_rx).await;
+        let ServerMessage::Welcome {
+            e2ee_enabled,
+            e2ee_epoch,
+            ..
+        } = welcome
+        else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        assert!(!e2ee_enabled);
+        assert_eq!(e2ee_epoch, 0);
+
+        let (_bob, mut bob_rx) = join(&engine, "ABCD-EFGH-JKLM", "bob").await;
+        next(&mut bob_rx).await; // bob welcome
+        next(&mut alice_rx).await; // bob joined — nothing else follows
+        assert!(
+            matches!(
+                alice_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "plaintext joins do not broadcast epochs"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2ee_epochs_rotate_on_join_and_leave() {
+        let (engine, _keep) = test_engine(8);
+        let code = "ABCD-EFGH-JKLM";
+        let (_alice, mut alice_rx) = join_e2ee(&engine, code, "alice").await;
+        next(&mut alice_rx).await; // welcome, epoch 1
+
+        let (bob, mut bob_rx) = join_e2ee(&engine, code, "bob").await;
+        let welcome = next(&mut bob_rx).await;
+        let ServerMessage::Welcome { e2ee_epoch, .. } = welcome else {
+            panic!("expected welcome, got {welcome:?}");
+        };
+        assert_eq!(e2ee_epoch, 2, "the joiner keys itself for the new epoch");
+        next(&mut alice_rx).await; // bob joined
+        let rotated = next(&mut alice_rx).await;
+        let ServerMessage::E2eeEpoch { epoch } = rotated else {
+            panic!("expected epoch broadcast, got {rotated:?}");
+        };
+        assert_eq!(epoch, 2, "everyone else rotates with the joiner");
+
+        engine.leave(code.into(), bob);
+        next(&mut alice_rx).await; // bob left
+        let rotated = next(&mut alice_rx).await;
+        let ServerMessage::E2eeEpoch { epoch } = rotated else {
+            panic!("expected epoch broadcast, got {rotated:?}");
+        };
+        assert_eq!(epoch, 3, "leavers never hold keys for what follows");
+    }
+
+    #[tokio::test]
+    async fn e2ee_keying_relays_only_to_the_addressee() {
+        let (engine, _keep) = test_engine(8);
+        let code = "ABCD-EFGH-JKLM";
+        let (alice, mut alice_rx) = join_e2ee(&engine, code, "alice").await;
+        let (bob, mut bob_rx) = join_e2ee(&engine, code, "bob").await;
+        let (_carol, mut carol_rx) = join_e2ee(&engine, code, "carol").await;
+        drain(&mut alice_rx);
+        drain(&mut bob_rx);
+        drain(&mut carol_rx);
+
+        engine.e2ee_keying(code.into(), alice, bob, 3, "opaque".into());
+        let msg = next(&mut bob_rx).await;
+        let ServerMessage::E2eeKeying {
+            from,
+            to,
+            epoch,
+            payload,
+        } = msg
+        else {
+            panic!("expected keying relay, got {msg:?}");
+        };
+        assert_eq!(from, alice);
+        assert_eq!(to, bob);
+        assert_eq!(epoch, 3);
+        assert_eq!(payload, "opaque");
+        for rx in [&mut carol_rx, &mut alice_rx] {
+            assert!(
+                matches!(
+                    rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "keying is directed: nobody else sees it"
+            );
+        }
+
+        // A receiver who already left is a silent drop, not an error.
+        engine.leave(code.into(), bob);
+        next(&mut alice_rx).await; // bob left
+        next(&mut alice_rx).await; // the epoch rotated
+        engine.e2ee_keying(code.into(), alice, bob, 4, "late".into());
+        assert!(
+            matches!(
+                alice_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "no echo for the sender, no delivery for the gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2ee_keying_is_ignored_outside_e2ee_meetings() {
+        let (engine, _keep) = test_engine(8);
+        let code = "ABCD-EFGH-JKLM";
+        let (alice, mut alice_rx) = join(&engine, code, "alice").await;
+        let (bob, mut bob_rx) = join(&engine, code, "bob").await;
+        drain(&mut alice_rx);
+        drain(&mut bob_rx);
+
+        // The trust mode is off: keying is meaningless, so it is
+        // dropped without a delivery or an error.
+        engine.e2ee_keying(code.into(), alice, bob, 0, "nope".into());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                bob_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "plaintext meetings never relay keying"
+        );
+
+        // A sender who is not in the room cannot key anyone either.
+        let (carol, mut carol_rx) = join_e2ee(&engine, "MNOP-QRST-UVWX", "carol").await;
+        drain(&mut carol_rx);
+        engine.e2ee_keying(
+            "MNOP-QRST-UVWX".into(),
+            Uuid::new_v4(),
+            carol,
+            1,
+            "x".into(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(
+                carol_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "unknown senders cannot key anyone"
+        );
+    }
+
+    #[tokio::test]
+    async fn recording_is_refused_in_e2ee_meetings() {
+        let (engine, _keep) = test_engine(8);
+        let (_alice, _alice_rx) = join_e2ee(&engine, "ABCD-EFGH-JKLM", "alice").await;
+
+        let refused = engine
+            .start_recording("ABCD-EFGH-JKLM".into(), Arc::new(DropSpy::default()))
+            .await
+            .expect("engine alive");
+        assert_eq!(refused.unwrap_err(), ErrorCode::E2eeActive);
     }
 }
