@@ -1,0 +1,30 @@
+[package]
+name = "huddle-desktop-app"
+description = "Tauri 2 desktop shell around the huddle web client (issue #18, ADR 014)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# This crate requires Tauri's platform system dependencies (webkit2gtk and
+# friends on Linux) and therefore builds ONLY on machines that installed
+# them — the desktop README documents the list. It is intentionally outside
+# the root workspace; the pure logic it shells out to lives in
+# ../core, which builds headlessly everywhere.
+#
+# Versions are pinned exactly (issue #18): the app cannot be compiled on
+# this VM, so conservative, known-good pins are the only honest choice.
+[build-dependencies]
+tauri-build = { version = "=2.7.4", features = [] }
+
+[dependencies]
+huddle-desktop-core = { path = "../core" }
+tauri = { version = "=2.12.5", features = ["tray-icon"] }
+tauri-plugin-http = "=2.8.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = "=0.3.44"
+
+[lints]
+workspace = true

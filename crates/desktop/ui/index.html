@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>huddle</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      main {
+        max-width: 26rem;
+        width: 100%;
+        padding: 2rem;
+        box-sizing: border-box;
+      }
+      h1 {
+        font-size: 1.4rem;
+        margin: 0 0 0.25rem;
+      }
+      p.sub {
+        margin: 0 0 1.5rem;
+        opacity: 0.7;
+        font-size: 0.9rem;
+      }
+      label {
+        display: block;
+        font-size: 0.85rem;
+        margin: 1rem 0 0.25rem;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0.5rem 0.6rem;
+        font-size: 1rem;
+        border-radius: 6px;
+        border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+        background: transparent;
+        color: inherit;
+      }
+      .row {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: 0.5rem;
+      }
+      .row input {
+        flex: 1;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        font-size: 0.9rem;
+        border-radius: 6px;
+        border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+      button.primary {
+        background: color-mix(in srgb, currentColor 90%, transparent);
+        color: color-mix(in srgb, canvas 92%, transparent);
+        border-color: transparent;
+      }
+      #status {
+        margin-top: 0.75rem;
+        font-size: 0.85rem;
+        min-height: 1.2em;
+        opacity: 0.85;
+        white-space: pre-wrap;
+      }
+      hr {
+        border: none;
+        border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+        margin: 1.5rem 0;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>huddle desktop</h1>
+      <p class="sub">
+        The meeting UI is served by your huddle server; this shell remembers
+        where it is and gets you into meetings faster.
+      </p>
+
+      <form id="server-form">
+        <label for="server">Huddle server</label>
+        <input id="server" name="server" placeholder="https://meet.example.com" autocomplete="url" />
+        <div class="row">
+          <button type="submit" class="primary">Connect</button>
+          <button type="button" id="check">Test</button>
+        </div>
+      </form>
+
+      <hr />
+
+      <form id="join-form">
+        <label for="join">Join a meeting</label>
+        <input id="join" name="join" placeholder="Meeting link or code (e.g. H7KD-PM2X-QR4T)" />
+        <div class="row">
+          <button type="submit" class="primary">Join</button>
+        </div>
+      </form>
+
+      <p id="status"></p>
+    </main>
+
+    <script>
+      // withGlobalTauri exposes the IPC bridge on window.__TAURI__ (v2).
+      const { invoke } = window.__TAURI__.core;
+      const status = document.getElementById("status");
+
+      function say(text) {
+        status.textContent = text ?? "";
+      }
+
+      async function init() {
+        try {
+          const settings = await invoke("load_settings");
+          if (settings.server_url) {
+            document.getElementById("server").value = settings.server_url;
+          }
+        } catch (e) {
+          say(String(e));
+        }
+      }
+
+      // Connect: validate, persist, and swap the window to the server UI.
+      document
+        .getElementById("server-form")
+        .addEventListener("submit", async (ev) => {
+          ev.preventDefault();
+          say("Connecting…");
+          try {
+            // Command args are camelCase on this side, snake_case in Rust.
+            await invoke("save_and_connect", {
+              serverUrl: document.getElementById("server").value,
+            });
+            // On success the window navigates to the server's dashboard;
+            // nothing else to do here.
+          } catch (e) {
+            say(String(e));
+          }
+        });
+
+      // Test: reachability probe of /api/health without saving.
+      document.getElementById("check").addEventListener("click", async () => {
+        say("Checking…");
+        try {
+          const result = await invoke("check_server", {
+            serverUrl: document.getElementById("server").value,
+          });
+          say((result.ok ? "Reachable — " : "Not reachable — ") + result.detail);
+        } catch (e) {
+          say(String(e));
+        }
+      });
+
+      // Join: full link or bare code (bare codes need a configured server).
+      document.getElementById("join-form").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        say("");
+        try {
+          await invoke("join_by_link", {
+            input: document.getElementById("join").value,
+          });
+          // On success the window navigates to the meeting's join page.
+        } catch (e) {
+          say(String(e));
+        }
+      });
+
+      init();
+    </script>
+  </body>
+</html>

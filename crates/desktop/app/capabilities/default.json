@@ -1,0 +1,7 @@
+{
+  "identifier": "default",
+  "description": "The shell's own home page (server settings, join-by-link) may invoke the app's custom commands and the core defaults. `local` is deliberately true and no `remote` entries exist: pages loaded from the huddle server origin get NO access to Tauri IPC — the web client needs none (it talks to the server directly), and not granting it is the security boundary (ADR 014).",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

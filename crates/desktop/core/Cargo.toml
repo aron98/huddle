@@ -1,0 +1,19 @@
+[package]
+name = "huddle-desktop-core"
+description = "Pure, headlessly-testable logic for the huddle desktop shell: settings, server-URL validation, join-link parsing, tray/menu model, meeting selection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Zero Tauri/system dependencies by design (issue #18): everything in this
+# crate compiles and tests on a bare headless runner, and CI exercises it
+# without any webkit2gtk packages.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["serde-well-known"] }
+
+[lints]
+workspace = true

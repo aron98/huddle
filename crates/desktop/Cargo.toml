@@ -1,0 +1,32 @@
+# Standalone workspace for the Tauri desktop shell (issue #18, ADR 014).
+#
+# This workspace is intentionally EXCLUDED from the root Cargo workspace
+# (root Cargo.toml `exclude = ["crates/desktop"]`): the `app` member needs
+# Tauri's platform system deps (webkit2gtk on Linux and friends), which this
+# VM and the ubuntu PR CI runners do not install. The four root gates
+# (fmt/clippy/test/wasm-clippy) therefore never see this tree, while the
+# `core` member — pure logic with zero Tauri deps — stays headlessly
+# testable everywhere (`cargo test -p huddle-desktop-core` from here).
+[workspace]
+resolver = "3"
+members = ["core", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/aron98/huddle"
+
+# Mirror the root workspace's lint posture so the same discipline applies
+# when the desktop workspace is built on capable machines (release CI).
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+dbg_macro = "warn"
+
+[profile.release]
+lto = "thin"
+strip = true
