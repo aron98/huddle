@@ -1,0 +1,63 @@
+# Container image publishing: on a pushed v* tag, build the release image
+# (Dockerfile.release — musl static binary with the web client baked in, on
+# alpine) and push it to ghcr.io/aron98/huddle. The compose guide
+# (deploy/compose/) and the Helm chart (deploy/helm/) consume this image.
+#
+# Tag strategy: the git tag minus the leading v (v1.2.3 -> 1.2.3), matching
+# the release tarball naming (huddle-1.2.3-x86_64-unknown-linux-musl.tar.gz)
+# and the Helm chart's appVersion convention, plus `latest` on the same
+# push.
+#
+# linux/amd64 only, on purpose: arm64 would run the whole rust + trunk
+# toolchain under QEMU emulation — hours per release build with no usable
+# cache. Revisit when CI has native arm64 runners or the project adopts
+# cross-compiled artifacts.
+#
+# No build cache configured: this workflow only runs on release tags, where
+# every source layer has changed since the previous tag and the expensive
+# layers (cargo build, trunk wasm build) can never hit; a gha cache would
+# only save the cheap base/apk layers at the cost of cache churn.
+
+name: release-image
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: build and push ghcr image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: compute image tags
+        id: tags
+        env:
+          # GHCR requires lowercase repository names; ${var,,} lowercases
+          # (a no-op for this repo's owner).
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "tags=ghcr.io/${OWNER,,}/huddle:${version},ghcr.io/${OWNER,,}/huddle:latest" >> "$GITHUB_OUTPUT"
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          file: Dockerfile.release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}

@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+
+# Release image for ghcr.io/aron98/huddle, built and pushed on v* tags by
+# .github/workflows/release-image.yml. This is the Docker form of the
+# release pipeline (release.yml): same alpine rust image, same trunk pin,
+# web client built to wasm with trunk and baked into the binary via
+# rust-embed (ADR 004), then the fully static musl binary dropped onto a
+# bare alpine runtime.
+#
+# Why a second Dockerfile instead of reusing the root one: the root
+# `Dockerfile` is the local-build flow — glibc toolchain on
+# rust:1.96-slim-bookworm, debian:bookworm-slim runtime. The published
+# image follows the release pipeline instead (rust:1.96.0-alpine, musl):
+# the runtime layer is roughly half the size and the binary carries no
+# dynamic-loader dependency at all, same trade-off as the release tarball.
+# Keep the rust version and trunk pin in sync with release.yml and the
+# root Dockerfile when bumping.
+#
+# Local build: `docker build -f Dockerfile.release -t huddle:musl .`
+# (amd64 host: the trunk binary below is the x86_64 musl build).
+
+# --- builder: web client + musl static server binary ----------------------
+FROM rust:1.96.0-alpine AS build
+
+# aws-lc-sys needs cmake + perl; build-base is gcc/musl-dev/make (also
+# links the native build scripts of the wasm build); ca-certificates for
+# rustup. Mirrors the "install build deps" step of release.yml.
+RUN apk add --no-cache build-base cmake perl ca-certificates
+
+RUN rustup target add wasm32-unknown-unknown
+
+# Trunk from the upstream release (mirrors the pinned version in CI).
+ADD https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-musl.tar.gz /tmp/trunk.tar.gz
+RUN tar -xzf /tmp/trunk.tar.gz -C /usr/local/bin && rm /tmp/trunk.tar.gz
+
+WORKDIR /build
+COPY . .
+RUN cd crates/web && trunk build --release
+
+# Bake the freshly built web bundle into the binary (rust-embed), same
+# sequence as release.yml.
+RUN cp -r crates/web/dist/. crates/server/assets/ \
+    && cargo build --release --bin huddle
+
+# --- runtime -------------------------------------------------------------
+FROM alpine:3.22 AS runtime
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=build /build/target/release/huddle /usr/local/bin/huddle
+
+ENV HUDDLE_BIND=0.0.0.0:3000 \
+    HUDDLE_DATA_DIR=/data
+
+VOLUME /data
+EXPOSE 3000
+
+ENTRYPOINT ["huddle"]
