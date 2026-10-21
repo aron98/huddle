@@ -420,10 +420,15 @@ Details and trade-offs: [ADR 013](docs/adr/013-agent-access-oauth-device-flow.md
 
 ### Docker / Kubernetes
 
-Docker: `docker build -t huddle .` produces the single-binary image. For
-production use the [secure-by-default compose stack](deploy/compose/) (huddle +
-coturn, guide: [docs/deploy/docker-compose.md](docs/deploy/docker-compose.md));
-the root `docker-compose.yml` is a hot-reloading *dev* stack.
+Docker: every release tag is published as a container image —
+`ghcr.io/aron98/huddle:<version>` (amd64; alpine + the static musl binary with
+the web client baked in, built from [`Dockerfile.release`](Dockerfile.release)).
+The [secure-by-default compose stack](deploy/compose/) consumes it by default
+(huddle + coturn, guide:
+[docs/deploy/docker-compose.md](docs/deploy/docker-compose.md)); the root
+`docker-compose.yml` is a hot-reloading *dev* stack. Self-hosters who prefer
+building can still `docker build -t huddle .` from the root `Dockerfile`
+(glibc/debian variant).
 
 Kubernetes: the [Helm chart](deploy/helm/huddle) deploys one pod with the web
 client embedded in the binary. It defaults to host networking because a k8s
@@ -445,7 +450,9 @@ For TURN over TLS on the sidecar/host coturn, see the
 
 Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
-(+ sha256) to the GitHub release. The same tag also builds **unsigned**
+(+ sha256) to the GitHub release. The same tag also publishes the container
+image `ghcr.io/aron98/huddle:<version>` (+ `latest`, linux/amd64 only — see
+`Dockerfile.release`) and builds **unsigned**
 desktop installers (Windows exe, macOS dmg, Linux AppImage/deb) from
 [`electron/`](electron/) — see [ADR 014](docs/adr/014-desktop-shell-electron.md)
 and [electron/README.md](electron/README.md).
