@@ -4,7 +4,7 @@ description: "Self-hosted video meetings: a single Rust binary serving web, sign
 annotations:
   licenses: Apache-2.0
 type: application
-version: 0.2.0
+version: 0.3.0
 appVersion: "0.1.0"
 home: https://github.com/aron98/huddle
 sources:

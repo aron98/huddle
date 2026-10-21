@@ -98,13 +98,18 @@ helm install cert-manager jetstack/cert-manager \
 
 ## 2. Secrets
 
-The session secret (HMAC key for stateless session cookies) belongs in a Secret —
-the chart consumes it via `existingSecret`:
+The session secret (HMAC key for stateless session cookies) belongs in a Secret.
+The production path is `existingSecret` — a Secret created out-of-band:
 
 ```sh
 kubectl create secret generic huddle-session \
   --from-literal=HUDDLE_SESSION_SECRET="$(openssl rand -hex 32)"
 ```
+
+For quick setups, setting `server.sessionSecret` makes the chart create the
+`<fullname>-secret` Secret for you — but the value then sits in your values
+file or `--set` history, so prefer `existingSecret` in production (see the
+[chart README](../../deploy/helm/huddle/README.md)).
 
 TURN credentials also belong in a Secret — mounted by coturn in step 5, and fed
 to huddle via the chart's `extraEnvFrom` knob so `HUDDLE_TURN_SHARED_SECRET`
