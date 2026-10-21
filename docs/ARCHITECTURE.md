@@ -7,7 +7,7 @@ work is tracked in the [post-MVP milestone](https://github.com/aron98/huddle/mil
 
 **Goals**
 - Lightweight: single static binary, ~tens of MB; idle RAM well under 100 MB for a handful of rooms.
-- Self-hostable with minimal ops: binary + SQLite file + coturn + TLS proxy. Docker-compose for the lazy path.
+- Self-hostable with minimal ops: binary + SQLite file + coturn + built-in TLS (rustls + ACME — [ADR 008](adr/008-built-in-tls-termination.md)). Docker-compose for the lazy path.
 - Performant multi-party meetings: SFU topology, no transcoding.
 - Modern web-first client in Rust/WASM.
 
@@ -144,7 +144,7 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 
 | Target | Shape |
 |---|---|
-| Own VPS (primary) | Single binary + SQLite + coturn + Caddy/TLS. `docker-compose.yml` provided. |
+| Own VPS (primary) | Single binary + SQLite + coturn, HTTPS terminated by the binary itself (rustls, Let's Encrypt via ACME — [ADR 008](adr/008-built-in-tls-termination.md)). A reverse proxy is an optional extra, no longer required. `docker-compose.yml` provided. |
 | AWS | EC2 or Fargate task + ALB (WebSocket-aware), coturn sidecar on the same host (must see its public IP in ICE candidates). |
 | Kubernetes | Helm chart (post-MVP hardening phase). |
 | Cloudflare | Not a primary target: full self-host keeps the media path open for E2EE. A Workers/D1 signaling port remains possible later. |
@@ -153,8 +153,8 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 443 | TCP | HTTPS + WebSocket signaling |
-| 3478 | UDP/TCP | coturn STUN/TURN |
+| 443 | TCP | HTTPS + WebSocket signaling (terminated by the binary in TLS mode — [ADR 008](adr/008-built-in-tls-termination.md)) |
+| 3478 | UDP/TCP | coturn STUN/TURN (5349 TCP additionally, if TURN over TLS is enabled) |
 | 49160–49200 | UDP | coturn TURN relay allocations |
 | 40000 (config) | UDP | SFU media (single ICE port) |
 
@@ -177,6 +177,7 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 ## Security
 
 - Media is always DTLS-SRTP (handled by the stack).
+- TLS: HTTPS/WSS terminated in-process by rustls ([ADR 008](adr/008-built-in-tls-termination.md)); in TLS mode responses carry HSTS and session cookies are marked `Secure`.
 - Organizers: magic-link tokens hashed at rest, short TTL; session cookie.
 - Meeting links are capabilities; per-meeting passcodes post-MVP.
 - Rate-limit join attempts + WS message size caps.

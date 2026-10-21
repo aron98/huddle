@@ -31,7 +31,8 @@ server:
   publicIp: ""
   mediaPort: 40000
   # ICE servers advertised to clients in addition to the SFU itself —
-  # point this at your coturn.
+  # point this at your coturn. For a coturn with TURN over TLS enabled,
+  # see the deploy/turn/turnserver.conf template (turns:...:5349 URLs).
   iceServers: ""
   sessionSecret: "" # set via --set or an existingSecret; random per boot otherwise
 
