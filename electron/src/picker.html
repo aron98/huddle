@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Choose what to share</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.4 system-ui, -apple-system, sans-serif;
+      background: #1e293b;
+      color: #e2e8f0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.9rem 1.2rem;
+      border-bottom: 1px solid #334155;
+    }
+    h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+    #audio-row {
+      display: none; /* shown by JS when the OS supports loopback audio */
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.85rem;
+      color: #94a3b8;
+      white-space: nowrap;
+    }
+    #audio-row[data-supported] { display: flex; }
+    #grid {
+      flex: 1;
+      overflow-y: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+      gap: 0.8rem;
+      padding: 1rem;
+      align-content: start;
+    }
+    .tile {
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      padding: 0;
+      background: #0f172a;
+      border: 2px solid transparent;
+      border-radius: 0.6rem;
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+      overflow: hidden;
+    }
+    .tile:hover, .tile:focus-visible { border-color: #0d9488; outline: none; }
+    .tile img {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+      background: #000;
+    }
+    .tile .name {
+      padding: 0 0.6rem 0.5rem;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    footer {
+      padding: 0.6rem 1.2rem;
+      border-top: 1px solid #334155;
+      font-size: 0.8rem;
+      color: #64748b;
+      display: flex;
+      justify-content: space-between;
+    }
+    #empty { padding: 2rem; color: #94a3b8; display: none; }
+    #empty[data-visible] { display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Choose what to share</h1>
+    <label id="audio-row"><input type="checkbox" id="audio"> Share computer audio</label>
+  </header>
+  <div id="grid"></div>
+  <div id="empty">No screens or windows are available to share.</div>
+  <footer>
+    <span>Click to share. Esc to cancel.</span>
+  </footer>
+  <script src="picker.js"></script>
+</body>
+</html>

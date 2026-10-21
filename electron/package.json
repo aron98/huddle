@@ -1,0 +1,20 @@
+{
+  "name": "huddle-desktop",
+  "productName": "Huddle",
+  "version": "0.1.0",
+  "description": "Huddle desktop shell (Electron) — loads the Huddle server's web client.",
+  "private": true,
+  "main": "src/main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "check": "node scripts/check-syntax.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "icons": "node scripts/make-icons.mjs",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "45.0.0",
+    "electron-builder": "26.15.3"
+  }
+}

@@ -1,0 +1,44 @@
+# electron-builder configuration for the Huddle desktop shell.
+# Built by .github/workflows/release-desktop.yml on v* tags, one matrix
+# job per OS, artifacts attached to the GitHub release. No code signing:
+# builds are unsigned and the release notes say so.
+
+appId: io.github.aron98.huddle
+productName: Huddle
+copyright: Apache-2.0
+
+directories:
+  output: dist
+  buildResources: build
+
+# Everything the runtime needs lives in src/ + build/ icons; there are no
+# production npm dependencies (the client is loaded from the server).
+files:
+  - src/**/*
+  - build/icon.png
+  - build/trayTemplate.png
+
+asar: true
+icon: build/icon.png
+artifactName: huddle-${version}-${os}-${arch}.${ext}
+
+win:
+  target: nsis
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+
+mac:
+  target: dmg
+  category: public.app-category.video-conferencing
+  # Unsigned: CI sets CSC_IDENTITY_AUTO_DISCOVERY=false so electron-builder
+  # does not probe for a developer certificate.
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Network
+  synopsis: Huddle video meetings
+  description: Desktop shell for Huddle — loads the web client served by a self-hosted Huddle server.
