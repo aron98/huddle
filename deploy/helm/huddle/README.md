@@ -106,3 +106,12 @@ extraEnvFrom:
 
 > If you set `fullnameOverride`, the generated Secret is named
 > `<fullnameOverride>-extra-secret` — reference that name in `extraEnvFrom`.
+
+## Chart versioning
+
+The chart is consumed from the repo's `main` branch, never from release tags.
+`appVersion` is updated automatically on every pushed `v*` tag by
+`.github/workflows/chart-sync.yml` (which also minor-bumps the chart
+`version`, lints, and pushes the commit to `main` right after the release):
+the default-branch chart always references the newest published image,
+tagged by `release-image.yml` as the git tag minus the leading `v`.

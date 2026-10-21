@@ -85,6 +85,7 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 ## Deployment / infra
 
 - Helm chart `deploy/helm/huddle` — linted in CI; hostNetwork by default (a k8s Service cannot proxy SFU UDP for ICE).
+- Chart `appVersion`/`version` are auto-synced on `v*` tags by `.github/workflows/chart-sync.yml` (bot commit to `main`; image tag = git tag minus the leading `v`, published by `release-image.yml`).
 - Release workflow on `v*` tags: alpine musl static binary with the web client **baked in** via rust-embed (`crates/web/dist` → `crates/server/assets`).
 - Trunk **release** builds need `data-wasm-opt-params="--enable-bulk-memory-opt"` (already on the rust link in `index.html`) — trunk's pinned binaryen rejects `memory.copy` without it; debug builds skip wasm-opt.
 

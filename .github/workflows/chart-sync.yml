@@ -1,0 +1,87 @@
+# Helm chart appVersion sync (issue #71): the chart's default image tag is
+# .Chart.AppVersion, but app releases only publish container images on v*
+# tags (release-image.yml, tag minus the leading v). This workflow keeps the
+# two glued together: on every pushed v* tag it sets the chart's appVersion
+# to the new version, minor-bumps the chart version, lints, and pushes a
+# bot commit to main.
+#
+# Why the commit lands after the tag: the chart is consumed from main, never
+# from the tag, so the sync makes main's chart reference the just-published
+# image. A fresh checkout of main always defaults to a real image tag.
+#
+# The concurrency group serializes back-to-back tags (e.g. a hotfix right
+# after a release): each queued run re-reads main, and the guards in the
+# bump step make re-runs idempotent (skip when already synced) and refuse
+# to roll the chart back (a re-pushed older tag never downgrades appVersion).
+
+name: chart-sync
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: chart-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: sync Chart.yaml to the release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # The chart rides main; the tag's tree is frozen history.
+          ref: main
+
+      # yq edits YAML without sed-style line surgery; pinned to a release,
+      # installed like trunk in ci.yml (binary from the GitHub release).
+      - name: install yq
+        run: |
+          curl -fsSL -o yq \
+            https://github.com/mikefarah/yq/releases/download/v4.54.1/yq_linux_amd64
+          sudo install -m 0755 yq /usr/local/bin/yq
+
+      - name: bump appVersion and chart version
+        run: |
+          chart=deploy/helm/huddle/Chart.yaml
+          export version="${GITHUB_REF_NAME#v}"
+          current="$(yq '.appVersion' "$chart")"
+          if [ "$current" = "$version" ]; then
+            echo "appVersion is already $version — nothing to sync"
+            exit 0
+          fi
+          if [ "$(printf '%s\n%s\n' "$current" "$version" | sort -V | tail -1)" = "$current" ]; then
+            echo "chart appVersion $current is newer than $version — not downgrading"
+            exit 0
+          fi
+          major="$(yq '.version' "$chart" | cut -d. -f1)"
+          minor="$(yq '.version' "$chart" | cut -d. -f2)"
+          yq -i '.appVersion = strenv(version)' "$chart"
+          yq -i ".version = \"${major}.$((minor + 1)).0\"" "$chart"
+          echo "appVersion $current -> $version, chart version -> ${major}.$((minor + 1)).0"
+
+      # The bot push with GITHUB_TOKEN does not re-trigger ci.yml, so lint
+      # here to keep the sync commit green by the repo's own standard.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: helm lint
+        run: helm lint deploy/helm/huddle
+
+      - name: commit and push
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if git diff --quiet; then
+            echo "nothing to commit — chart already synced"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/helm/huddle/Chart.yaml
+          git commit -m "chore(helm): sync chart appVersion to ${version}"
+          git push origin HEAD:main
