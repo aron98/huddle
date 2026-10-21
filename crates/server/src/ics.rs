@@ -49,7 +49,13 @@ pub fn build_ics(
             .collect::<Result<Vec<_>, _>>()?;
         lines.push(format!("EXDATE:{}", dates.join(",")));
     }
-    lines.push(format!("SUMMARY:{}", escape_ics_text(&meeting.title)));
+    // Issue #29: calendar software cannot decrypt client-side encrypted
+    // titles, so the export degrades honestly to the masked label
+    // instead of leaking the ciphertext blob into users' calendars.
+    lines.push(format!(
+        "SUMMARY:{}",
+        escape_ics_text(huddle_protocol::display_title(&meeting.title))
+    ));
     lines.push(format!(
         "URL:{base}/m/{code}",
         base = base_url.trim_end_matches('/'),
@@ -96,6 +102,7 @@ mod tests {
             created_at: datetime!(2025-12-30 12:00 UTC),
             repeat: None,
             passcode: None,
+            e2ee: false,
         }
     }
 

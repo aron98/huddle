@@ -377,6 +377,19 @@ async fn start_recording(
     let organizer = auth::session_organizer(&state, &headers);
     let started_by = organizer.map(|o| o.id);
 
+    // Interlock (ADR 010): E2EE meetings never record. The trust modes
+    // are visibly exclusive by design — refused before any recording
+    // row or sink exists.
+    if meeting.e2ee {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            ApiError {
+                code: ErrorCode::E2eeActive,
+                message: "end-to-end encrypted meetings cannot be recorded".into(),
+            },
+        ));
+    }
+
     let recording_id = Uuid::new_v4();
     recording::insert_row(state.pool(), recording_id, meeting.id, started_by)
         .await
@@ -431,6 +444,7 @@ async fn start_recording(
             let message = match code {
                 ErrorCode::RecordingActive => "a recording is already active",
                 ErrorCode::MeetingNotLive => "the meeting has no live participants to record",
+                ErrorCode::E2eeActive => "end-to-end encrypted meetings cannot be recorded",
                 _ => "cannot start recording",
             };
             tracing::debug!("recording start refused: {code:?}");
@@ -1960,6 +1974,32 @@ mod tests {
         created.meeting
     }
 
+    /// Like [`create_owned_meeting`], but in E2EE trust mode.
+    async fn create_owned_e2ee_meeting(app: &Router, cookie: &str) -> huddle_protocol::MeetingDto {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "E2EE sync",
+            "starts_at": (now).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(60)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "e2ee": true,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        created.meeting
+    }
+
     async fn request_recording(
         app: &Router,
         method: &str,
@@ -2003,6 +2043,215 @@ mod tests {
         // Unknown meeting: 404, not 403 or 409.
         let (status, _) = request_recording(&app, "POST", "ZZZZ-ZZZZ-ZZZZ", Some(&alice)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recording_interlock_refuses_e2ee_meetings() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let meeting = create_owned_e2ee_meeting(&app, &alice).await;
+        assert!(meeting.e2ee, "creation honored the e2ee flag");
+        let code = meeting.code.clone();
+
+        // Even with a live participant the interlock holds.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .engine()
+            .join(Uuid::new_v4(), "alice".into(), meeting.clone(), out_tx)
+            .await
+            .expect("engine alive")
+            .expect("join accepted");
+
+        let (status, body) = request_recording(&app, "POST", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert!(body.contains("e2ee_active"), "body: {body}");
+
+        // Nothing half-started lingers behind the refusal.
+        let (status, _) = request_recording(&app, "GET", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // --- encrypted titles (issue 29) ----------------------------------------
+
+    /// Create an owned E2EE meeting whose title is a client-side encrypted
+    /// blob, the way the organizer's browser sends it.
+    async fn create_owned_encrypted_title_meeting(
+        app: &Router,
+        cookie: &str,
+        blob: &str,
+    ) -> huddle_protocol::MeetingDto {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": blob,
+            "starts_at": (now).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(60)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "e2ee": true,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        created.meeting
+    }
+
+    #[tokio::test]
+    async fn encrypted_titles_are_masked_in_api_responses_and_stored_as_ciphertext() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+
+        // A self-describing blob (prefix + base64), opaque to the server.
+        let blob = format!(
+            "{}{}",
+            huddle_protocol::ENCRYPTED_TITLE_PREFIX,
+            base64_of_title()
+        );
+        let created = create_owned_encrypted_title_meeting(&app, &alice, &blob).await;
+
+        // The API never echoes the blob as the title — viewers get the
+        // masked label, and the blob rides the additive field.
+        assert_eq!(created.title, huddle_protocol::MASKED_TITLE);
+        assert_eq!(created.title_ciphertext.as_deref(), Some(blob.as_str()));
+        assert!(created.e2ee, "encrypted titles imply the E2EE trust mode");
+
+        // At rest: the row holds the blob, nothing else.
+        let stored = meetings::get_by_code(state.pool(), &created.code)
+            .await
+            .expect("meeting exists")
+            .expect("row present");
+        assert_eq!(stored.title, blob, "ciphertext at rest");
+        assert!(huddle_protocol::is_encrypted_title(&stored.title));
+
+        // Re-fetching over the API masks again (get-by-code path).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/meetings/{}", created.code))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let fetched: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(fetched.meeting.title, huddle_protocol::MASKED_TITLE);
+        assert_eq!(
+            fetched.meeting.title_ciphertext.as_deref(),
+            Some(blob.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_titles_mask_in_ics_export() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let blob = format!(
+            "{}{}",
+            huddle_protocol::ENCRYPTED_TITLE_PREFIX,
+            base64_of_title()
+        );
+        let created = create_owned_encrypted_title_meeting(&app, &alice, &blob).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::get(format!("/api/meetings/{}/ics", created.code))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let ics = String::from_utf8_lossy(&bytes);
+        assert!(
+            ics.contains(&format!("SUMMARY:{}", huddle_protocol::MASKED_TITLE)),
+            "ics masks the encrypted title: {ics}"
+        );
+        assert!(
+            !ics.contains(&blob),
+            "no ciphertext blob in calendars: {ics}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_meetings_are_unchanged_by_title_encryption() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let (status, body) = create_meeting_via(app, "Standup").await;
+        assert_eq!(status, StatusCode::CREATED, "body: {body}");
+        let created: MeetingResponse = serde_json::from_str(&body).unwrap();
+
+        // Plaintext meetings keep their title and carry no blob.
+        assert_eq!(created.meeting.title, "Standup");
+        assert_eq!(created.meeting.title_ciphertext, None);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap()
+                .pointer("/meeting/title_ciphertext")
+                .is_none(),
+            "the field is skipped, not null"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_accepts_an_encrypted_title_blob() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let meeting = create_owned_e2ee_meeting(&app, &alice).await;
+        let blob = format!(
+            "{}{}",
+            huddle_protocol::ENCRYPTED_TITLE_PREFIX,
+            base64_of_title()
+        );
+
+        // Renaming to a blob: the server validates it as an encrypted title
+        // (no plaintext shape checks) and stores it verbatim.
+        let patch = serde_json::json!({ "title": blob });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::patch(format!("/api/meetings/{}", meeting.code))
+                    .header(header::COOKIE, &alice)
+                    .header("content-type", "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "encrypted rename accepted"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let updated: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(updated.meeting.title, huddle_protocol::MASKED_TITLE);
+        assert_eq!(
+            updated.meeting.title_ciphertext.as_deref(),
+            Some(blob.as_str())
+        );
+    }
+
+    /// A deterministic stand-in for the base64 payload the browser would
+    /// produce (12-byte nonce ‖ ciphertext ‖ tag). The server treats it
+    /// as opaque; only the marker prefix and length matter here.
+    fn base64_of_title() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode([42u8; 44])
     }
 
     #[tokio::test]

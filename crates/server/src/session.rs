@@ -30,6 +30,12 @@ use crate::state::AppState;
 /// defaults would let one connection hold hundreds of MB hostage.
 const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 
+/// Cap for one E2EE keying payload (ADR 010): the wire form is base64,
+/// so ~22 K characters bound the ~16 KiB of raw ciphertext (a sender
+/// key share) that ever needs to travel. Larger blobs are refused —
+/// they cannot be legitimate keying.
+const MAX_KEYING_PAYLOAD: usize = 22 * 1024;
+
 /// Entry point for the `/ws` route.
 pub async fn ws(
     State(state): State<AppState>,
@@ -151,6 +157,21 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     }
                     ClientMessage::LayerPreference { origin, layer } => {
                         engine.layer_preference(code.clone(), id, origin, layer);
+                    }
+                    // Opaque ciphertext to this server (ADR 010):
+                    // size-capped, never inspected, never persisted;
+                    // the engine relays it only to the addressee.
+                    ClientMessage::E2eeKeying { to, epoch, payload } => {
+                        if payload.len() > MAX_KEYING_PAYLOAD {
+                            send_error(
+                                &mut sender,
+                                ErrorCode::InvalidMessage,
+                                "keying payload too large",
+                            )
+                            .await;
+                            continue;
+                        }
+                        engine.e2ee_keying(code.clone(), id, to, epoch, payload);
                     }
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
@@ -430,6 +451,7 @@ mod tests {
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: None,
                 passcode,
+                e2ee: false,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -452,6 +474,7 @@ mod tests {
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: Some(rule),
                 passcode: None,
+                e2ee: false,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -1171,6 +1194,97 @@ mod tests {
         alice.pump.stop();
         bob.pump.stop();
         carol.pump.stop();
+    }
+
+    // ------------------------------------------------------------------
+    // E2EE chat (issue 28).
+    // ------------------------------------------------------------------
+
+    /// In an E2EE meeting, chat bodies are client-encrypted envelopes
+    /// (base64 of `0x04 ‖ nonce ‖ ciphertext`, ADR 011 D7). The
+    /// server must treat them as opaque: relay byte-identical to
+    /// every participant and persist them verbatim — never inspect,
+    /// re-encode, or trim. This pins that contract.
+    #[tokio::test]
+    async fn e2ee_chat_bodies_relay_and_persist_verbatim() {
+        let server = TestServer::start().await;
+
+        let now = OffsetDateTime::now_utc();
+        let req = CreateMeetingRequest {
+            title: "E2EE test call".into(),
+            starts_at: now,
+            ends_at: now + time::Duration::minutes(60),
+            repeat: None,
+            passcode: None,
+            e2ee: true,
+        };
+        let code = meetings::create(server.state.pool(), &req, None, now)
+            .await
+            .unwrap()
+            .code;
+
+        let mut alice = TestClient::connect(&server, &code, "alice").await;
+        let mut bob = TestClient::connect(&server, &code, "bob").await;
+        let msg = alice.next_server_message().await; // bob joined
+        assert!(matches!(msg, ServerMessage::ParticipantJoined { .. }));
+
+        // A realistic e2ee chat envelope: tag 0x04, a 12-byte nonce,
+        // and some "ciphertext". The bytes are meaningless to the
+        // server — that is the point.
+        let mut envelope = vec![0x04];
+        envelope.extend_from_slice(&[0u8; 12]); // nonce
+        envelope.extend((0u8..40).collect::<Vec<u8>>()); // ciphertext
+        use base64::Engine as _;
+        let body = base64::engine::general_purpose::STANDARD.encode(&envelope);
+
+        alice
+            .send_client(&ClientMessage::Chat { body: body.clone() })
+            .await;
+
+        // Both participants get the exact same bytes back. E2EE
+        // meetings also fan out E2eeEpoch frames on joins, so the
+        // relay assertion has to skip past them.
+        let sender_id = alice.you;
+        for client in [&mut alice, &mut bob] {
+            let msg = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let msg = client.next_server_message().await;
+                    match msg {
+                        ServerMessage::Chat { .. } => break msg,
+                        ServerMessage::ParticipantJoined { .. }
+                        | ServerMessage::E2eeEpoch { .. } => continue,
+                        other => panic!("unexpected {other:?}"),
+                    }
+                }
+            })
+            .await
+            .expect("chat relay within 5s");
+            let ServerMessage::Chat { message } = msg else {
+                unreachable!("loop only breaks on chat")
+            };
+            assert_eq!(message.body, body, "relay must be byte-identical");
+            assert_eq!(message.sender_id, Some(sender_id));
+        }
+
+        // And the stored copy round-trips through history unchanged.
+        // The session persists before relaying, so durability is
+        // already guaranteed once bob received the message above.
+        let meeting = meetings::get_by_code(server.state.pool(), &code)
+            .await
+            .unwrap()
+            .unwrap();
+        let stored = chat::history(server.state.pool(), meeting.id)
+            .await
+            .unwrap();
+        let message = stored
+            .iter()
+            .find(|m| m.body == body)
+            .expect("the envelope must be persisted verbatim");
+        assert_eq!(message.sender_id, Some(alice.you));
+        assert_eq!(message.sender_name, "alice");
+
+        alice.pump.stop();
+        bob.pump.stop();
     }
 
     #[tokio::test]

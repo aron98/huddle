@@ -25,6 +25,21 @@ pub struct MeetingDto {
     /// never sent over the wire — only this flag is.
     #[serde(default)]
     pub has_passcode: bool,
+    /// Whether the meeting is end-to-end encrypted (issue #27): media
+    /// keys live only on the participants' clients and the server relays
+    /// ciphertext. Set at creation; not changeable afterwards.
+    #[serde(default)]
+    pub e2ee: bool,
+    /// The client-side encrypted title blob (issue #29) for E2EE
+    /// meetings: `"<ENCRYPTED_TITLE_PREFIX>" + base64(nonce ‖ AES-GCM
+    /// ciphertext)`, sealed by the creating client to the organizer's
+    /// identity key. Present only when the stored title is encrypted;
+    /// in that case [`MeetingDto::title`] carries the masked label and
+    /// clients that can decrypt replace it locally. `None` for plaintext
+    /// meetings and for old servers — additive, so legacy payloads
+    /// parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_ciphertext: Option<String>,
 }
 
 /// Curated recurrence frequencies for recurring meetings (issue 16). A
@@ -127,6 +142,12 @@ pub struct CreateMeetingRequest {
     /// in constant time. Absent or `null` means no passcode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passcode: Option<String>,
+    /// Create the meeting in end-to-end encrypted mode (issue #27): the
+    /// clients exchange media keys pairwise and the server only ever
+    /// relays ciphertext — which also means the meeting cannot be
+    /// recorded (ADR 010's interlock). Absent means a plaintext meeting.
+    #[serde(default)]
+    pub e2ee: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -218,13 +239,7 @@ impl CreateMeetingRequest {
     /// Pure validation, shared by server and client so the form can show
     /// the same errors the API would return.
     pub fn validate(&self) -> Result<(), &'static str> {
-        let title = self.title.trim();
-        if title.is_empty() {
-            return Err("title must not be empty");
-        }
-        if title.len() > 200 {
-            return Err("title must be at most 200 characters");
-        }
+        validate_title(&self.title)?;
         if self.ends_at <= self.starts_at {
             return Err("ends_at must be after starts_at");
         }
@@ -236,6 +251,66 @@ impl CreateMeetingRequest {
         }
         Ok(())
     }
+}
+
+/// Maximum plaintext title length, shared by create and update
+/// validation. The client enforces this *before* encrypting.
+pub const TITLE_MAX_LEN: usize = 200;
+
+/// Marker prefix of a client-side encrypted title in the `title`
+/// column (issue #29). The stored string is self-describing: servers
+/// and old clients can tell an encrypted title from a plaintext one
+/// without a schema change or an extra flag.
+pub const ENCRYPTED_TITLE_PREFIX: &str = "enc1.";
+
+/// Upper bound for an encrypted title blob (prefix + base64 of a
+/// 12-byte nonce, the ciphertext, and a 16-byte tag). Ample headroom
+/// over the 200-character plaintext cap.
+pub const ENCRYPTED_TITLE_MAX_LEN: usize = 2048;
+
+/// What the server reports as a meeting's title when the stored title
+/// is encrypted and cannot be decrypted for the viewer: UIs and the
+/// ICS export show this instead of ever rendering ciphertext.
+pub const MASKED_TITLE: &str = "Encrypted meeting";
+
+/// Whether a stored title string is a client-side encrypted blob
+/// rather than plaintext.
+pub fn is_encrypted_title(title: &str) -> bool {
+    title.starts_with(ENCRYPTED_TITLE_PREFIX)
+}
+
+/// The title to display for a stored title string: the masked label
+/// for encrypted blobs (only the organizer's own client can decrypt
+/// those), the title itself for plaintext meetings.
+pub fn display_title(title: &str) -> &str {
+    if is_encrypted_title(title) {
+        MASKED_TITLE
+    } else {
+        title
+    }
+}
+
+/// Validate a title, plaintext or encrypted (issue #29): plaintext
+/// titles must be trimmed, non-empty and at most [`TITLE_MAX_LEN`]
+/// characters; encrypted blobs must fit [`ENCRYPTED_TITLE_MAX_LEN`]
+/// (the plaintext inside was validated by the client *before*
+/// sealing, so the server only bounds the stored size). Shared by
+/// the create request and the server's update path.
+pub fn validate_title(title: &str) -> Result<(), &'static str> {
+    if is_encrypted_title(title) {
+        if title.len() > ENCRYPTED_TITLE_MAX_LEN {
+            return Err("encrypted title must be at most 2048 characters");
+        }
+        return Ok(());
+    }
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("title must not be empty");
+    }
+    if trimmed.len() > TITLE_MAX_LEN {
+        return Err("title must be at most 200 characters");
+    }
+    Ok(())
 }
 
 /// Maximum passcode length, shared by create and update validation.
@@ -305,6 +380,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH,
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert_eq!(req.validate(), Err("title must not be empty"));
     }
@@ -317,6 +393,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert_eq!(req.validate(), Err("ends_at must be after starts_at"));
     }
@@ -372,6 +449,7 @@ mod tests {
             starts_at: OffsetDateTime::UNIX_EPOCH,
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             passcode: None,
+            e2ee: false,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,
@@ -410,6 +488,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             repeat: None,
             passcode: Some("   ".into()),
+            e2ee: false,
         };
         assert_eq!(blank.validate(), Err("passcode must not be empty"));
 
@@ -498,5 +577,114 @@ mod tests {
             ..legacy
         };
         assert_eq!(serde_json::to_value(&set).unwrap()["has_passcode"], true);
+    }
+
+    #[test]
+    fn e2ee_flags_are_additive() {
+        // Payloads that predate E2EE still parse, as plaintext meetings.
+        let legacy: MeetingDto = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "code": "H7KD-PM2X-QR4T",
+                "title": "Standup",
+                "starts_at": "1970-01-01T00:00:00Z",
+                "ends_at": "1970-01-01T00:00:00Z",
+                "cancelled": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!legacy.e2ee);
+
+        // And a create request defaults to a plaintext meeting.
+        let req: CreateMeetingRequest =
+            serde_json::from_str(r#"{"title": "S", "starts_at": "1970-01-01T00:00:00Z", "ends_at": "1970-01-01T00:00:00Z"}"#)
+                .unwrap();
+        assert!(!req.e2ee);
+
+        // While an E2EE meeting round-trips the flag.
+        let encrypted = MeetingDto {
+            e2ee: true,
+            ..legacy
+        };
+        assert_eq!(serde_json::to_value(&encrypted).unwrap()["e2ee"], true);
+        let req = CreateMeetingRequest { e2ee: true, ..req };
+        assert_eq!(serde_json::to_value(&req).unwrap()["e2ee"], true);
+    }
+
+    #[test]
+    fn title_ciphertext_is_additive() {
+        // Payloads that predate encrypted titles still parse: no blob.
+        let legacy: MeetingDto = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "code": "H7KD-PM2X-QR4T",
+                "title": "Standup",
+                "starts_at": "1970-01-01T00:00:00Z",
+                "ends_at": "1970-01-01T00:00:00Z",
+                "cancelled": false
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.title_ciphertext, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("title_ciphertext")
+                .is_none(),
+            "the field is skipped, not null"
+        );
+
+        // An encrypted meeting carries the blob alongside the masked title.
+        let encrypted = MeetingDto {
+            title: MASKED_TITLE.into(),
+            title_ciphertext: Some("enc1.AQIDBAU=".into()),
+            ..legacy
+        };
+        let value = serde_json::to_value(&encrypted).unwrap();
+        assert_eq!(value["title"], MASKED_TITLE);
+        assert_eq!(value["title_ciphertext"], "enc1.AQIDBAU=");
+    }
+
+    #[test]
+    fn encrypted_titles_validate_differently_from_plaintext() {
+        // Encrypted blobs skip the plaintext shape checks and only bound
+        // the stored size; whitespace is not trimmed (base64 has none).
+        assert_eq!(validate_title("enc1.AQIDBAU="), Ok(()));
+        assert_eq!(
+            validate_title(&format!("enc1.{}", "A".repeat(ENCRYPTED_TITLE_MAX_LEN))),
+            Err("encrypted title must be at most 2048 characters"),
+        );
+
+        // Plaintext titles keep their existing rules, shared by create and
+        // update paths.
+        assert_eq!(validate_title("  "), Err("title must not be empty"));
+        assert_eq!(
+            validate_title(&"x".repeat(TITLE_MAX_LEN + 1)),
+            Err("title must be at most 200 characters"),
+        );
+        assert_eq!(validate_title(" Standup "), Ok(()));
+
+        // A create request with an encrypted title passes title validation
+        // (the other field checks still apply).
+        let req = CreateMeetingRequest {
+            title: "enc1.AQIDBAU=".into(),
+            starts_at: OffsetDateTime::UNIX_EPOCH,
+            ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            repeat: None,
+            passcode: None,
+            e2ee: true,
+        };
+        assert_eq!(req.validate(), Ok(()));
+    }
+
+    #[test]
+    fn display_title_masks_only_encrypted_titles() {
+        assert_eq!(display_title("Standup"), "Standup");
+        assert_eq!(display_title(MASKED_TITLE), MASKED_TITLE);
+        assert_eq!(display_title("enc1.AQIDBAU="), MASKED_TITLE);
+        assert!(is_encrypted_title("enc1."));
+        assert!(!is_encrypted_title("Standup"));
+        assert!(!is_encrypted_title(""));
+        assert!(!is_encrypted_title("enc2.AQIDBAU="));
     }
 }

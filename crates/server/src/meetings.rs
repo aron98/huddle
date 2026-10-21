@@ -33,19 +33,36 @@ pub struct Meeting {
     pub repeat: Option<RecurrenceRule>,
     /// Per-meeting join passcode (issue #13). `None` means open.
     pub passcode: Option<String>,
+    /// End-to-end encrypted trust mode (issue #27), fixed at creation.
+    pub e2ee: bool,
 }
 
 impl From<Meeting> for MeetingDto {
     fn from(m: Meeting) -> Self {
+        // Issue #29: an encrypted stored title is never sent as-is in
+        // `title` — viewers see the masked label, and the blob travels
+        // in the additive `title_ciphertext` field for clients that can
+        // decrypt it (the organizer's browser). This one impl covers
+        // REST responses and the WS `Welcome` alike.
+        let (title, title_ciphertext) = if huddle_protocol::is_encrypted_title(&m.title) {
+            (
+                huddle_protocol::MASKED_TITLE.to_owned(),
+                Some(m.title.clone()),
+            )
+        } else {
+            (m.title, None)
+        };
         Self {
             id: m.id,
             code: m.code,
-            title: m.title,
+            title,
             starts_at: m.starts_at,
             ends_at: m.ends_at,
             cancelled: m.cancelled,
             repeat: m.repeat,
             has_passcode: m.passcode.is_some(),
+            e2ee: m.e2ee,
+            title_ciphertext,
         }
     }
 }
@@ -118,6 +135,7 @@ fn row_to_meeting(row: &SqliteRow) -> Result<Meeting, MeetingError> {
         )?,
         repeat: row_repeat(row)?,
         passcode: row.try_get("passcode")?,
+        e2ee: row.try_get::<i64, _>("e2ee")? != 0,
     })
 }
 
@@ -195,8 +213,8 @@ pub async fn create(
     for _ in 0..5 {
         let code = generate_code();
         let result = sqlx::query(
-            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO meetings (id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode, e2ee)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(Uuid::new_v4().to_string())
         .bind(&code)
@@ -209,6 +227,7 @@ pub async fn create(
         .bind(&rrule_until)
         .bind(rrule_count)
         .bind(&passcode)
+        .bind(i64::from(req.e2ee))
         .execute(pool)
         .await;
 
@@ -228,7 +247,7 @@ pub async fn create(
 /// Look up a meeting by its (normalized) code.
 pub async fn get_by_code(pool: &SqlitePool, code: &str) -> Result<Option<Meeting>, MeetingError> {
     let row = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode, e2ee
          FROM meetings WHERE code = ?1",
     )
     .bind(normalize_code(code))
@@ -244,7 +263,7 @@ pub async fn list_for_organizer(
     organizer_id: Uuid,
 ) -> Result<Vec<Meeting>, MeetingError> {
     let rows = sqlx::query(
-        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode
+        "SELECT id, code, title, starts_at, ends_at, organizer_id, cancelled, created_at, rrule, rrule_until, rrule_count, passcode, e2ee
          FROM meetings WHERE organizer_id = ?1 ORDER BY starts_at ASC",
     )
     .bind(organizer_id.to_string())
@@ -264,11 +283,10 @@ pub async fn update_by_code(
     };
 
     if let Some(title) = &req.title {
-        let title = title.trim();
-        if title.is_empty() || title.len() > 200 {
-            return Err(MeetingError::Invalid);
-        }
-        meeting.title = title.to_owned();
+        // Shared with create validation (issue #29): accepts either a
+        // plaintext title or an `enc1.`-prefixed encrypted blob.
+        huddle_protocol::validate_title(title).map_err(|_| MeetingError::Invalid)?;
+        meeting.title = title.trim().to_owned();
     }
     if let Some(starts_at) = req.starts_at {
         meeting.starts_at = starts_at;
@@ -491,6 +509,7 @@ mod tests {
             ends_at: now + starts_in + lasts,
             repeat: None,
             passcode: None,
+            e2ee: false,
         }
     }
 
@@ -532,6 +551,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn e2ee_flag_round_trips_through_storage() {
+        let pool = pool().await;
+        let mut request = req(Duration::hours(1), Duration::hours(1), "Secret sync");
+        request.e2ee = true;
+        let meeting = create(&pool, &request, None, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert!(meeting.e2ee);
+
+        let fetched = get_by_code(&pool, &meeting.code).await.unwrap().unwrap();
+        assert!(fetched.e2ee, "the flag survives storage");
+        assert_eq!(fetched.id, meeting.id);
+
+        // The DTO carries the trust mode to clients.
+        let dto = MeetingDto::from(fetched);
+        assert!(dto.e2ee);
+
+        // Plain meetings stay plain.
+        let plain = create(
+            &pool,
+            &req(Duration::hours(1), Duration::hours(1), "Open sync"),
+            None,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+        assert!(!plain.e2ee);
+        assert!(!get_by_code(&pool, &plain.code).await.unwrap().unwrap().e2ee);
+    }
+
+    #[tokio::test]
     async fn create_rejects_backwards_times() {
         let pool = pool().await;
         let err = create(
@@ -542,6 +592,7 @@ mod tests {
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 repeat: None,
                 passcode: None,
+                e2ee: false,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -775,6 +826,7 @@ mod tests {
             created_at: start,
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert!(matches!(
             joinability_with(&meeting, &[], &config, start - Duration::minutes(6)),
@@ -804,6 +856,7 @@ mod tests {
             created_at: OffsetDateTime::now_utc(),
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert_eq!(
             joinability_with(&meeting, &[], &config, OffsetDateTime::now_utc()),
@@ -827,6 +880,7 @@ mod tests {
             cancelled: false,
             created_at: OffsetDateTime::now_utc(),
             passcode: None,
+            e2ee: false,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,
@@ -846,6 +900,7 @@ mod tests {
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
             passcode: None,
+            e2ee: false,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,

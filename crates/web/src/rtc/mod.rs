@@ -75,6 +75,16 @@ pub struct RtcClient<S, P> {
     speaking: HashSet<ParticipantId>,
     /// Whether the meeting is currently being recorded (consent indicator).
     recording: bool,
+    /// Whether the meeting is end-to-end encrypted (issue #27); the
+    /// E2EE plumbing in `crate::e2ee` only runs when this is set.
+    e2ee_enabled: bool,
+    /// The meeting's current E2EE epoch, bumped by the server on every
+    /// join/leave (authoritative on all sides; see ADR 010).
+    e2ee_epoch: u64,
+    /// E2EE messages (epoch rotations + keying envelopes) that the
+    /// inner pump loops consumed without a raw-message path back to
+    /// the UI; `crate::e2ee::session` drains them (issue #27).
+    pending_e2ee: Vec<ServerMessage>,
 }
 
 impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
@@ -89,6 +99,9 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             chat_log: Vec::new(),
             speaking: HashSet::new(),
             recording: false,
+            e2ee_enabled: false,
+            e2ee_epoch: 0,
+            pending_e2ee: Vec::new(),
         }
     }
 
@@ -113,6 +126,14 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         &self.chat_log
     }
 
+    /// Mutable access to the buffered chat log: the E2EE layer rewrites
+    /// bodies it could not decrypt when they arrived (replayed history and
+    /// anything swallowed while `publish` was mid-negotiation) once the
+    /// keys for their epoch show up.
+    pub fn chat_log_mut(&mut self) -> &mut [ChatMessage] {
+        &mut self.chat_log
+    }
+
     /// Participants the server currently reports as speaking.
     pub fn speaking(&self) -> &HashSet<ParticipantId> {
         &self.speaking
@@ -121,6 +142,23 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
     /// Whether the meeting is currently being recorded.
     pub fn recording(&self) -> bool {
         self.recording
+    }
+
+    /// Whether the meeting runs in end-to-end encrypted mode.
+    pub fn e2ee_enabled(&self) -> bool {
+        self.e2ee_enabled
+    }
+
+    /// The meeting's current E2EE epoch (0 when the meeting is plaintext).
+    pub fn e2ee_epoch(&self) -> u64 {
+        self.e2ee_epoch
+    }
+
+    /// Take the E2EE messages buffered by `handle_server_message` —
+    /// epoch rotations and relayed keying envelopes destined for the
+    /// wasm-only keying state machine (`crate::e2ee::session`).
+    pub fn take_pending_e2ee(&mut self) -> Vec<ServerMessage> {
+        std::mem::take(&mut self.pending_e2ee)
     }
 
     /// Mutable access to the peer connection, e.g. to attach local media
@@ -162,6 +200,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     roster,
                     ice_servers,
                     recording,
+                    e2ee_enabled,
+                    e2ee_epoch,
                 } => {
                     if protocol_version != PROTOCOL_VERSION {
                         self.state = SessionState::Closed;
@@ -176,6 +216,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     self.meeting = Some(meeting);
                     self.roster = roster;
                     self.recording = recording;
+                    self.e2ee_enabled = e2ee_enabled;
+                    self.e2ee_epoch = e2ee_epoch;
                     self.state = SessionState::InCall;
                     return Ok(());
                 }
@@ -351,6 +393,31 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 self.recording = active;
                 Ok(())
             }
+            // Epoch bookkeeping is ours; the rotations and keying
+            // envelopes are ALSO buffered for the E2EE module in
+            // `crate::e2ee::session` (the browser-side crypto is
+            // wasm-only, this driver is not) — buffering means they
+            // survive inner pump loops (publish) that have no
+            // raw-message path back to the UI.
+            ServerMessage::E2eeEpoch { epoch } => {
+                self.e2ee_epoch = epoch;
+                self.pending_e2ee.push(ServerMessage::E2eeEpoch { epoch });
+                Ok(())
+            }
+            ServerMessage::E2eeKeying {
+                from,
+                to,
+                epoch,
+                payload,
+            } => {
+                self.pending_e2ee.push(ServerMessage::E2eeKeying {
+                    from,
+                    to,
+                    epoch,
+                    payload,
+                });
+                Ok(())
+            }
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }
@@ -363,6 +430,22 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         self.require_in_call()?;
         self.signaling
             .send(ClientMessage::Chat { body })
+            .await
+            .map_err(RtcError::from)
+    }
+
+    /// Send an opaque E2EE keying envelope to one participant (issue
+    /// #27, ADR 010): the server cannot read the payload — only the
+    /// addressee receives it.
+    pub async fn send_e2ee_keying(
+        &mut self,
+        to: ParticipantId,
+        epoch: u64,
+        payload: String,
+    ) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.signaling
+            .send(ClientMessage::E2eeKeying { to, epoch, payload })
             .await
             .map_err(RtcError::from)
     }

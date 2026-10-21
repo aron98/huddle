@@ -5,6 +5,8 @@
 
 use crate::api;
 use crate::audio_settings;
+use crate::e2ee::session::{Browser, E2eeSession, PeerView};
+use crate::e2ee::transform::{TransformWorker, supports_e2ee};
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
@@ -48,6 +50,11 @@ enum UiAction {
     Focus {
         origin: Option<Uuid>,
     },
+    /// Confirm the out-of-band safety-number comparison for a peer
+    /// (E2EE verification, issue #27).
+    VerifyPeer {
+        id: Uuid,
+    },
     Leave,
 }
 
@@ -88,6 +95,11 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     let recording = RwSignal::new(false);
     // Transient in-call notices (e.g. a denied screen-share picker).
     let status = RwSignal::<Option<String>>::new(None);
+    // E2EE (issue #27): the meeting's trust mode, our own id, and
+    // the roster's per-peer verification state.
+    let e2ee_enabled = RwSignal::new(false);
+    let e2ee_peers = RwSignal::<Vec<PeerView>>::new(Vec::new());
+    let you_id = RwSignal::<Option<Uuid>>::new(None);
     // The live session's action inbox, present only between a
     // successful join and the end of the call.
     let ui_tx_slot = RwSignal::<Option<UnboundedSender<UiAction>>>::new(None);
@@ -107,6 +119,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
             recording,
             status,
             ui_tx_slot,
+            e2ee_enabled,
+            e2ee_peers,
+            you_id,
         };
         move |name: String, local: Option<MediaStream>| {
             // One session at a time: buttons double-firing during the
@@ -146,6 +161,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
                         sharing=sharing
                         share_preview=share_preview
                         focused=focused
+                        e2ee_enabled=e2ee_enabled
+                        e2ee_peers=e2ee_peers
+                        you_id=you_id
                         recording=recording
                         status=status
                         ui_tx_slot=ui_tx_slot
@@ -180,6 +198,9 @@ struct SessionSignals {
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
+    e2ee_enabled: RwSignal<bool>,
+    e2ee_peers: RwSignal<Vec<PeerView>>,
+    you_id: RwSignal<Option<Uuid>>,
 }
 
 impl SessionSignals {
@@ -271,13 +292,17 @@ async fn run_session(
         }
     };
 
-    // Test hook: let e2e reach the peer connection via getStats.
-    if window()
-        .location()
-        .search()
-        .unwrap_or_default()
-        .contains("test=1")
-    {
+    // Test hooks (`?test=1`): let e2e reach the peer connection via
+    // getStats, and the E2EE keying state via `__huddleE2eeStats`.
+    let search = window().location().search().unwrap_or_default();
+    let test_mode = search.contains("test=1");
+    // E2EE transform knobs (test-gated, so production behavior can
+    // never change): `?e2eeDegrade=1` forces the worker's degrade path;
+    // `?e2eeTag=1` attaches a tag-only transform in a PLAINTEXT meeting
+    // to prove the transform plumbing without touching real crypto.
+    let degrade_knob = test_mode && search.contains("e2eeDegrade=1");
+    let tag_knob = test_mode && search.contains("e2eeTag=1");
+    if test_mode {
         let _ = js_sys::Reflect::set(
             &window().into(),
             &wasm_bindgen::JsValue::from_str("__huddlePc"),
@@ -317,9 +342,6 @@ async fn run_session(
             });
         });
     }
-    if let Some(outgoing) = &outgoing {
-        peer.attach_stream(outgoing).await;
-    }
 
     let mut client = RtcClient::new(signaling, peer);
     if let Err(e) = client.join(&code, &name, passcode).await {
@@ -337,11 +359,134 @@ async fn run_session(
     // The Welcome says whether the meeting is already being recorded.
     signals.recording.set(client.recording());
     if let Some(meeting) = client.meeting() {
-        signals.prejoin.meeting.set(Some(meeting.clone()));
+        // The Welcome DTO carries the masked title for encrypted
+        // meetings; keep the one this browser decrypted before joining
+        // (issue #29) instead of letting the clobber lose it.
+        let mut meeting = meeting.clone();
+        if let Some(title) = signals.prejoin.decrypted_title.get_untracked() {
+            meeting.title = title;
+        }
+        signals.prejoin.meeting.set(Some(meeting));
     }
+
+    // E2EE (issues #27/#28, ADRs 010/011): set up the keying session and
+    // the media transform worker BEFORE the local media is attached, so
+    // every sender gets its transform in the same task that creates it
+    // (Chrome 155 wires sender-side transforms same-task only — ADR 011,
+    // D1). The worker drops frames until the first sender key arrives,
+    // so publishing before the exchange completes is still safe.
+    let mut e2ee: Option<E2eeSession> = None;
+    let mut transform: Option<TransformWorker> = None;
+    if client.e2ee_enabled() {
+        signals.e2ee_enabled.set(true);
+        // A browser without worker-based RTP transforms cannot honor an
+        // E2EE meeting — leaving cleanly beats streaming plaintext
+        // nobody could decrypt (ADR 011, D6).
+        if !supports_e2ee() {
+            let _ = client.leave().await;
+            signals.connection_lost(
+                "This meeting is end-to-end encrypted, but this browser cannot encrypt media (needs Chrome/Edge 141+, Firefox 117+, or Safari 15.4+)."
+                    .to_owned(),
+            );
+            return;
+        }
+        match client.you().map(|p| p.id) {
+            Some(you) => {
+                signals.you_id.set(Some(you));
+                // The title this browser decrypted before joining (the
+                // organizer's) is relayed to peers after the identity
+                // exchange; guests start with none (issue #29).
+                let known_title = signals.prejoin.decrypted_title.get_untracked();
+                match E2eeSession::start(you, client.e2ee_epoch(), known_title).await {
+                    Some(mut session) => {
+                        let roster_snapshot = client.roster().to_vec();
+                        session.announce_to_all(&roster_snapshot, &mut client).await;
+                        signals.e2ee_peers.set(session.peer_views());
+                        e2ee = Some(session);
+                    }
+                    // Keying is the backbone of an E2EE meeting: without
+                    // it nobody can decrypt anything, so bail instead of
+                    // continuing broken.
+                    None => {
+                        let _ = client.leave().await;
+                        signals.connection_lost(
+                            "End-to-end encryption is unavailable in this browser, and this meeting requires it."
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                }
+                let worker = match TransformWorker::new(false, degrade_knob) {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        let _ = client.leave().await;
+                        signals.connection_lost(format!(
+                            "The E2EE media worker could not start ({e})"
+                        ));
+                        return;
+                    }
+                };
+                // The worker detects per-frame slowness (ADR 011, D5)
+                // and reports it once; a true plaintext rejoin is
+                // impossible in an E2EE meeting (server interlock), so
+                // the notice can only suggest leaving.
+                let status_signal = signals.status;
+                worker.set_on_degrade(move || {
+                    status_signal.set(Some(
+                        "E2EE is struggling on this device — video may stutter. Consider leaving and starting a regular (non-E2EE) meeting."
+                            .to_owned(),
+                    ));
+                });
+                client.peer_mut().enable_e2ee(worker.clone());
+                transform = Some(worker);
+            }
+            None => {
+                let _ = client.leave().await;
+                signals.connection_lost(
+                    "Could not determine your participant id for end-to-end encryption.".to_owned(),
+                );
+                return;
+            }
+        }
+    } else if tag_knob {
+        // `?test=1&e2eeTag=1` in a PLAINTEXT meeting: a tag-only
+        // transform (appends a marker, no crypto) proves the worker
+        // plumbing end to end and that the SFU forwards opaque payloads
+        // unharmed. Test knob only — failure is a notice, never a
+        // broken call.
+        match TransformWorker::new(true, false) {
+            Ok(worker) => {
+                client.peer_mut().enable_e2ee(worker.clone());
+                transform = Some(worker);
+            }
+            Err(e) => signals
+                .status
+                .set(Some(format!("E2EE tag transform unavailable ({e})"))),
+        }
+    }
+    // Now the senders can be created — each creation path attaches its
+    // transform in the same task (Chrome 155, ADR 011 D1).
+    if let Some(outgoing) = &outgoing {
+        client.peer_mut().attach_stream(outgoing).await;
+    }
+
+    // Seed the worker with the current key set (the announce above may
+    // already have produced our own sender key); the session loop
+    // re-syncs whenever keying changes.
+    let mut keys_synced: u64 = 0;
+    if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+        sync_keys_if_changed(e2ee, transform, &mut keys_synced);
+    }
+
     if let Err(e) = client.publish().await {
         signals.connection_lost(format!("Your audio and video could not be published ({e})"));
         return;
+    }
+    // History replayed around the join lands while `publish` waits for
+    // the SDP answer and skips the select-loop intercept; open whatever
+    // the session can (or placeholder it — ADR 011, D7).
+    if let Some(e2ee) = &e2ee {
+        decrypt_pending_chat(e2ee, &mut client).await;
     }
 
     // The prejoin toggles survive the handover: the local stream is the
@@ -372,6 +517,13 @@ async fn run_session(
             return;
         }
     }
+
+    publish_e2ee_probe(
+        test_mode,
+        e2ee.as_ref(),
+        transform.as_ref(),
+        client.roster(),
+    );
 
     // The session is live: the controls can reach it, and the flow can
     // move to the in-call view.
@@ -419,7 +571,20 @@ async fn run_session(
         // future below runs to completion.
         futures::select! {
             message = client.read_server_message().fuse() => match message {
-                Ok(msg) => {
+                Ok(mut msg) => {
+                    // E2EE chat (issue #28, ADR 011): swap the
+                    // ciphertext body for its plaintext before the
+                    // signaling pump files it into the chat log.
+                    // System messages (server-generated, no sender id)
+                    // stay as-is; undecryptable bodies become a
+                    // placeholder (forward secrecy — pre-join epochs
+                    // are unreadable by design).
+                    if let (Some(e2ee), ServerMessage::Chat { message }) = (&e2ee, &mut msg)
+                        && let Some(sender) = message.sender_id
+                    {
+                        let plaintext = e2ee.decrypt_chat(sender, &message.body).await;
+                        message.body = plaintext;
+                    }
                     if let Err(e) = client.handle_server_message(msg.clone()).await {
                         signals.connection_lost(e.to_string());
                         break;
@@ -454,10 +619,47 @@ async fn run_session(
                             .remote_streams
                             .update(|list| list.retain(|(stream_id, _)| stream_id != &screen));
                     }
+                    // E2EE: feed the raw message (and anything the
+                    // inner pump loops buffered) through the keying
+                    // state machine; the peer views refresh the
+                    // roster's verification UX.
+                    if let Some(e2ee) = &mut e2ee {
+                        e2ee.handle_server_message(&msg, &mut client).await;
+                        for buffered in client.take_pending_e2ee() {
+                            e2ee.handle_server_message(&buffered, &mut client).await;
+                        }
+                        signals.e2ee_peers.set(e2ee.peer_views());
+                        // A peer relayed the true meeting title (issue
+                        // #29): the in-call and post-leave views read
+                        // this DTO, so patch it and remember the title.
+                        if let Some(title) = e2ee.take_title() {
+                            signals.prejoin.decrypted_title.set(Some(title.clone()));
+                            signals.prejoin.meeting.update(|m| {
+                                if let Some(m) = m {
+                                    m.title = title.clone();
+                                }
+                            });
+                        }
+                    } else {
+                        let _ = client.take_pending_e2ee();
+                    }
+                    // New (or rotated) sender keys must reach the
+                    // transform worker before frames encrypted with
+                    // them can arrive.
+                    if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+                        sync_keys_if_changed(e2ee, transform, &mut keys_synced);
+                    }
+                    // Anything the publish negotiation swallowed (the
+                    // replayed history) is still sealed — open it now
+                    // that the session owns keys.
+                    if let Some(e2ee) = &e2ee {
+                        decrypt_pending_chat(e2ee, &mut client).await;
+                    }
                     signals.roster.set(client.roster().to_vec());
                     signals.speaking.set(client.speaking().clone());
                     signals.chat.set(client.chat_log().to_vec());
                     signals.recording.set(client.recording());
+                    publish_e2ee_probe(test_mode, e2ee.as_ref(), transform.as_ref(), client.roster());
                 }
                 Err(e) => {
                     signals.connection_lost(e.to_string());
@@ -611,9 +813,31 @@ async fn run_session(
                         }
                     },
                     UiAction::Chat { body } => {
+                        // E2EE chat (issue #28, ADR 011): encrypt before
+                        // the body ever leaves the page; without a
+                        // usable key the message is refused — never sent
+                        // in plaintext.
+                        let body = if let Some(e2ee) = &mut e2ee {
+                            match e2ee.encrypt_chat(&body).await {
+                                Some(encrypted) => encrypted,
+                                None => {
+                                    signals.status.set(Some(
+                                        "Message not sent — could not be encrypted.".to_owned(),
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            body
+                        };
                         if let Err(e) = client.send_chat(body).await {
                             signals.connection_lost(e.to_string());
                             break;
+                        }
+                        // encrypt_chat may have minted our own sender
+                        // key; hand it to the transform worker too.
+                        if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+                            sync_keys_if_changed(e2ee, transform, &mut keys_synced);
                         }
                     }
                     UiAction::Focus { origin } => {
@@ -671,6 +895,13 @@ async fn run_session(
                                 .set(signals.prejoin.effects.notice.get_untracked());
                         }
                     }
+                    UiAction::VerifyPeer { id } => {
+                        if let Some(e2ee) = &mut e2ee {
+                            e2ee.confirm_verification(id, &mut client).await;
+                            signals.e2ee_peers.set(e2ee.peer_views());
+                        }
+                        publish_e2ee_probe(test_mode, e2ee.as_ref(), transform.as_ref(), client.roster());
+                    }
                     UiAction::Leave => {
                         let _ = client.leave().await;
                         signals.ui_tx_slot.set(None);
@@ -708,6 +939,132 @@ async fn watch_speaking_for(
             leptos::logging::warn!("speaking detection off: {e}");
             None
         }
+    }
+}
+
+/// `?test=1` probe (same convention as `__huddlePc`): expose the E2EE
+/// keying state for e2e assertions — trust mode, epoch, and per-peer
+/// safety numbers + verified marks. When a transform worker exists, its
+/// counters ride along (also in tag-only test mode, where `e2ee` is
+/// `None` but the plumbing is what is under test).
+fn publish_e2ee_probe(
+    test_mode: bool,
+    e2ee: Option<&E2eeSession>,
+    transform: Option<&TransformWorker>,
+    roster: &[Participant],
+) {
+    if !test_mode {
+        return;
+    }
+    let stats = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("enabled"),
+        &wasm_bindgen::JsValue::from_bool(e2ee.is_some()),
+    );
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("epoch"),
+        &wasm_bindgen::JsValue::from_f64(e2ee.map(E2eeSession::epoch).unwrap_or(0) as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &stats,
+        &wasm_bindgen::JsValue::from_str("hasSenderKey"),
+        &wasm_bindgen::JsValue::from_bool(e2ee.is_some_and(|e2ee| e2ee.has_sender_key())),
+    );
+    let peers = js_sys::Array::new();
+    for view in e2ee.map(|e2ee| e2ee.peer_views()).unwrap_or_default() {
+        let peer = js_sys::Object::new();
+        let name = roster
+            .iter()
+            .find(|p| p.id == view.id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("id"),
+            &wasm_bindgen::JsValue::from_str(&view.id.to_string()),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("name"),
+            &wasm_bindgen::JsValue::from_str(&name),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("safetyNumber"),
+            &view
+                .safety_number
+                .map(|number| wasm_bindgen::JsValue::from_str(&number))
+                .unwrap_or(wasm_bindgen::JsValue::NULL),
+        );
+        let _ = js_sys::Reflect::set(
+            &peer,
+            &wasm_bindgen::JsValue::from_str("verified"),
+            &wasm_bindgen::JsValue::from_bool(view.verified),
+        );
+        peers.push(&peer);
+    }
+    let _ = js_sys::Reflect::set(&stats, &wasm_bindgen::JsValue::from_str("peers"), &peers);
+    if let Some(worker) = transform {
+        let snapshot = worker.stats();
+        let number = |key: &str, value: f64| {
+            let _ = js_sys::Reflect::set(
+                &stats,
+                &wasm_bindgen::JsValue::from_str(key),
+                &wasm_bindgen::JsValue::from_f64(value),
+            );
+        };
+        number("attached", snapshot.attached);
+        number("encryptedFrames", snapshot.encrypted_frames);
+        number("decryptedFrames", snapshot.decrypted_frames);
+        number("decryptFail", snapshot.decrypt_fail);
+        number("emaMs", snapshot.ema_ms);
+        let _ = js_sys::Reflect::set(
+            &stats,
+            &wasm_bindgen::JsValue::from_str("degraded"),
+            &wasm_bindgen::JsValue::from_bool(snapshot.degraded),
+        );
+    }
+    let _ = js_sys::Reflect::set(
+        &window().into(),
+        &wasm_bindgen::JsValue::from_str("__huddleE2eeStats"),
+        &stats,
+    );
+}
+
+/// Push the session's SFrame key material to the transform worker
+/// whenever the keying state machine produced (or rotated) keys. The
+/// worker guards against out-of-order `keys` messages by version, so a
+/// redundant post is cheap and a stale one can never win.
+fn sync_keys_if_changed(e2ee: &E2eeSession, worker: &TransformWorker, synced: &mut u64) {
+    let keys = e2ee.media_keys();
+    if keys.version != *synced {
+        worker.post_keys(keys.version, keys.send, &keys.recv);
+        *synced = keys.version;
+    }
+}
+
+/// Decrypt chat bodies still in envelope form. The select-loop intercept
+/// decrypts messages as they arrive, but anything the inner pump loops
+/// buffered during `publish` — the replayed history above all — lands in
+/// the client's log raw. A decrypted body never parses as an envelope and
+/// system messages carry no sender, so the guard rewrites only entries
+/// that are genuinely still sealed; undecryptable ones become the
+/// forward-secrecy placeholder (ADR 011, D7).
+async fn decrypt_pending_chat(e2ee: &E2eeSession, client: &mut Browser) {
+    let mut sealed: Vec<(usize, huddle_protocol::ParticipantId)> = Vec::new();
+    for (index, message) in client.chat_log_mut().iter().enumerate() {
+        if let Some(sender) = message.sender_id
+            && crate::e2ee::chat::decode(&message.body).is_some()
+        {
+            sealed.push((index, sender));
+        }
+    }
+    for (index, sender) in sealed {
+        let body = client.chat_log_mut()[index].body.clone();
+        let opened = e2ee.decrypt_chat(sender, &body).await;
+        client.chat_log_mut()[index].body = opened;
     }
 }
 
@@ -869,6 +1226,9 @@ fn CallView(
     sharing: RwSignal<bool>,
     share_preview: RwSignal<Option<MediaStream>>,
     focused: RwSignal<Option<Uuid>>,
+    e2ee_enabled: RwSignal<bool>,
+    e2ee_peers: RwSignal<Vec<PeerView>>,
+    you_id: RwSignal<Option<Uuid>>,
     recording: RwSignal<bool>,
     status: RwSignal<Option<String>>,
     ui_tx_slot: RwSignal<Option<UnboundedSender<UiAction>>>,
@@ -924,6 +1284,9 @@ fn CallView(
             let _ = tx.unbounded_send(action);
         }
     };
+
+    // The open "verify" dialog: which participant, by id.
+    let verify_open = RwSignal::<Option<Uuid>>::new(None);
 
     let toggle_mic = {
         let local = local.clone();
@@ -1022,7 +1385,20 @@ fn CallView(
                         "REC"
                     </span>
                 })}
-                <p class="call-title">{meeting_title}</p>
+                {move || e2ee_enabled.get().then(|| view! {
+                    // The E2EE trust-mode badge (ADR 010, D6): the
+                    // counterpart of REC — the server enforces that
+                    // they never co-occur.
+                    <span
+                        class="e2ee-indicator"
+                        data-testid="e2ee-indicator"
+                        role="status"
+                        title="This meeting is end-to-end encrypted"
+                    >
+                        "E2EE"
+                    </span>
+                })}
+                <p class="call-title" data-testid="call-title">{meeting_title}</p>
                 {move || {
                     status
                         .get()
@@ -1146,12 +1522,110 @@ fn CallView(
                                     } else {
                                         format!("{} ({mic}, {cam})", current.name)
                                     };
+                                    // The verification affordance (issue #27):
+                                    // a verified chip, a Verify button
+                                    // once the safety number is known, or
+                                    // nothing while the key exchange
+                                    // settles. Never for ourselves.
+                                    let is_self = you_id
+                                        .get()
+                                        .is_some_and(|you| you == current.id);
+                                    let peer_view = e2ee_peers
+                                        .get()
+                                        .into_iter()
+                                        .find(|v| v.id == current.id);
+                                    let verify_ui = (!is_self).then(|| match peer_view {
+                                        Some(v) if v.verified => {
+                                            let verified_testid =
+                                                format!("verified-{}", current.name);
+                                            view! {
+                                                <span
+                                                    class="chip chip-verified"
+                                                    data-testid=verified_testid
+                                                >
+                                                    "verified"
+                                                </span>
+                                            }
+                                                .into_any()
+                                        }
+                                        Some(v) if v.safety_number.is_some() => {
+                                            let verify_testid =
+                                                format!("verify-{}", current.name);
+                                            let verify_click =
+                                                move |_| verify_open.set(Some(current.id));
+                                            view! {
+                                                <button
+                                                    class="btn small"
+                                                    data-testid=verify_testid
+                                                    on:click=verify_click
+                                                >
+                                                    "Verify"
+                                                </button>
+                                            }
+                                                .into_any()
+                                        }
+                                        _ => ().into_any(),
+                                    });
                                     view! {
-                                        <li data-testid=testid>{text}</li>
+                                        <li data-testid=testid>{text} {verify_ui}</li>
                                     }
                                 }}
                             </For>
                         </ul>
+                        {move || {
+                            verify_open
+                                .get()
+                                .map(|id| {
+                                    // The name is looked up live from the roster so
+                                    // the dialog survives edits and re-renders
+                                    // without capturing any Strings.
+                                    let name = roster
+                                        .get()
+                                        .into_iter()
+                                        .find(|p| p.id == id)
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_default();
+                                    let safety = e2ee_peers
+                                        .get()
+                                        .into_iter()
+                                        .find(|v| v.id == id)
+                                        .and_then(|v| v.safety_number.clone());
+                                    let safety_testid = format!("safety-number-{name}");
+                                    let confirm_testid = format!("confirm-verify-{name}");
+                                    let on_confirm = move |_| {
+                                        send(UiAction::VerifyPeer { id });
+                                        verify_open.set(None);
+                                    };
+                                    view! {
+                                        <div class="verify-dialog" data-testid="verify-dialog">
+                                            <p class="verify-title">
+                                                {format!("Verify {name}")}
+                                            </p>
+                                            <p class="safety-number" data-testid=safety_testid>
+                                                {safety.unwrap_or_else(|| "…".to_owned())}
+                                            </p>
+                                            <p class="muted">
+                                                "Read this number to each other out of band (or compare it over another channel). If the numbers match, mark the participant as verified."
+                                            </p>
+                                            <div class="verify-actions">
+                                                <button
+                                                    class="btn primary small"
+                                                    data-testid=confirm_testid
+                                                    on:click=on_confirm
+                                                >
+                                                    "They match — mark verified"
+                                                </button>
+                                                <button
+                                                    class="btn small"
+                                                    on:click=move |_| verify_open.set(None)
+                                                >
+                                                    "Close"
+                                                </button>
+                                            </div>
+                                        </div>
+                                    }
+                                })
+                        }}
                     </section>
 
                     <section class="chat">
