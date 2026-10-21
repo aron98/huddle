@@ -8,13 +8,15 @@ import {
   settingsPath,
 } from "../src/settings.mjs";
 
-// Expectations use path.sep/path.dirname so the same assertions hold on the
-// POSIX and Windows runners of release-desktop.yml (path.join is native
-// per platform by design).
+// Expectations are built with the same path functions the code under test
+// uses, so the same assertions hold on the POSIX and Windows runners of
+// release-desktop.yml. Note path.join normalizes every separator, so an
+// expectation must itself be a path.join call — joining strings with
+// path.sep would leave foreign separators unnormalized.
 test("settingsPath joins the userData dir", () => {
   assert.equal(
     settingsPath("/home/me/.huddle"),
-    ["/home/me/.huddle", "settings.json"].join(path.sep)
+    path.join("/home/me/.huddle", "settings.json")
   );
 });
 
