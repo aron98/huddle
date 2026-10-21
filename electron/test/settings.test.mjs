@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import path from "node:path";
 import { test } from "node:test";
 import {
   loadSettings,
@@ -7,8 +8,14 @@ import {
   settingsPath,
 } from "../src/settings.mjs";
 
+// Expectations use path.sep/path.dirname so the same assertions hold on the
+// POSIX and Windows runners of release-desktop.yml (path.join is native
+// per platform by design).
 test("settingsPath joins the userData dir", () => {
-  assert.equal(settingsPath("/home/me/.huddle"), "/home/me/.huddle/settings.json");
+  assert.equal(
+    settingsPath("/home/me/.huddle"),
+    ["/home/me/.huddle", "settings.json"].join(path.sep)
+  );
 });
 
 test("normalizeServerUrl accepts bare origins with the right default scheme", () => {
@@ -88,7 +95,7 @@ test("loadSettings treats missing and corrupt files as unset", () => {
 test("saveSettings round-trips through loadSettings and creates the dir", () => {
   const fs = memFs({});
   saveSettings(fs, "/userData/settings.json", { serverUrl: "http://localhost:3000" });
-  assert.deepEqual(fs.mkdirCalls, ["/userData"]);
+  assert.deepEqual(fs.mkdirCalls, [path.dirname("/userData/settings.json")]);
   assert.deepEqual(loadSettings(fs, "/userData/settings.json"), {
     serverUrl: "http://localhost:3000",
   });
