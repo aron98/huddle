@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/protocol", "crates/sfu", "crates/server", "crates/web"]
+# The Tauri desktop shell (issue #18, ADR 014) is its own workspace: it needs
+# GUI/webkit2gtk system deps that the 4-gate suite must never require. Keep
+# this exclusion tightly delimited — sibling branches edit `members` above.
+exclude = ["crates/desktop"]
 
 [workspace.package]
 version = "0.1.0"
