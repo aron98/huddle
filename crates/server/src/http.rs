@@ -377,6 +377,19 @@ async fn start_recording(
     let organizer = auth::session_organizer(&state, &headers);
     let started_by = organizer.map(|o| o.id);
 
+    // Interlock (ADR 010): E2EE meetings never record. The trust modes
+    // are visibly exclusive by design — refused before any recording
+    // row or sink exists.
+    if meeting.e2ee {
+        return Err(ApiErr(
+            StatusCode::CONFLICT,
+            ApiError {
+                code: ErrorCode::E2eeActive,
+                message: "end-to-end encrypted meetings cannot be recorded".into(),
+            },
+        ));
+    }
+
     let recording_id = Uuid::new_v4();
     recording::insert_row(state.pool(), recording_id, meeting.id, started_by)
         .await
@@ -431,6 +444,7 @@ async fn start_recording(
             let message = match code {
                 ErrorCode::RecordingActive => "a recording is already active",
                 ErrorCode::MeetingNotLive => "the meeting has no live participants to record",
+                ErrorCode::E2eeActive => "end-to-end encrypted meetings cannot be recorded",
                 _ => "cannot start recording",
             };
             tracing::debug!("recording start refused: {code:?}");
@@ -1960,6 +1974,32 @@ mod tests {
         created.meeting
     }
 
+    /// Like [`create_owned_meeting`], but in E2EE trust mode.
+    async fn create_owned_e2ee_meeting(app: &Router, cookie: &str) -> huddle_protocol::MeetingDto {
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "E2EE sync",
+            "starts_at": (now).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(60)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "e2ee": true,
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let created: MeetingResponse = serde_json::from_slice(&bytes).unwrap();
+        created.meeting
+    }
+
     async fn request_recording(
         app: &Router,
         method: &str,
@@ -2002,6 +2042,33 @@ mod tests {
 
         // Unknown meeting: 404, not 403 or 409.
         let (status, _) = request_recording(&app, "POST", "ZZZZ-ZZZZ-ZZZZ", Some(&alice)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn recording_interlock_refuses_e2ee_meetings() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let meeting = create_owned_e2ee_meeting(&app, &alice).await;
+        assert!(meeting.e2ee, "creation honored the e2ee flag");
+        let code = meeting.code.clone();
+
+        // Even with a live participant the interlock holds.
+        let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .engine()
+            .join(Uuid::new_v4(), "alice".into(), meeting.clone(), out_tx)
+            .await
+            .expect("engine alive")
+            .expect("join accepted");
+
+        let (status, body) = request_recording(&app, "POST", &code, Some(&alice)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert!(body.contains("e2ee_active"), "body: {body}");
+
+        // Nothing half-started lingers behind the refusal.
+        let (status, _) = request_recording(&app, "GET", &code, Some(&alice)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
