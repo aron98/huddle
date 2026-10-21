@@ -33,12 +33,46 @@ server:
   # ICE servers advertised to clients in addition to the SFU itself —
   # point this at your coturn. For a coturn with TURN over TLS enabled,
   # see the deploy/turn/turnserver.conf template (turns:...:5349 URLs).
+  # WARNING: this value lands in the chart's plain ConfigMap — for the
+  # TURN credential use extraSecret + extraEnvFrom instead (below).
   iceServers: ""
   sessionSecret: "" # set via --set or an existingSecret; random per boot otherwise
 
 # Provide `name` of an existing Secret with a HUDDLE_SESSION_SECRET key
 # to avoid putting the session secret in values.
 existingSecret: ""
+
+# Extra environment variables for the huddle container, appended after
+# the chart's own env. Literal values and valueFrom refs are both
+# supported; env entries always win over envFrom sources (Kubernetes
+# precedence) and thus can override the chart's ConfigMap.
+# extraEnv:
+#   - name: HUDDLE_MAIL_PROVIDER
+#     value: resend
+#   - name: HUDDLE_MAIL_RESEND_API_KEY
+#     valueFrom:
+#       secretKeyRef:
+#         name: huddle-mailer
+#         key: HUDDLE_MAIL_RESEND_API_KEY
+extraEnv: []
+
+# Extra envFrom sources, appended after the chart's own ConfigMap so a
+# key defined here overrides the ConfigMap's on collisions. Each entry
+# is {type: Secret | ConfigMap, name, prefix (optional)}.
+# extraEnvFrom:
+#   - type: Secret
+#     name: huddle-ice
+extraEnvFrom: []
+
+# Optional chart-managed Secret, for deployments that don't want to
+# hand-roll a Secret manifest. When non-empty the chart creates a
+# Secret named <fullname>-extra-secret with these stringData keys —
+# load it with extraEnvFrom (see above). Keep credentials here (TURN
+# password in HUDDLE_ICE_SERVERS, mailer API keys), NOT in the
+# server.* values that land in the plain ConfigMap.
+# extraSecret:
+#   HUDDLE_ICE_SERVERS: '[{urls=["turn:turn.example.com:3478?transport=udp"],username="huddle",credential="REPLACE_WITH_TURN_PASSWORD"}]'
+extraSecret: {}
 
 persistence:
   enabled: true
