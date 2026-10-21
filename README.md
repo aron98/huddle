@@ -267,7 +267,12 @@ supports `?turn=relay` — the call then refuses every non-relayed candidate,
 which is exactly what the TURN e2e in CI asserts against a real local
 coturn.
 
-Production checklist: real credentials (not the dev pair), TLS on 5349 for
+Production checklist: real credentials (not the dev pair) — or, better, the
+TURN REST API: run coturn with `use-auth-secret` + `static-auth-secret`, put
+the same secret in huddle's `[turn] shared_secret`, and huddle mints
+time-limited credentials per join (see the
+[VPS guide](docs/deploy/ubuntu-vps.md#62-configure-etcturnserverconf)) —
+plus TLS on 5349 for
 clients that split-tunnel TCP, and — unless you are building an internal
 setup — do **not** copy `allow-loopback-peers` from the e2e configs; coturn
 refuses loopback peers by default for good reason. A ready-to-edit

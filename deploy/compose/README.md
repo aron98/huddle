@@ -18,8 +18,8 @@ Contents:
   rust-embed, built-in ACME TLS on 443) + coturn, both on host networking for
   WebRTC UDP reachability.
 - `.env.example` — domains, public IP, `HUDDLE_SESSION_SECRET`, `HUDDLE_STATS_TOKEN`,
-  TURN password.
-- `turnserver.conf` — coturn template (lt-cred-mech static credentials to match
-  huddle's `HUDDLE_ICE_SERVERS`).
+  TURN shared secret.
+- `turnserver.conf` — coturn template (`use-auth-secret` REST credentials matching
+  huddle's `HUDDLE_TURN_SHARED_SECRET`).
 
 `.env`, `.env.*` with real secrets, and `certs/` are git-ignored — never commit them.
