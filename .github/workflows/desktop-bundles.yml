@@ -1,0 +1,67 @@
+# Desktop bundles: on a pushed v* tag, build the Tauri shell packages
+# (.deb + AppImage) and attach them to the GitHub release.
+#
+# The shell does NOT build the Leptos web client: after connecting it
+# navigates the webview to the huddle server origin, and the server serves
+# the embedded UI there (ADR 004 / ADR 014). frontendDist only ships the
+# shell's own home page, so there is no trunk step here.
+#
+# NOTE: this job has not run until the first v* tag pushed after this
+# file landed — expect (and fix) first-run issues there.
+
+name: desktop-bundles
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  bundles:
+    name: build desktop bundles
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/desktop
+
+      # Tauri's Linux system dependencies (webkit2gtk webview + tray/appindicator).
+      - name: install tauri system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file \
+            libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      # Runner images ship Node, so npx needs no setup step. The Tauri CLI
+      # finds the project by searching for tauri.conf.json under the cwd
+      # (crates/desktop/app), wherever `tauri build` is documented to look.
+      - name: tauri build
+        run: npx --yes @tauri-apps/cli@^2 build
+        working-directory: crates/desktop
+
+      - name: sha256 bundles
+        run: |
+          cd crates/desktop/target/release/bundle
+          find . -type f \( -name '*.deb' -o -name '*.AppImage' \) -print0 \
+            | xargs -0 -I{} sh -c 'sha256sum "{}" > "{}.sha256"'
+          find . -type f \( -name '*.deb*' -o -name '*.AppImage*' \)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            crates/desktop/target/release/bundle/deb/*.deb
+            crates/desktop/target/release/bundle/deb/*.deb.sha256
+            crates/desktop/target/release/bundle/appimage/*.AppImage
+            crates/desktop/target/release/bundle/appimage/*.AppImage.sha256

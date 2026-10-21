@@ -108,3 +108,32 @@ jobs:
       - name: e2e suites
         run: node run-all.mjs
         working-directory: test/e2e
+
+  # Desktop shell (issue #18): crates/desktop is a standalone cargo
+  # workspace (excluded from the root one), so its gates run separately.
+  # Only the pure-logic crate is headless — huddle-desktop-app needs GUI
+  # system packages and is built only in desktop-bundles.yml on v* tags.
+  desktop-core:
+    name: desktop shell (pure logic)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: crates/desktop
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/desktop
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy (huddle-desktop-core)
+        run: cargo clippy -p huddle-desktop-core --all-targets -- -D warnings
+
+      - name: tests (huddle-desktop-core)
+        run: cargo test -p huddle-desktop-core
