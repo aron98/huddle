@@ -2,8 +2,9 @@
 
 Electron shell that runs the Huddle meeting client as a desktop app. The
 client is **not** bundled into the shell: it is same-origin by design
-(relative-path REST, `ws://<host>/ws` derived from the page origin), so the
-shell loads the HTTP origin of a Huddle server, which serves the identical
+(relative-path REST, scheme-matched `wss://`/`ws://` signaling derived
+from the page origin), so the shell loads the HTTP(S) origin of a Huddle
+server, which serves the identical
 rust-embed'd web client it serves to browsers ([ADR 004](../docs/adr/004-single-binary-embedded-ui.md)).
 Rationale — bundled Chromium over Tauri's per-OS system webviews — is
 [ADR 014](../docs/adr/014-desktop-shell-electron.md).
@@ -73,15 +74,6 @@ builds skip code-sign probing via `CSC_IDENTITY_AUTO_DISCOVERY=false`.
 - First-run connect page; the chosen server origin is persisted to
   `settings.json` under Electron's `userData` dir. An unreachable server
   falls back to the connect page with the error instead of a dead tab.
-
-## Known follow-up (pre-existing web bug, not introduced here)
-
-`crates/web/src/call.rs` derives the WebSocket URL as `ws://<host>/ws`
-unconditionally — even on `https://` pages, where mixed-content blocking
-kills it. This affects the browser tab equally. Consequence for desktop:
-connect to servers over **plain HTTP or localhost** for now; an https origin
-will load but its WebSocket will be blocked until the client derives
-`wss://` from `location.protocol` (one-line fix, to be done web-side).
 
 ## Manual verification checklist (per release, per OS)
 

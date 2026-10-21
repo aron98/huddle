@@ -1,7 +1,7 @@
 // Huddle desktop shell — main process.
 //
 // The web client is deliberately same-origin (relative-path REST,
-// ws://<host>/ws), so the shell cannot serve crates/web/dist itself.
+// scheme-matched signaling), so the shell cannot serve crates/web/dist itself.
 // Instead it loads the HTTP origin of a Huddle server, which serves the
 // identical built client (ADR 004, rust-embed). Dev mode points at a
 // locally running `cargo run -p huddle-server`; production uses the
