@@ -629,6 +629,10 @@ impl Engine {
             roster,
             ice_servers: self.ice_servers.clone(),
             recording: inst.recording(),
+            // Wired to the meeting's trust mode when the engine-side E2EE
+            // support lands (issue #27); plaintext until then.
+            e2ee_enabled: false,
+            e2ee_epoch: 0,
         });
 
         let joined = ServerMessage::ParticipantJoined { participant };
@@ -933,6 +937,7 @@ mod tests {
             cancelled: false,
             repeat: None,
             has_passcode: false,
+            e2ee: false,
         }
     }
 

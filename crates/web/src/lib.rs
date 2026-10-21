@@ -317,6 +317,9 @@ fn Dashboard() -> impl IntoView {
             ends_at,
             repeat: repeat_rule,
             passcode: (!passcode.is_empty()).then_some(passcode),
+            // The dashboard E2EE checkbox lands with the web feature
+            // (issue #27); plaintext stays the default until then.
+            e2ee: false,
         };
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));

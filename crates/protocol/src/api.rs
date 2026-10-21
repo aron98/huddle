@@ -25,6 +25,11 @@ pub struct MeetingDto {
     /// never sent over the wire — only this flag is.
     #[serde(default)]
     pub has_passcode: bool,
+    /// Whether the meeting is end-to-end encrypted (issue #27): media
+    /// keys live only on the participants' clients and the server relays
+    /// ciphertext. Set at creation; not changeable afterwards.
+    #[serde(default)]
+    pub e2ee: bool,
 }
 
 /// Curated recurrence frequencies for recurring meetings (issue 16). A
@@ -127,6 +132,12 @@ pub struct CreateMeetingRequest {
     /// in constant time. Absent or `null` means no passcode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passcode: Option<String>,
+    /// Create the meeting in end-to-end encrypted mode (issue #27): the
+    /// clients exchange media keys pairwise and the server only ever
+    /// relays ciphertext — which also means the meeting cannot be
+    /// recorded (ADR 010's interlock). Absent means a plaintext meeting.
+    #[serde(default)]
+    pub e2ee: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -305,6 +316,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH,
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert_eq!(req.validate(), Err("title must not be empty"));
     }
@@ -317,6 +329,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             repeat: None,
             passcode: None,
+            e2ee: false,
         };
         assert_eq!(req.validate(), Err("ends_at must be after starts_at"));
     }
@@ -372,6 +385,7 @@ mod tests {
             starts_at: OffsetDateTime::UNIX_EPOCH,
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             passcode: None,
+            e2ee: false,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,
@@ -410,6 +424,7 @@ mod tests {
             ends_at: OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
             repeat: None,
             passcode: Some("   ".into()),
+            e2ee: false,
         };
         assert_eq!(blank.validate(), Err("passcode must not be empty"));
 
@@ -498,5 +513,37 @@ mod tests {
             ..legacy
         };
         assert_eq!(serde_json::to_value(&set).unwrap()["has_passcode"], true);
+    }
+
+    #[test]
+    fn e2ee_flags_are_additive() {
+        // Payloads that predate E2EE still parse, as plaintext meetings.
+        let legacy: MeetingDto = serde_json::from_str(
+            r#"{
+                "id": "00000000-0000-0000-0000-000000000000",
+                "code": "H7KD-PM2X-QR4T",
+                "title": "Standup",
+                "starts_at": "1970-01-01T00:00:00Z",
+                "ends_at": "1970-01-01T00:00:00Z",
+                "cancelled": false
+            }"#,
+        )
+        .unwrap();
+        assert!(!legacy.e2ee);
+
+        // And a create request defaults to a plaintext meeting.
+        let req: CreateMeetingRequest =
+            serde_json::from_str(r#"{"title": "S", "starts_at": "1970-01-01T00:00:00Z", "ends_at": "1970-01-01T00:00:00Z"}"#)
+                .unwrap();
+        assert!(!req.e2ee);
+
+        // While an E2EE meeting round-trips the flag.
+        let encrypted = MeetingDto {
+            e2ee: true,
+            ..legacy
+        };
+        assert_eq!(serde_json::to_value(&encrypted).unwrap()["e2ee"], true);
+        let req = CreateMeetingRequest { e2ee: true, ..req };
+        assert_eq!(serde_json::to_value(&req).unwrap()["e2ee"], true);
     }
 }

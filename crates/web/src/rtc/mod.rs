@@ -75,6 +75,12 @@ pub struct RtcClient<S, P> {
     speaking: HashSet<ParticipantId>,
     /// Whether the meeting is currently being recorded (consent indicator).
     recording: bool,
+    /// Whether the meeting is end-to-end encrypted (issue #27); the
+    /// E2EE plumbing in `crate::e2ee` only runs when this is set.
+    e2ee_enabled: bool,
+    /// The meeting's current E2EE epoch, bumped by the server on every
+    /// join/leave (authoritative on all sides; see ADR 010).
+    e2ee_epoch: u64,
 }
 
 impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
@@ -89,6 +95,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             chat_log: Vec::new(),
             speaking: HashSet::new(),
             recording: false,
+            e2ee_enabled: false,
+            e2ee_epoch: 0,
         }
     }
 
@@ -121,6 +129,16 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
     /// Whether the meeting is currently being recorded.
     pub fn recording(&self) -> bool {
         self.recording
+    }
+
+    /// Whether the meeting runs in end-to-end encrypted mode.
+    pub fn e2ee_enabled(&self) -> bool {
+        self.e2ee_enabled
+    }
+
+    /// The meeting's current E2EE epoch (0 when the meeting is plaintext).
+    pub fn e2ee_epoch(&self) -> u64 {
+        self.e2ee_epoch
     }
 
     /// Mutable access to the peer connection, e.g. to attach local media
@@ -162,6 +180,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     roster,
                     ice_servers,
                     recording,
+                    e2ee_enabled,
+                    e2ee_epoch,
                 } => {
                     if protocol_version != PROTOCOL_VERSION {
                         self.state = SessionState::Closed;
@@ -176,6 +196,8 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                     self.meeting = Some(meeting);
                     self.roster = roster;
                     self.recording = recording;
+                    self.e2ee_enabled = e2ee_enabled;
+                    self.e2ee_epoch = e2ee_epoch;
                     self.state = SessionState::InCall;
                     return Ok(());
                 }
@@ -351,6 +373,14 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
                 self.recording = active;
                 Ok(())
             }
+            // Epoch bookkeeping is ours; keying envelopes are consumed by
+            // the E2EE module in `crate::call` from the raw message (the
+            // browser-side crypto is wasm-only, this driver is not).
+            ServerMessage::E2eeEpoch { epoch } => {
+                self.e2ee_epoch = epoch;
+                Ok(())
+            }
+            ServerMessage::E2eeKeying { .. } => Ok(()),
             ServerMessage::Error { code, message } => {
                 Err(RtcError::Server(ServerError { code, message }))
             }

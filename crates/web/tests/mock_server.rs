@@ -57,6 +57,7 @@ fn meeting_dto(code: &str) -> MeetingDto {
         cancelled: false,
         repeat: None,
         has_passcode: false,
+        e2ee: false,
     }
 }
 
@@ -96,6 +97,8 @@ impl MockState {
                         credential: Some("secret".into()),
                     }],
                     recording: false,
+                    e2ee_enabled: false,
+                    e2ee_epoch: 0,
                 }]
             }
             ClientMessage::SdpOffer { .. } => {
@@ -156,6 +159,9 @@ impl MockState {
             }],
             // Layer preferences are consumed by the SFU with no reply.
             ClientMessage::LayerPreference { .. }
+            // Keying envelopes are relayed by the real server; the mock
+            // only records them.
+            | ClientMessage::E2eeKeying { .. }
             // SDP answers and leaves close out flows that already got
             // their replies elsewhere.
             | ClientMessage::SdpAnswer { .. }

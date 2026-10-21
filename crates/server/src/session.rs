@@ -152,6 +152,10 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::LayerPreference { origin, layer } => {
                         engine.layer_preference(code.clone(), id, origin, layer);
                     }
+                    // Relayed to the addressed participant once the
+                    // engine-side relay lands (issue #27); a no-op here
+                    // keeps the exhaustive match honest in the meantime.
+                    ClientMessage::E2eeKeying { .. } => {}
                     ClientMessage::Leave => break,
                     ClientMessage::Join { .. } => {
                         send_error(&mut sender, ErrorCode::InvalidMessage, "already joined").await;
@@ -430,6 +434,7 @@ mod tests {
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: None,
                 passcode,
+                e2ee: false,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await
@@ -452,6 +457,7 @@ mod tests {
                 ends_at: now + time::Duration::minutes(starts_in_min + lasts_min),
                 repeat: Some(rule),
                 passcode: None,
+                e2ee: false,
             };
             let meeting = meetings::create(self.state.pool(), &req, None, now)
                 .await

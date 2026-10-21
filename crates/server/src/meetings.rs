@@ -46,6 +46,8 @@ impl From<Meeting> for MeetingDto {
             cancelled: m.cancelled,
             repeat: m.repeat,
             has_passcode: m.passcode.is_some(),
+            // Wired to the stored flag once the column lands (issue #27).
+            e2ee: false,
         }
     }
 }
@@ -491,6 +493,7 @@ mod tests {
             ends_at: now + starts_in + lasts,
             repeat: None,
             passcode: None,
+            e2ee: false,
         }
     }
 
@@ -542,6 +545,7 @@ mod tests {
                 ends_at: OffsetDateTime::now_utc() + Duration::hours(1),
                 repeat: None,
                 passcode: None,
+                e2ee: false,
             },
             None,
             OffsetDateTime::now_utc(),
@@ -846,6 +850,7 @@ mod tests {
             starts_at: now + starts_in,
             ends_at: now + starts_in + lasts,
             passcode: None,
+            e2ee: false,
             repeat: Some(RecurrenceRule {
                 frequency: RepeatFrequency::Weekly,
                 until: None,

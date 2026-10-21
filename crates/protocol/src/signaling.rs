@@ -83,6 +83,9 @@ pub enum ErrorCode {
     /// The join did not carry the meeting's passcode, or carried a wrong
     /// one. The client should prompt for a passcode and rejoin with it.
     PasscodeRequired,
+    /// The meeting is end-to-end encrypted, so the requested action
+    /// (recording) cannot run on it — ADR 010's interlock.
+    E2eeActive,
 }
 
 /// Client → server messages.
@@ -143,6 +146,16 @@ pub enum ClientMessage {
         origin: ParticipantId,
         layer: VideoLayer,
     },
+    /// Opaque E2EE keying envelope, relayed to one other participant
+    /// (issue #27 / ADR 010). `payload` is base64 of bytes the server
+    /// must not interpret — identity announces, sender keys, and
+    /// verification marks all ride this pipe. `epoch` is the meeting
+    /// epoch the envelope belongs to; the server relays it untouched.
+    E2eeKeying {
+        to: ParticipantId,
+        epoch: u64,
+        payload: String,
+    },
     /// Graceful leave; the socket closing implies the same.
     Leave,
 }
@@ -167,6 +180,15 @@ pub enum ServerMessage {
         /// recording support.
         #[serde(default)]
         recording: bool,
+        /// Whether this meeting is end-to-end encrypted (ADR 010). Like
+        /// `recording`, `#[serde(default)]` keeps the addition wire-safe.
+        #[serde(default)]
+        e2ee_enabled: bool,
+        /// The meeting's current E2EE epoch: bumped by the server on
+        /// every join/leave, identical on all sides by construction.
+        /// Meaningful only when `e2ee_enabled` is true.
+        #[serde(default)]
+        e2ee_epoch: u64,
     },
     ParticipantJoined {
         participant: Participant,
@@ -214,6 +236,20 @@ pub enum ServerMessage {
     /// participant knows the meeting is being recorded (consent indicator).
     Recording {
         active: bool,
+    },
+    /// Broadcast when the meeting's E2EE epoch advances — every join
+    /// and leave bumps it. Participants provision fresh per-epoch sender
+    /// keys on receipt (ADR 010). E2EE meetings only.
+    E2eeEpoch {
+        epoch: u64,
+    },
+    /// Relayed E2EE keying envelope, addressed to one participant.
+    /// `payload` is opaque to the server (see [`ClientMessage::E2eeKeying`]).
+    E2eeKeying {
+        from: ParticipantId,
+        to: ParticipantId,
+        epoch: u64,
+        payload: String,
     },
     Error {
         code: ErrorCode,
@@ -278,10 +314,13 @@ mod tests {
                 cancelled: false,
                 repeat: None,
                 has_passcode: false,
+                e2ee: false,
             },
             roster: vec![],
             ice_servers: vec![],
             recording: false,
+            e2ee_enabled: false,
+            e2ee_epoch: 0,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "welcome");
@@ -398,12 +437,20 @@ mod tests {
         });
         let back: ServerMessage = serde_json::from_value(legacy).unwrap();
         let ServerMessage::Welcome {
-            recording, meeting, ..
+            recording,
+            e2ee_enabled,
+            e2ee_epoch,
+            meeting,
+            ..
         } = back
         else {
             panic!("expected welcome");
         };
         assert!(!recording);
+        // The E2EE fields are additive the same way: legacy payloads
+        // parse as a plaintext meeting at epoch 0.
+        assert!(!e2ee_enabled);
+        assert_eq!(e2ee_epoch, 0);
         // Same additive story for the meeting's passcode flag.
         assert!(!meeting.has_passcode);
     }
@@ -416,6 +463,64 @@ mod tests {
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["code"], "passcode_required");
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn e2ee_keying_round_trips_both_directions() {
+        let msg = ClientMessage::E2eeKeying {
+            to: Uuid::nil(),
+            epoch: 3,
+            payload: "c2VjcmV0".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "e2ee_keying",
+                "to": Uuid::nil().to_string(),
+                "epoch": 3,
+                "payload": "c2VjcmV0",
+            })
+        );
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+
+        let msg = ServerMessage::E2eeKeying {
+            from: Uuid::nil(),
+            to: Uuid::max(),
+            epoch: 3,
+            payload: "c2VjcmV0".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "e2ee_keying",
+                "from": Uuid::nil().to_string(),
+                "to": Uuid::max().to_string(),
+                "epoch": 3,
+                "payload": "c2VjcmV0",
+            })
+        );
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn e2ee_epoch_broadcast_round_trips() {
+        let msg = ServerMessage::E2eeEpoch { epoch: 7 };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "e2ee_epoch", "epoch": 7}));
+        assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn e2ee_active_error_is_snake_case() {
+        let msg = ServerMessage::Error {
+            code: ErrorCode::E2eeActive,
+            message: "this meeting is end-to-end encrypted".into(),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["code"], "e2ee_active");
         assert_eq!(serde_json::from_value::<ServerMessage>(v).unwrap(), msg);
     }
 
