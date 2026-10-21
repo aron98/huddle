@@ -5,6 +5,7 @@
 //! server. All key material lives client-side — the server only ever
 //! relays opaque payloads between participants.
 
+use crate::e2ee::chat;
 use crate::e2ee::identity::{self, Identity};
 use crate::e2ee::keying::{self, KeyingPayload};
 use crate::e2ee::safety;
@@ -142,6 +143,65 @@ impl E2eeSession {
             version: self.keys_version,
             send: self.own_key.map(|key| (you, key)),
             recv,
+        }
+    }
+
+    /// Encrypt a chat body for the current epoch (ADR 011, D7). `None`
+    /// means "do not send": without a key the message is refused with
+    /// a status notice rather than falling back to plaintext.
+    pub async fn encrypt_chat(&mut self, body: &str) -> Option<String> {
+        let key = match self.ensure_own_key() {
+            Ok(key) => key,
+            Err(e) => {
+                leptos::logging::warn!("cannot generate a chat key: {e}");
+                return None;
+            }
+        };
+        let crypto_key = match keying::import_aes_key(&chat::chat_key(&key)).await {
+            Ok(key) => key,
+            Err(e) => {
+                leptos::logging::warn!("cannot import the chat key: {e}");
+                return None;
+            }
+        };
+        let nonce = keying::random_bytes(chat::NONCE_LEN).ok()?;
+        let aad = chat::chat_aad(self.you, self.epoch);
+        let ciphertext = keying::seal(&crypto_key, &nonce, &aad, body.as_bytes())
+            .await
+            .ok()?;
+        Some(chat::encode(&nonce, &ciphertext))
+    }
+
+    /// Decrypt a chat body from `sender`, or render the placeholder for
+    /// anything we cannot open — pre-join history, a stale epoch, a key
+    /// race. Forward secrecy means the text stays sealed (ADR 011, D7).
+    pub async fn decrypt_chat(&self, sender: ParticipantId, body: &str) -> String {
+        const PLACEHOLDER: &str =
+            "Encrypted message (no key available — sent before you joined or during a key change)";
+        let Some((nonce, ciphertext)) = chat::decode(body) else {
+            return PLACEHOLDER.to_owned();
+        };
+        let base = if sender == self.you {
+            self.own_key
+        } else {
+            self.peers
+                .get(&sender)
+                .and_then(|peer| peer.sender_key)
+                .filter(|(epoch, _)| *epoch == self.epoch)
+                .map(|(_, key)| key)
+        };
+        let Some(base) = base else {
+            return PLACEHOLDER.to_owned();
+        };
+        let Ok(crypto_key) = keying::import_aes_key(&chat::chat_key(&base)).await else {
+            return PLACEHOLDER.to_owned();
+        };
+        let aad = chat::chat_aad(sender, self.epoch);
+        match keying::open(&crypto_key, &nonce, &aad, &ciphertext).await {
+            Ok(plaintext) => {
+                String::from_utf8(plaintext).unwrap_or_else(|_| PLACEHOLDER.to_owned())
+            }
+            Err(_) => PLACEHOLDER.to_owned(),
         }
     }
 

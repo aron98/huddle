@@ -551,7 +551,20 @@ async fn run_session(
         // future below runs to completion.
         futures::select! {
             message = client.read_server_message().fuse() => match message {
-                Ok(msg) => {
+                Ok(mut msg) => {
+                    // E2EE chat (issue #28, ADR 011): swap the
+                    // ciphertext body for its plaintext before the
+                    // signaling pump files it into the chat log.
+                    // System messages (server-generated, no sender id)
+                    // stay as-is; undecryptable bodies become a
+                    // placeholder (forward secrecy — pre-join epochs
+                    // are unreadable by design).
+                    if let (Some(e2ee), ServerMessage::Chat { message }) = (&e2ee, &mut msg)
+                        && let Some(sender) = message.sender_id
+                    {
+                        let plaintext = e2ee.decrypt_chat(sender, &message.body).await;
+                        message.body = plaintext;
+                    }
                     if let Err(e) = client.handle_server_message(msg.clone()).await {
                         signals.connection_lost(e.to_string());
                         break;
@@ -763,9 +776,31 @@ async fn run_session(
                         }
                     },
                     UiAction::Chat { body } => {
+                        // E2EE chat (issue #28, ADR 011): encrypt before
+                        // the body ever leaves the page; without a
+                        // usable key the message is refused — never sent
+                        // in plaintext.
+                        let body = if let Some(e2ee) = &mut e2ee {
+                            match e2ee.encrypt_chat(&body).await {
+                                Some(encrypted) => encrypted,
+                                None => {
+                                    signals.status.set(Some(
+                                        "Message not sent — could not be encrypted.".to_owned(),
+                                    ));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            body
+                        };
                         if let Err(e) = client.send_chat(body).await {
                             signals.connection_lost(e.to_string());
                             break;
+                        }
+                        // encrypt_chat may have minted our own sender
+                        // key; hand it to the transform worker too.
+                        if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+                            sync_keys_if_changed(e2ee, transform, &mut keys_synced);
                         }
                     }
                     UiAction::Focus { origin } => {
