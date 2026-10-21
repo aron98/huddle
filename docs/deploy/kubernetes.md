@@ -80,10 +80,12 @@ helm install cert-manager jetstack/cert-manager \
 
 > TLS termination at the ingress is the chart-compatible path. Huddle's built-in
 > ACME (ADR 008) binds the *serving* port for TLS-ALPN-01, i.e. the pod would need
-> `HUDDLE_BIND=0.0.0.0:443` + hostPort 443 — the chart hardcodes bind
-> `0.0.0.0:3000` and offers no knob for extra env. Pod-terminated TLS is possible,
-> but needs a small chart extension (see
+> `HUDDLE_BIND=0.0.0.0:443` + hostPort 443 — the chart's port plumbing
+> (hostPort, readiness probe, Service) assumes `service.port`, so pod-terminated
+> TLS still needs a small chart extension (see
 > [Pod-terminated TLS variant](#pod-terminated-tls-variant-chart-extension-required)).
+> The `HUDDLE_TLS_*` env vars themselves can already be passed via the chart's
+> `extraEnv` knob.
 
 ## 2. Secrets
 
@@ -95,10 +97,29 @@ kubectl create secret generic huddle-session \
   --from-literal=HUDDLE_SESSION_SECRET="$(openssl rand -hex 32)"
 ```
 
-TURN credentials also belong in a Secret — mounted by coturn in step 5. Note the
-chart itself has no Secret option for `server.iceServers`: the value lands in the
-chart's ConfigMap (known chart limitation, see
-[Known limitations](#known-chart-limitations)).
+TURN credentials also belong in a Secret — mounted by coturn in step 5, and fed
+to huddle via the chart's `extraEnvFrom` knob so `HUDDLE_TURN_SHARED_SECRET`
+never lands in the chart's ConfigMap (see steps 3 and 5).
+
+The same plumbing carries mailer credentials. For example, a Resend API key:
+
+```sh
+kubectl create secret generic huddle-mailer -n huddle \
+  --from-literal=HUDDLE_MAIL_RESEND_API_KEY="re_xxxxxxxxxxxx"
+```
+
+```yaml
+# my-values.yaml
+extraEnv:
+  - name: HUDDLE_MAIL_PROVIDER
+    value: resend
+extraEnvFrom:
+  - type: Secret
+    name: huddle-mailer
+```
+
+(The chart can also create the Secret for you — `extraSecret` — see the
+[chart README](../../deploy/helm/huddle/README.md).)
 
 ## 3. Install the Huddle chart
 
@@ -123,6 +144,16 @@ server:
   # too — then they must match coturn's user= byte-for-byte.
   # Figment array syntax, TOML-ish:
   iceServers: '[{urls=["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp","turns:turn.example.com:5349?transport=tcp"]}]'
+
+# Pod env vars injected from Secrets (chart 0.2.0 knob): the TURN
+# REST-auth shared secret (huddle-turn, step 5) and the mailer API
+# key (huddle-mailer, step 2) — keep secret material out of the
+# plain ConfigMap.
+extraEnvFrom:
+  - type: Secret
+    name: huddle-turn
+  - type: Secret
+    name: huddle-mailer
 
 # Secret with key HUDDLE_SESSION_SECRET (created above):
 existingSecret: huddle-session
@@ -235,11 +266,10 @@ SFU media can, so coturn also runs hostNetwork — as a DaemonSet on the same no
 API, issue #59): huddle holds the same shared secret and mints time-limited
 credentials at every join — `username` is the expiry timestamp and
 `credential` is `base64(HMAC-SHA1(secret, username))` — so no static TURN
-password is stored anywhere. The chart gap: the Helm chart has no
-extra-env/extra-envFrom knob (see [Known chart limitations](#known-chart-limitations)),
-so `HUDDLE_TURN_SHARED_SECRET` cannot be set through chart values today.
-Create the secret and patch the Deployment env until the chart grows a knob
-(the patch must be re-applied after every `helm upgrade`).
+password is stored anywhere. The chart's `extraEnvFrom` knob (added alongside
+this guide) delivers `HUDDLE_TURN_SHARED_SECRET` to the pod from the
+`huddle-turn` Secret created below — through chart values, no post-install
+patching.
 
 Create the TURN shared secret and a coturn config referencing it (the config is
 mounted as a Secret so the credential never appears in a ConfigMap):
@@ -262,20 +292,19 @@ no-multicast-peers
 "
 ```
 
-Deliver the secret to the huddle pod (workaround for the missing chart knob —
-re-apply after every `helm upgrade`):
-
-```sh
-kubectl patch deployment huddle -n huddle --type=json \
-  -p='[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"HUDDLE_TURN_SHARED_SECRET","valueFrom":{"secretKeyRef":{"name":"huddle-turn","key":"HUDDLE_TURN_SHARED_SECRET"}}}}]'
-kubectl -n huddle rollout status deploy/huddle
-```
+The chart's `extraEnvFrom` (step 3) injects `HUDDLE_TURN_SHARED_SECRET` from
+the `huddle-turn` Secret into the pod, so the shared secret never appears in
+plain chart values or the ConfigMap.
 
 > With REST auth, `server.iceServers` carries only URL lists — safe to keep in
-> the chart's ConfigMap (see
-> [Known limitations](#known-chart-limitations)). The shared secret lives in a
+> the chart's ConfigMap (it holds no credentials). The shared secret lives in a
 > Secret, which is not readable cluster-wide by default — strictly better than
-> the old static-password-in-ConfigMap shape.
+> the old static-password-in-ConfigMap shape. Prefer static `lt-cred-mech`
+> pairs instead? Then the same static password must appear in huddle's
+> `HUDDLE_ICE_SERVERS`; keep it out of the ConfigMap by putting the whole value
+> under the chart's `extraSecret` map and pointing `extraEnvFrom` at
+> `huddle-extra-secret` (the chart then manages the Secret for you; see the
+> [chart README](../../deploy/helm/huddle/README.md)).
 
 DaemonSet manifest:
 
@@ -329,9 +358,11 @@ for the certificate mechanics — they are identical.
 
 **Advertising the TURN address:** with a DaemonSet, every node runs coturn, but
 huddle advertises a *static* URL list. Either give the TURN nodes stable DNS names
-and list them all in `server.iceServers` (browsers try every candidate), or run a
-single coturn pinned to one node with a stable public IP and advertise just that
-one. Both work; the single-coturn shape is easier to reason about at small scale.
+and list them all in `server.iceServers` (step 3 — with the REST-auth shared
+secret huddle mints the credentials, and the URL list holds no secrets, so the
+chart ConfigMap is fine; browsers try every candidate), or run a single coturn
+pinned to one node with a stable public IP and advertise just that one. Both
+work; the single-coturn shape is easier to reason about at small scale.
 
 ## 6. Node firewall / security groups
 
@@ -375,32 +406,27 @@ kubectl -n huddle rollout status deploy/huddle
 ## Pod-terminated TLS variant (chart extension required)
 
 If you need huddle itself to own TLS on the cluster — e.g. no ingress, direct node
-exposure — you can use the built-in ACME (ADR 008). This requires, at minimum, a
-chart extension (all three are missing from the current templates):
+exposure — you can use the built-in ACME (ADR 008). The env side is already
+covered: the chart's `extraEnv` knob passes `HUDDLE_TLS_MODE=acme`,
+`HUDDLE_TLS_DOMAINS`, `HUDDLE_TLS_CONTACT`, and friends. What is still missing
+from the chart is port plumbing (a small extension if you take it on):
 
-1. An extra-env/envFrom knob so you can pass `HUDDLE_TLS_MODE=acme`,
-   `HUDDLE_TLS_DOMAINS`, … (today `envFrom` binds only the chart's own ConfigMap).
-2. `HUDDLE_BIND=0.0.0.0:443` instead of the hardcoded 3000, plus a
-   `containerPort`/`hostPort` change and the Service/ingress port to match —
+1. `HUDDLE_BIND=0.0.0.0:443` via `extraEnv` (it overrides the ConfigMap's
+   bind), plus the matching `containerPort`/`hostPort` and Service port —
    the TLS-ALPN-01 challenge is answered on the serving port.
-3. Readiness still probes `/api/health` — adjust the port there too.
+2. Readiness still probes `/api/health` over plain HTTP — the probe needs a
+   port/mode that works when the serving port speaks TLS.
 
 Until then, the ingress path above is the supported shape on Kubernetes; the
 [VPS guide](ubuntu-vps.md) covers the binary-owns-443 topology natively.
 
 ## Known chart limitations (as of this guide)
 
-1. **No extra-env / extra-envFrom knob** — pod-terminated TLS (README mentions a
-   "`HUDDLE_TLS_*`-bearing ConfigMap") is not reachable through chart values today.
-2. **`server.iceServers` lands in a ConfigMap** — with TURN REST auth (issue #59)
-   that list carries only URLs, so the fix is delivering the shared secret:
-   an `extraEnv`/`extraEnvFrom` knob would let `HUDDLE_TURN_SHARED_SECRET` come
-   from a Secret instead of the section-5 patch workaround.
-3. `image.repository` defaults to `ghcr.io/aron98/huddle`, which no CI workflow
+1. `image.repository` defaults to `ghcr.io/aron98/huddle`, which no CI workflow
    publishes — you must build and push it yourself.
 
-All three are small, additive chart changes if you take them on; file an issue so
-they land upstream rather than as a local fork.
+It is a small, additive chart change if you take it on; file an issue so
+it lands upstream rather than as a local fork.
 
 ## Troubleshooting quick reference
 
