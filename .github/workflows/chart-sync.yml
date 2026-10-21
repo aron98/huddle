@@ -102,10 +102,15 @@ jobs:
           body="Auto-sync from the ${GITHUB_REF_NAME} tag: chart appVersion → ${version} (image published by release-image.yml), chart version minor-bumped. helm lint passed in the tagging run.
 
           This PR carries no CI check runs — pushes made with GITHUB_TOKEN do not trigger workflows (the same reason the bot commit never re-runs ci.yml). A maintainer merges it (ruleset bypass)."
-          if ! gh pr view charts/sync-appversion --json number >/dev/null 2>&1; then
-            gh pr create --base main --head charts/sync-appversion --title "$title" --body "$body"
-            echo "opened sync PR for ${version}"
-          else
+          # Edit the standing PR only while it is still OPEN (consecutive tags
+          # before a maintainer merge walk the same PR). Once the previous sync
+          # PR was merged or closed, GitHub allows a fresh PR for the same
+          # head branch — create one, since merged PRs cannot be reopened.
+          state=$(gh pr view charts/sync-appversion --json state -q .state 2>/dev/null || echo NONE)
+          if [ "$state" = "OPEN" ]; then
             gh pr edit charts/sync-appversion --title "$title" --body "$body"
             echo "updated existing sync PR for ${version}"
+          else
+            gh pr create --base main --head charts/sync-appversion --title "$title" --body "$body"
+            echo "opened sync PR for ${version}"
           fi
