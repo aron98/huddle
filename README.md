@@ -54,7 +54,7 @@ next (SSO, simulcast, passcodes, E2EE, recording, and more).
 | TLS | Built in: rustls termination + ACME (Let's Encrypt) via `axum-server` / `rustls-acme` — no reverse proxy required ([ADR 008](docs/adr/008-built-in-tls-termination.md)) |
 | Storage | SQLite (single file) |
 | Web client | Rust → WASM with [`Leptos`](https://github.com/leptos-rs/leptos); browser-native WebRTC via `web-sys` |
-| Desktop (later) | Tauri shell reusing the web client |
+| Desktop | [Tauri 2 shell](#desktop-app) reusing the web client |
 | TURN | `coturn` (self-hosted companion) |
 | Deploy | Single binary on a VPS · AWS EC2/Fargate · Kubernetes (Helm) |
 
@@ -390,6 +390,29 @@ For TURN over TLS on the sidecar/host coturn, see the
 Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
 (+ sha256) to the GitHub release.
+
+## Desktop app
+
+> Desktop shell added in [#18](https://github.com/aron98/huddle/issues/18)
+> ([ADR 014](docs/adr/014-tauri-desktop-shell.md)) — this section and
+> [`crates/desktop/`](crates/desktop/README.md) document it.
+
+A native desktop client built with **Tauri 2** that reuses the web client
+unchanged: the shell hosts a small home page (server URL + join box), then
+navigates its webview to your huddle server, which serves the same UI it serves
+to browsers — session cookies, magic-link login, and calls all work per server
+with zero extra configuration.
+
+`crates/desktop` is a **standalone cargo workspace** (excluded from the root
+one), so the server's quality gates never need the Tauri/GUI toolchain. Its
+pure-logic crate (`huddle-desktop-core`) is tested headlessly in CI; bundles
+(.deb/AppImage) are built only on `v*` tags.
+
+Platform support is decided by each OS's embedded browser engine — two-person
+calls work on Windows and macOS; **Linux cannot do calls yet** (WebKitGTK ships
+WebRTC in its 2.56 cycle, ~2027) and macOS screen sharing is a known gap. The
+full matrix, build instructions, and the manual verification checklist are in
+[`crates/desktop/README.md`](crates/desktop/README.md).
 
 ## License
 

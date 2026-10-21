@@ -10,6 +10,7 @@ Cargo workspace, edition 2024, resolver 3, toolchain pinned in `rust-toolchain.t
 - `crates/sfu` (`huddle-sfu`) — sans-io SFU room on **str0m, pinned `=0.24.1`** (pre-1.0 API churn).
 - `crates/server` (`huddle-server`, **binary named `huddle`** — `cargo build -p huddle` fails).
 - `crates/web` (`huddle-web`) — Leptos 0.8 CSR, built with trunk to `crates/web/dist` (gitignored). `src/lib.rs` holds landing/login/dashboard; the meeting page is `src/call.rs` (`MeetingFlow` owns the explicit flow state machine in `src/flow.rs`: prejoin → joining → in-call → left/connection-lost, incl. a designed post-leave view), `src/prejoin.rs` the prejoin page. The flow diagram is `docs/user-flow.md` and the code must match it. wasm-only modules are `#[cfg(target_arch = "wasm32")]`; the native stub render keeps `cargo clippy --all-targets` green.
+- `crates/desktop` — Tauri 2 shell (issue #18). **Standalone cargo workspace, excluded from the root one** (root `Cargo.toml` `exclude`): the four root gates never cover it, and it is never built with the root toolchain invocation. Only `huddle-desktop-core` (pure logic) is headless-testable; `huddle-desktop-app` needs GUI system packages. See `crates/desktop/README.md`.
 
 ## Commands
 
