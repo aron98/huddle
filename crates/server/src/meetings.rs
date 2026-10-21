@@ -39,16 +39,30 @@ pub struct Meeting {
 
 impl From<Meeting> for MeetingDto {
     fn from(m: Meeting) -> Self {
+        // Issue #29: an encrypted stored title is never sent as-is in
+        // `title` — viewers see the masked label, and the blob travels
+        // in the additive `title_ciphertext` field for clients that can
+        // decrypt it (the organizer's browser). This one impl covers
+        // REST responses and the WS `Welcome` alike.
+        let (title, title_ciphertext) = if huddle_protocol::is_encrypted_title(&m.title) {
+            (
+                huddle_protocol::MASKED_TITLE.to_owned(),
+                Some(m.title.clone()),
+            )
+        } else {
+            (m.title, None)
+        };
         Self {
             id: m.id,
             code: m.code,
-            title: m.title,
+            title,
             starts_at: m.starts_at,
             ends_at: m.ends_at,
             cancelled: m.cancelled,
             repeat: m.repeat,
             has_passcode: m.passcode.is_some(),
             e2ee: m.e2ee,
+            title_ciphertext,
         }
     }
 }
@@ -269,11 +283,10 @@ pub async fn update_by_code(
     };
 
     if let Some(title) = &req.title {
-        let title = title.trim();
-        if title.is_empty() || title.len() > 200 {
-            return Err(MeetingError::Invalid);
-        }
-        meeting.title = title.to_owned();
+        // Shared with create validation (issue #29): accepts either a
+        // plaintext title or an `enc1.`-prefixed encrypted blob.
+        huddle_protocol::validate_title(title).map_err(|_| MeetingError::Invalid)?;
+        meeting.title = title.trim().to_owned();
     }
     if let Some(starts_at) = req.starts_at {
         meeting.starts_at = starts_at;

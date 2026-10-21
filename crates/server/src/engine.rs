@@ -1031,6 +1031,7 @@ mod tests {
             repeat: None,
             has_passcode: false,
             e2ee: false,
+            title_ciphertext: None,
         }
     }
 
