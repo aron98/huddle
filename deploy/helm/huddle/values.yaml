@@ -36,10 +36,13 @@ server:
   # WARNING: this value lands in the chart's plain ConfigMap — for the
   # TURN credential use extraSecret + extraEnvFrom instead (below).
   iceServers: ""
-  sessionSecret: "" # set via --set or an existingSecret; random per boot otherwise
+  # Setting this makes the chart create a Secret named <fullname>-secret
+  # with this value under HUDDLE_SESSION_SECRET. Prefer existingSecret
+  # in production: values land in plain files / --set CLI history.
+  sessionSecret: "" # random per boot when unset (with existingSecret)
 
-# Provide `name` of an existing Secret with a HUDDLE_SESSION_SECRET key
-# to avoid putting the session secret in values.
+# Name of an existing Secret with a HUDDLE_SESSION_SECRET key — takes
+# precedence over server.sessionSecret and keeps the secret out of values.
 existingSecret: ""
 
 # Extra environment variables for the huddle container, appended after

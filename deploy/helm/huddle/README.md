@@ -15,19 +15,38 @@ for the full production guide (ingress, cert-manager, coturn companion).
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/aron98/huddle` / `""` (= `appVersion`) / `IfNotPresent` | Container image. No CI workflow publishes the default repository — build and push it yourself. |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/aron98/huddle` / `""` (= `appVersion`) / `IfNotPresent` | Container image, published by `release-image.yml` on every `v*` tag (tag minus the leading `v`, plus `latest`). |
 | `hostNetwork` | `true` | Pod shares the node network namespace (required for direct media). |
 | `service.port` | `3000` | Web/signaling port (TCP). |
 | `server.baseUrl` | `http://localhost:3000` | External URL used in join links, magic links, ICS invites. |
 | `server.publicIp` | `""` | IP advertised in ICE candidates; empty = auto-detect the node IP. |
 | `server.mediaPort` | `40000` | UDP media port. |
 | `server.iceServers` | `""` | Extra ICE servers (your coturn) — lands in the ConfigMap; for credentials use `extraSecret`/`extraEnvFrom` instead (below). |
-| `server.sessionSecret` / `existingSecret` | `""` | Session cookie HMAC key: gate + name of a Secret with a `HUDDLE_SESSION_SECRET` key. |
+| `server.sessionSecret` / `existingSecret` | `""` | Session cookie HMAC key: value gate + name of the Secret holding `HUDDLE_SESSION_SECRET` (below). |
 | `persistence.enabled` / `persistence.size` / `persistence.storageClass` | `true` / `1Gi` / `""` | PVC for SQLite + recordings. |
 | `resources` | `{}` | Container resources. |
 | `extraEnv` | `[]` | Extra env vars (below). |
 | `extraEnvFrom` | `[]` | Extra envFrom sources (below). |
 | `extraSecret` | `{}` | Opt-in chart-managed Secret (below). |
+
+## Session secret
+
+`HUDDLE_SESSION_SECRET` (the HMAC key for stateless session cookies) can be
+delivered two ways:
+
+- `server.sessionSecret: <value>` — the chart creates a Secret named
+  `<fullname>-secret` with the value and points the pod at it. Convenient for
+  `--set`, but the value then lives in chart values / CLI history.
+- `existingSecret: <name>` — reference a Secret you created out-of-band (with
+  a `HUDDLE_SESSION_SECRET` key); takes precedence when both are set, and the
+  chart renders no Secret of its own.
+
+With neither set, huddle falls back to a random key per boot (sessions do not
+survive restarts).
+
+> Migrating a release that set `server.sessionSecret` and hand-created
+> `<fullname>-secret`? The chart now owns that name — delete your manual
+> Secret before `helm upgrade`, or switch to `existingSecret` and keep it.
 
 ## Environment plumbing
 
@@ -87,3 +106,12 @@ extraEnvFrom:
 
 > If you set `fullnameOverride`, the generated Secret is named
 > `<fullnameOverride>-extra-secret` — reference that name in `extraEnvFrom`.
+
+## Chart versioning
+
+The chart is consumed from the repo's `main` branch, never from release tags.
+`appVersion` is updated automatically on every pushed `v*` tag by
+`.github/workflows/chart-sync.yml` (which also minor-bumps the chart
+`version`, lints, and pushes the commit to `main` right after the release):
+the default-branch chart always references the newest published image,
+tagged by `release-image.yml` as the git tag minus the leading `v`.
