@@ -362,6 +362,57 @@ identity is the email), and the provider must support the authorization-code
 flow — huddle always sends a PKCE `S256` challenge and a `nonce`, and only
 accepts asymmetric signature algorithms (RS/ES/PS families) from its JWKS.
 
+### Agent access (CLI + MCP)
+
+Scripts, shells, and AI agents get API access through the OAuth device flow
+(RFC 8628) — huddle is its own authorization server, so no external provider
+is needed. Build the thin REST wrapper:
+
+```sh
+cargo build -p huddle-cli   # binary: target/debug/huddle-cli
+```
+
+Log in once; the CLI prints a code, you approve it in the browser you are
+already signed into, and it stores a refresh token:
+
+```sh
+huddle-cli login --server https://huddle.example.com
+```
+
+From then on `create`, `list`, `get`, `cancel`, `link`, and `ics` work
+non-interactively — every command takes `--json`, destructive ones require
+`--yes`, and exit codes are stable for scripting (0 ok, 1 usage, 2 auth,
+3 server error):
+
+```sh
+huddle-cli create --title "Sync" --in 1h --json
+huddle-cli cancel ABCD-1234-EFGH --yes
+```
+
+Tokens are scoped (`meetings:read`, `meetings:write`) and revocable: the
+organizer dashboard lists every authorization with a revoke button, and
+revoking kills the agent's refresh token immediately. The login is stored in
+`~/.config/huddle/cli.json` (mode 0600); override the location with
+`--token-file` or `$HUDDLE_CLI_TOKEN_FILE`.
+
+The same binary serves MCP tools over stdio for AI agents — one login covers
+both. Point any MCP-capable client at it:
+
+```json
+{
+  "mcpServers": {
+    "huddle": {
+      "command": "/usr/local/bin/huddle-cli",
+      "args": ["mcp", "--server", "https://huddle.example.com"]
+    }
+  }
+}
+```
+
+The agent can then call `create_meeting`, `list_upcoming`, `get_meeting`, and
+`cancel_meeting` and receive join links and ICS URLs as structured content.
+Details and trade-offs: [ADR 013](docs/adr/013-agent-access-oauth-device-flow.md).
+
 ### Docker / Kubernetes
 
 Docker: `docker build -t huddle .` produces the single-binary image. For
