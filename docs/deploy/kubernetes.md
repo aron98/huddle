@@ -41,25 +41,34 @@ Practical consequences:
 
 ## Prerequisites: the container image
 
-The Helm chart references `ghcr.io/aron98/huddle` (tag defaults to the chart's
-`appVersion`), but **no workflow in this repo publishes that image** — the release
-pipeline ships a static musl tarball for the VPS path. For Kubernetes you must build
-and push the image yourself from the repo root `Dockerfile` (multi-stage: web client
-built with trunk, dist copied into `crates/server/assets`, release server binary on
-`debian:bookworm-slim` with ca-certificates only):
-
-```sh
-git checkout v0.1.0                       # the version you deploy
-docker build -t ghcr.io/<your-org>/huddle:0.1.0 .
-docker push ghcr.io/<your-org>/huddle:0.1.0
-```
-
-Then point the chart at it:
+The Helm chart references `ghcr.io/aron98/huddle`, which is published
+automatically: pushing a `v*` tag builds the image from `Dockerfile.release`
+(multi-stage: web client built with trunk, dist copied into
+`crates/server/assets`, static musl server binary on alpine with
+ca-certificates only) and pushes it to GHCR — see
+`.github/workflows/release-image.yml`. Image tags mirror release tags without
+the leading `v` (release v1.2.3 → image tag `1.2.3`); `latest` follows the
+newest release. Images exist from the first release tag published after the
+image workflow landed.
 
 ```yaml
 image:
-  repository: ghcr.io/<your-org>/huddle
-  tag: "0.1.0"
+  repository: ghcr.io/aron98/huddle
+  tag: "1.2.3"        # defaults to the chart's appVersion — pin explicitly
+```
+
+> The chart's `appVersion` can lag behind the newest release (it only moves
+> when the chart itself is released); pin `image.tag` deliberately instead of
+> riding the default.
+
+Self-hosting the image in your own registry (or building with local patches)
+works exactly as before — build and push the repo root `Dockerfile`
+(glibc/debian variant) or `Dockerfile.release` (musl/alpine variant, what CI
+publishes), then point `image.repository`/`image.tag` at it:
+
+```sh
+docker build -f Dockerfile.release -t <registry>/huddle:1.2.3 .
+docker push <registry>/huddle:1.2.3
 ```
 
 ## 1. Install cert-manager and ingress-nginx
@@ -126,9 +135,10 @@ extraEnvFrom:
 `my-values.yaml`:
 
 ```yaml
-image:
-  repository: ghcr.io/<your-org>/huddle
-  tag: "0.1.0"
+# image: repository/tag default to ghcr.io/aron98/huddle at the chart's
+# appVersion — pin an explicit release tag here unless you ride the default:
+# image:
+#   tag: "1.2.3"
 
 hostNetwork: true          # default — do not change, see the UDP constraint
 
@@ -422,11 +432,16 @@ Until then, the ingress path above is the supported shape on Kubernetes; the
 
 ## Known chart limitations (as of this guide)
 
-1. `image.repository` defaults to `ghcr.io/aron98/huddle`, which no CI workflow
-   publishes — you must build and push it yourself.
+1. ~~`image.repository` defaults to `ghcr.io/aron98/huddle`, which no CI workflow
+   publishes~~ — resolved: `release-image.yml` (this change) publishes it on
+   every `v*` tag. The remaining caveat is that the chart's `appVersion` only
+   advances when the chart itself is released, so pin `image.tag` to the newest
+   server release (tracked in issue #71).
 
-It is a small, additive chart change if you take it on; file an issue so
-it lands upstream rather than as a local fork.
+The earlier gaps — no `extraEnv`/`extraEnvFrom` knob and TURN credentials
+landing in the plain ConfigMap — were resolved by the chart 0.2.0 plumbing
+this guide now uses. If you spot another gap, file an issue so it lands
+upstream rather than as a local fork.
 
 ## Troubleshooting quick reference
 

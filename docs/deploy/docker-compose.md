@@ -1,7 +1,8 @@
 # Deploying Huddle with Docker Compose
 
-Production huddle + coturn stack on a single Docker host: the release image built
-from the repo `Dockerfile` (web client baked into the binary via rust-embed), TLS via
+Production huddle + coturn stack on a single Docker host: the published
+`ghcr.io/aron98/huddle` image (web client baked into the musl static binary via
+rust-embed — built from `Dockerfile.release` on every release tag), TLS via
 huddle's built-in ACME client, coturn alongside, host networking for WebRTC media.
 
 All example files live in [`deploy/compose/`](../../deploy/compose/) in the repo:
@@ -67,25 +68,49 @@ sed -i "s/REPLACE_WITH_TURN_SHARED_SECRET/${TURN_SHARED_SECRET}/" turnserver.con
 Point `HUDDLE_DOMAIN` (and `TURN_DOMAIN`) DNS A records at the host first — the
 ACME TLS-ALPN-01 challenge requires the domain to resolve here before huddle starts.
 
-## 2. Build and start
+## 2. Pull and start
 
 ```sh
-docker compose build          # builds the root Dockerfile: trunk web build + release server
+docker compose pull huddle       # ghcr.io/aron98/huddle:<HUDDLE_IMAGE_TAG>
 docker compose up -d
 docker compose logs -f huddle # wait for the ACME issuance log line
 curl -fsS https://meet.example.com/api/health
 # {"status":"ok"}
 ```
 
+Pin the tag: set `HUDDLE_IMAGE_TAG` in `.env` to a published release tag
+(without the leading `v` — release v1.2.3 is image tag `1.2.3`). The default
+is `latest`, which upgrades implicitly and is not reproducible — fine for
+evaluating, not for production. Images exist from the first release tag
+published after the image workflow landed.
+
 The `huddle-data` volume holds `/data` inside the container: SQLite database
 (`<data_dir>/huddle.sqlite3`), the ACME certificate/account cache
 (`<data_dir>/acme-cache`) and recordings. It must survive restarts and be part of
 backups — see the [hardening checklist](hardening-checklist.md#backups).
 
-> **No healthcheck, on purpose.** The runtime image is debian:bookworm-slim with
+> **No healthcheck, on purpose.** The runtime image is alpine with
 > ca-certificates only (no curl/wget), so an in-container HTTP probe would need a
 > bigger, less minimal image. Monitor `/api/health` and `/metrics` (bearer
 > `HUDDLE_STATS_TOKEN`) from outside, e.g. uptime-kuma or a k8s-style probe later.
+
+### Variant: build your own image
+
+If you prefer (or need) a self-built image — unpublished patches, an air-gapped
+registry, a different base — the repo root `Dockerfile` builds it locally
+(multi-stage: trunk web build, release server build, `debian:bookworm-slim`
+runtime):
+
+```sh
+# comment the `image:` line of the huddle service in docker-compose.yml,
+# uncomment the `build:` block (context: ../..) and `image: huddle:local`
+docker compose build huddle
+docker compose up -d
+```
+
+`Dockerfile.release` (the recipe CI publishes to GHCR) is also locally
+buildable: `docker build -f Dockerfile.release -t huddle:musl .` — same musl
+static binary on alpine instead of the glibc/debian variant.
 
 ## 3. coturn TLS (optional)
 
@@ -126,11 +151,15 @@ TLS-terminating proxy in front. Know the trade-offs, all of which also apply to 
 ## Upgrades
 
 ```sh
-git fetch --tags && git checkout v0.1.0   # or the version you deploy
-docker compose build
-docker compose up -d                       # recreates huddle; drops in-flight meetings
+${EDITOR:-vi} .env                      # bump HUDDLE_IMAGE_TAG to the new release
+docker compose pull huddle
+docker compose up -d                    # recreates huddle; drops in-flight meetings
 docker compose logs huddle | grep -i migrate
 ```
+
+For a self-built image (see the variant above) the equivalent is the classic
+checkout-and-rebuild: `git fetch --tags && git checkout v1.1.0 && docker compose
+build huddle && docker compose up -d`.
 
 Schema migrations run automatically at startup (`sqlx::migrate!` is embedded in the
 binary — no migration files to copy). There is no downgrade path: back up the

@@ -11,12 +11,18 @@ name: huddle
 
 services:
   huddle:
-    # The repo Dockerfile builds the release image: web client built with
-    # trunk and baked into the binary via rust-embed, single static server
-    # binary on debian:bookworm-slim (+ ca-certificates only).
-    build:
-      context: ../..
-    image: huddle:local
+    # Published release image: ghcr.io/aron98/huddle, built and pushed on
+    # v* tags by .github/workflows/release-image.yml (Dockerfile.release:
+    # web client baked into a musl static binary, alpine runtime +
+    # ca-certificates only). Pin a real release tag in .env
+    # (HUDDLE_IMAGE_TAG, e.g. 1.1.0) instead of tracking latest.
+    image: ghcr.io/aron98/huddle:${HUDDLE_IMAGE_TAG:-latest}
+    # Self-build alternative (root Dockerfile, debian/glibc variant):
+    # comment the image line above and uncomment the next two lines, then
+    # run `docker compose build huddle`.
+    # build:
+    #   context: ../..
+    # image: huddle:local
     restart: unless-stopped
     # Host networking: the SFU advertises a directly-reachable UDP candidate.
     # Docker bridge NAT makes WebRTC UDP flaky; built-in ACME also needs the
