@@ -5,7 +5,7 @@
 # runtime stage is a slim Debian with just the huddle binary.
 
 # --- web client: rust -> wasm via trunk ---------------------------------
-FROM rust:1.96-slim-bookworm AS web
+FROM rust:1.96.0-slim-bookworm AS web
 
 RUN rustup target add wasm32-unknown-unknown
 
@@ -18,7 +18,15 @@ COPY . .
 RUN cd crates/web && trunk build --release
 
 # --- server binary: embeds the freshly built web bundle -----------------
-FROM rust:1.96-slim-bookworm AS server
+FROM rust:1.96.0-slim-bookworm AS server
+
+# aws-lc-sys (the rustls crypto backend) needs cmake + perl at build time;
+# cmake's default Unix Makefiles generator needs make (gcc already ships in
+# the rust slim image). Mirrors "apk add build-base cmake perl" in
+# Dockerfile.release and the install-build-deps step of release.yml.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake make perl \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
