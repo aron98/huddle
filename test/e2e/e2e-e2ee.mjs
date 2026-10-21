@@ -219,9 +219,18 @@ const waitTransformStats = (who, page, refresh, { requireDecrypted = true } = {}
     return null;
   });
 
+// A sender may switch to a new epoch before every receiver has imported
+// the new key; frames dropped in that window are by design. Allow a small
+// bounded number; a large value would point at a stuck key-distribution
+// path, and genuine decrypt failures (known key, bad auth) always fail.
+const PENDING_KEY_MISS_LIMIT = 8;
+
 function assertHealthyTransform(who, stats) {
   if (stats.decryptFail !== 0) {
     fail(`${who}: transform reported decrypt failures: ${JSON.stringify(stats)}`);
+  }
+  if ((stats.pendingKeyMiss ?? 0) > PENDING_KEY_MISS_LIMIT) {
+    fail(`${who}: too many frames dropped waiting for epoch keys: ${JSON.stringify(stats)}`);
   }
   if (stats.degraded !== false) {
     fail(`${who}: transform reported degraded in a healthy call: ${JSON.stringify(stats)}`);

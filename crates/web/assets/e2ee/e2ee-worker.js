@@ -42,6 +42,12 @@ const stats = {
   encryptedFrames: 0,
   decryptedFrames: 0,
   decryptFail: 0,
+  // Frames dropped because their KID had no key material YET — the
+  // expected transient during epoch key distribution (a sender can switch
+  // to a new epoch before every receiver has imported the new key). These
+  // drops are by design; `decryptFail` counts only frames that failed
+  // WITH known key material (genuine corruption/auth failures).
+  pendingKeyMiss: 0,
   emaMs: 0,
   degraded: false,
 };
@@ -55,6 +61,7 @@ function post(message) {
 function postStats() {
   post({ t: 'stats', attached: stats.attached, encryptedFrames: stats.encryptedFrames,
     decryptedFrames: stats.decryptedFrames, decryptFail: stats.decryptFail,
+    pendingKeyMiss: stats.pendingKeyMiss,
     emaMs: Math.round(stats.emaMs * 100) / 100, degraded: stats.degraded });
 }
 
@@ -220,7 +227,10 @@ async function decryptFrame(frame, kind) {
   const kid = ((header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4]) >>> 0;
   const material = keyTable.get(kid);
   if (!material) {
-    stats.decryptFail += 1;
+    // No key material for this KID yet — expected while an epoch's sender
+    // key is still in flight to us (sender switched before our import).
+    // Drop (never plaintext) and count separately from genuine failures.
+    stats.pendingKeyMiss += 1;
     trackMs(performance.now() - t0);
     return null;
   }
