@@ -3,6 +3,11 @@
   "productName": "Huddle",
   "version": "0.1.0",
   "description": "Huddle desktop shell (Electron) — loads the Huddle server's web client.",
+  "homepage": "https://github.com/aron98/huddle",
+  "author": {
+    "name": "aron98",
+    "email": "aron98@users.noreply.github.com"
+  },
   "private": true,
   "main": "src/main.mjs",
   "scripts": {
