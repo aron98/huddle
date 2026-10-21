@@ -108,3 +108,25 @@ jobs:
       - name: e2e suites
         run: node run-all.mjs
         working-directory: test/e2e
+
+  # Desktop shell gate: pure node — `node --check` over every shell file plus
+  # the node:test unit tests over the pure-logic modules. No npm install
+  # needed (the shell has no runtime dependencies), so this stays a
+  # seconds-cheap job next to the Rust/e2e gates.
+  desktop:
+    name: electron shell check + tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: syntax check
+        run: npm run check
+        working-directory: electron
+
+      - name: unit tests
+        run: npm test
+        working-directory: electron
