@@ -13,6 +13,9 @@ pub const PAIRWISE_INFO: &[u8] = b"huddle-e2ee/v1/pairwise";
 pub const KID_INFO: &[u8] = b"huddle-e2ee/v1/kid";
 pub const SENDER_KEY_AAD_PREFIX: &[u8] = b"huddle-e2ee/v1/sender-key";
 pub const VERIFIED_AAD_PREFIX: &[u8] = b"huddle-e2ee/v1/verified";
+/// Binds an in-call title envelope (issue #29, tag 0x04) to its sender
+/// and receiver — same pattern as the sender-key and verified AADs.
+pub const TITLE_AAD_PREFIX: &[u8] = b"huddle-e2ee/v1/title";
 
 /// Raw ECDH P-256 public keys on the wire: uncompressed points.
 pub const PUBLIC_KEY_LEN: usize = 65;

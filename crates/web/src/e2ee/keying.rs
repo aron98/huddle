@@ -6,7 +6,9 @@
 //! extensible (new kinds of payloads — e.g. #28's encrypted chat —
 //! ride the same relay without a protocol change).
 
-use crate::e2ee::safety::{PUBLIC_KEY_LEN, SENDER_KEY_AAD_PREFIX, VERIFIED_AAD_PREFIX};
+use crate::e2ee::safety::{
+    PUBLIC_KEY_LEN, SENDER_KEY_AAD_PREFIX, TITLE_AAD_PREFIX, VERIFIED_AAD_PREFIX,
+};
 use base64::Engine;
 use uuid::Uuid;
 
@@ -16,6 +18,10 @@ pub const TAG_IDENTITY: u8 = 0x01;
 pub const TAG_SENDER_KEY: u8 = 0x02;
 /// A verification confirmation sealed to the receiver's pairwise key.
 pub const TAG_VERIFIED: u8 = 0x03;
+/// The meeting title sealed to the receiver's pairwise key (issue #29,
+/// ADR 012): distributed after the identity exchange so participants
+/// learn the true title that at-rest encryption masked.
+pub const TAG_TITLE: u8 = 0x05;
 
 /// AES-GCM nonce length (the standard 96-bit size).
 pub const NONCE_LEN: usize = 12;
@@ -28,6 +34,7 @@ pub enum KeyingPayload {
     Identity { public: Vec<u8> },
     SenderKey { nonce: Vec<u8>, ciphertext: Vec<u8> },
     Verified { nonce: Vec<u8>, ciphertext: Vec<u8> },
+    Title { nonce: Vec<u8>, ciphertext: Vec<u8> },
 }
 
 /// Encode an identity announce (ADR 010, D4 tag 0x01).
@@ -58,6 +65,11 @@ pub fn encode_verified(nonce: &[u8], ciphertext: &[u8]) -> String {
     encode_sealed(TAG_VERIFIED, nonce, ciphertext)
 }
 
+/// Encode a title envelope (issue #29, tag 0x05; chat owns 0x04).
+pub fn encode_title(nonce: &[u8], ciphertext: &[u8]) -> String {
+    encode_sealed(TAG_TITLE, nonce, ciphertext)
+}
+
 /// Decode an envelope; `None` on any malformed input.
 pub fn decode(payload: &str) -> Option<KeyingPayload> {
     let bytes = base64::engine::general_purpose::STANDARD
@@ -73,6 +85,10 @@ pub fn decode(payload: &str) -> Option<KeyingPayload> {
             ciphertext: data[NONCE_LEN..].to_vec(),
         }),
         TAG_VERIFIED if data.len() > NONCE_LEN => Some(KeyingPayload::Verified {
+            nonce: data[..NONCE_LEN].to_vec(),
+            ciphertext: data[NONCE_LEN..].to_vec(),
+        }),
+        TAG_TITLE if data.len() > NONCE_LEN => Some(KeyingPayload::Title {
             nonce: data[..NONCE_LEN].to_vec(),
             ciphertext: data[NONCE_LEN..].to_vec(),
         }),
@@ -95,6 +111,17 @@ pub fn sender_key_aad(sender: Uuid, receiver: Uuid) -> Vec<u8> {
 pub fn verified_aad(sender: Uuid, receiver: Uuid) -> Vec<u8> {
     let mut aad = Vec::with_capacity(VERIFIED_AAD_PREFIX.len() + 32);
     aad.extend_from_slice(VERIFIED_AAD_PREFIX);
+    aad.extend_from_slice(sender.as_bytes());
+    aad.extend_from_slice(receiver.as_bytes());
+    aad
+}
+
+/// The additional data binding a title envelope to its sender and
+/// receiver (issue #29): a relayed title is useless to anyone else and
+/// cannot be replayed in the other direction.
+pub fn title_aad(sender: Uuid, receiver: Uuid) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(TITLE_AAD_PREFIX.len() + 32);
+    aad.extend_from_slice(TITLE_AAD_PREFIX);
     aad.extend_from_slice(sender.as_bytes());
     aad.extend_from_slice(receiver.as_bytes());
     aad
@@ -151,10 +178,20 @@ mod tests {
         let verified = encode_verified(&nonce, &ciphertext);
         assert_eq!(
             decode(&verified),
-            Some(KeyingPayload::Verified { nonce, ciphertext })
+            Some(KeyingPayload::Verified {
+                nonce: nonce.clone(),
+                ciphertext: ciphertext.clone()
+            })
+        );
+        let title = encode_title(&nonce, &ciphertext);
+        assert_eq!(
+            decode(&title),
+            Some(KeyingPayload::Title { nonce, ciphertext })
         );
         // The tags must not be confusable.
         assert_ne!(sender, verified);
+        assert_ne!(sender, title);
+        assert_ne!(verified, title);
     }
 
     #[test]
@@ -202,6 +239,15 @@ mod tests {
             .concat()
         );
         assert_ne!(aad, verified_aad(sender, receiver));
+        // The title AAD is distinct from (and direction-bound like) the
+        // other sealed AADs (issue #29).
+        assert_ne!(aad, title_aad(sender, receiver));
+        assert_ne!(verified_aad(sender, receiver), title_aad(sender, receiver));
+        assert_ne!(title_aad(sender, receiver), title_aad(receiver, sender));
+        assert_eq!(
+            title_aad(sender, receiver),
+            [TITLE_AAD_PREFIX, sender.as_bytes(), receiver.as_bytes()].concat()
+        );
         // Swapping roles yields a different AAD — a confirmation meant
         // for one direction cannot be replayed in the other.
         assert_ne!(

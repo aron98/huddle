@@ -55,6 +55,14 @@ pub struct E2eeSession {
     /// the session task can cheaply tell when the transform worker
     /// needs a fresh key table (ADR 011, D1 sync).
     keys_version: u64,
+    /// The true meeting title this client knows (issue #29): seeded by
+    /// the flow when the prejoin fetch decrypted the stored blob (the
+    /// organizer's browser), or learned from a peer's title envelope
+    /// afterwards. `None` while only the masked label is known.
+    known_title: Option<String>,
+    /// A freshly learned title the UI has not surfaced yet; drained
+    /// via [`E2eeSession::take_title`].
+    pending_title: Option<String>,
 }
 
 /// A snapshot of the current-epoch media keys for the transform
@@ -68,9 +76,15 @@ pub struct MediaKeys {
 
 impl E2eeSession {
     /// Load the long-term identity and the persisted verified set.
+    /// `known_title` carries the title the caller could decrypt before
+    /// joining (organizer's browser), so it can be relayed to peers.
     /// `None` (with the call continuing) when the browser cannot do
     /// E2EE — no IndexedDB / WebCrypto, or a broken store.
-    pub async fn start(you: ParticipantId, epoch: u64) -> Option<Self> {
+    pub async fn start(
+        you: ParticipantId,
+        epoch: u64,
+        known_title: Option<String>,
+    ) -> Option<Self> {
         let identity = match identity::load_or_create().await {
             Ok(identity) => identity,
             Err(e) => {
@@ -87,6 +101,8 @@ impl E2eeSession {
             peers: HashMap::new(),
             verified_fingerprints,
             keys_version: 0,
+            known_title,
+            pending_title: None,
         })
     }
 
@@ -280,6 +296,9 @@ impl E2eeSession {
                 self.receive_verified_confirmation(from, &nonce, &ciphertext)
                     .await;
             }
+            Some(KeyingPayload::Title { nonce, ciphertext }) => {
+                self.receive_title(from, &nonce, &ciphertext, rtc).await;
+            }
             None => leptos::logging::warn!("dropped a malformed keying envelope from {from}"),
         }
     }
@@ -323,6 +342,87 @@ impl E2eeSession {
             },
         );
         self.send_own_key(from, rtc).await;
+        // Issue #29: if this client already knows the true title (the
+        // organizer's browser decrypted it before joining), hand it
+        // over now that the pairwise key exists.
+        if self.known_title.is_some() {
+            self.send_title(from, rtc).await;
+        }
+    }
+
+    /// Open a peer's title envelope (issue #29). On a *new* title:
+    /// adopt it, queue it for the UI, and re-send it to every other
+    /// peer — forwarding stops there because an already-known title is
+    /// not re-adopted, so the mesh cannot loop.
+    async fn receive_title(
+        &mut self,
+        from: ParticipantId,
+        nonce: &[u8],
+        ciphertext: &[u8],
+        rtc: &mut Browser,
+    ) {
+        if self.known_title.is_some() {
+            // Known already — this is a redundant relay; do nothing
+            // (and in particular do not forward again).
+            return;
+        }
+        let Some(peer) = self.peers.get(&from) else {
+            return;
+        };
+        let Some(pairwise_key) = peer.pairwise_key.clone() else {
+            return;
+        };
+        let aad = keying::title_aad(from, self.you);
+        let Ok(plaintext) = keying::open(&pairwise_key, nonce, &aad, ciphertext).await else {
+            leptos::logging::warn!("could not open the title from {from}");
+            return;
+        };
+        let Ok(title) = String::from_utf8(plaintext) else {
+            leptos::logging::warn!("the title from {from} was not valid UTF-8");
+            return;
+        };
+        self.known_title = Some(title.clone());
+        self.pending_title = Some(title);
+        // Re-distribute to peers learned before the title arrived.
+        let targets: Vec<ParticipantId> = self
+            .peers
+            .keys()
+            .copied()
+            .filter(|id| *id != from)
+            .collect();
+        for to in targets {
+            self.send_title(to, rtc).await;
+        }
+    }
+
+    /// Seal the known title to one peer's pairwise key (issue #29).
+    async fn send_title(&self, to: ParticipantId, rtc: &mut Browser) {
+        let Some(title) = self.known_title.as_ref() else {
+            return;
+        };
+        let Some(peer) = self.peers.get(&to) else {
+            return;
+        };
+        let Some(pairwise_key) = peer.pairwise_key.clone() else {
+            return;
+        };
+        let Ok(nonce) = keying::random_bytes(keying::NONCE_LEN) else {
+            return;
+        };
+        let aad = keying::title_aad(self.you, to);
+        let Ok(ciphertext) = keying::seal(&pairwise_key, &nonce, &aad, title.as_bytes()).await
+        else {
+            return;
+        };
+        let payload = keying::encode_title(&nonce, &ciphertext);
+        if let Err(e) = rtc.send_e2ee_keying(to, self.epoch, payload).await {
+            leptos::logging::warn!("could not send the title to {to}: {e}");
+        }
+    }
+
+    /// Drain a title learned from a peer, for the UI to apply.
+    pub fn take_title(&mut self) -> Option<String> {
+        self.pending_title.take()
     }
 
     /// Open and accept a peer's sender key. The epoch inside the

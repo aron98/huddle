@@ -359,7 +359,14 @@ async fn run_session(
     // The Welcome says whether the meeting is already being recorded.
     signals.recording.set(client.recording());
     if let Some(meeting) = client.meeting() {
-        signals.prejoin.meeting.set(Some(meeting.clone()));
+        // The Welcome DTO carries the masked title for encrypted
+        // meetings; keep the one this browser decrypted before joining
+        // (issue #29) instead of letting the clobber lose it.
+        let mut meeting = meeting.clone();
+        if let Some(title) = signals.prejoin.decrypted_title.get_untracked() {
+            meeting.title = title;
+        }
+        signals.prejoin.meeting.set(Some(meeting));
     }
 
     // E2EE (issues #27/#28, ADRs 010/011): set up the keying session and
@@ -386,7 +393,11 @@ async fn run_session(
         match client.you().map(|p| p.id) {
             Some(you) => {
                 signals.you_id.set(Some(you));
-                match E2eeSession::start(you, client.e2ee_epoch()).await {
+                // The title this browser decrypted before joining (the
+                // organizer's) is relayed to peers after the identity
+                // exchange; guests start with none (issue #29).
+                let known_title = signals.prejoin.decrypted_title.get_untracked();
+                match E2eeSession::start(you, client.e2ee_epoch(), known_title).await {
                     Some(mut session) => {
                         let roster_snapshot = client.roster().to_vec();
                         session.announce_to_all(&roster_snapshot, &mut client).await;
@@ -618,6 +629,17 @@ async fn run_session(
                             e2ee.handle_server_message(&buffered, &mut client).await;
                         }
                         signals.e2ee_peers.set(e2ee.peer_views());
+                        // A peer relayed the true meeting title (issue
+                        // #29): the in-call and post-leave views read
+                        // this DTO, so patch it and remember the title.
+                        if let Some(title) = e2ee.take_title() {
+                            signals.prejoin.decrypted_title.set(Some(title.clone()));
+                            signals.prejoin.meeting.update(|m| {
+                                if let Some(m) = m {
+                                    m.title = title.clone();
+                                }
+                            });
+                        }
                     } else {
                         let _ = client.take_pending_e2ee();
                     }
@@ -1376,7 +1398,7 @@ fn CallView(
                         "E2EE"
                     </span>
                 })}
-                <p class="call-title">{meeting_title}</p>
+                <p class="call-title" data-testid="call-title">{meeting_title}</p>
                 {move || {
                     status
                         .get()

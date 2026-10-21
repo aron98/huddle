@@ -4,9 +4,9 @@
 //!
 //! [`safety`], [`sframe`] and the framing halves of [`keying`] and
 //! [`chat`] are pure Rust so the derivations are unit-testable
-//! natively; [`identity`], [`session`] and [`transform`] are wasm-only —
-//! they wrap WebCrypto, IndexedDB and the RTCTransform APIs, which
-//! only exist in the browser.
+//! natively; [`identity`], [`session`], [`transform`] and [`titles`]
+//! are wasm-only — they wrap WebCrypto, IndexedDB and the
+//! RTCTransform APIs, which only exist in the browser.
 
 pub mod chat;
 pub mod keying;
@@ -20,4 +20,5 @@ pub mod identity;
 pub mod session;
 
 #[cfg(target_arch = "wasm32")]
+pub mod titles;
 pub mod transform;

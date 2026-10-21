@@ -41,6 +41,10 @@ pub struct PrejoinState {
     /// Meeting info from `GET /api/meetings/{code}`, for the title and
     /// the "starts at" hint.
     pub meeting: RwSignal<Option<MeetingDto>>,
+    /// The true title when this browser could decrypt the stored blob
+    /// (the organizer's device, issue #29); `None` for guests, who see
+    /// the masked label until the E2EE relay delivers the real one.
+    pub decrypted_title: RwSignal<Option<String>>,
     /// Joinability from the same fetch; refreshed by a poll while the
     /// meeting has not opened yet.
     pub joinability: RwSignal<Option<Joinability>>,
@@ -72,6 +76,7 @@ impl PrejoinState {
             audio: RwSignal::new(audio_settings::load()),
             media_error: RwSignal::new(None),
             meeting: RwSignal::new(None),
+            decrypted_title: RwSignal::new(None),
             joinability: RwSignal::new(None),
             join_error: RwSignal::new(None),
             missing: RwSignal::new(false),
@@ -140,7 +145,7 @@ fn poll_until_open(code: String, state: PrejoinState) {
                 {
                     let still_not_open = matches!(response.joinability, Joinability::NotYet { .. });
                     state.joinability.set(Some(response.joinability));
-                    state.meeting.set(Some(response.meeting));
+                    apply_meeting_title(state, response.meeting).await;
                     if !still_not_open && let Some(id) = handle.get() {
                         window().clear_interval_with_handle(id);
                         handle.set(None);
@@ -160,6 +165,20 @@ fn poll_until_open(code: String, state: PrejoinState) {
         // this leak by the meeting opening.
         std::mem::forget(callback);
     }
+}
+
+/// Decrypt the stored title blob when this browser is the organizer's
+/// (the title key is the organizer identity's self-ECDH) and publish
+/// the meeting DTO with the true title; guests keep the masked label
+/// the server sent (issue #29).
+async fn apply_meeting_title(state: PrejoinState, mut meeting: MeetingDto) {
+    if let Some(ciphertext) = meeting.title_ciphertext.clone()
+        && let Ok(Some(title)) = crate::e2ee::titles::decrypt_title(&ciphertext).await
+    {
+        state.decrypted_title.set(Some(title.clone()));
+        meeting.title = title;
+    }
+    state.meeting.set(Some(meeting));
 }
 
 /// The prejoin page. `on_join` hands (name, stream) to the flow owner,
@@ -189,7 +208,7 @@ pub fn Prejoin(
                     if let Ok(response) = serde_json::from_str::<MeetingResponse>(&body) {
                         let not_yet = matches!(response.joinability, Joinability::NotYet { .. });
                         state.joinability.set(Some(response.joinability));
-                        state.meeting.set(Some(response.meeting));
+                        apply_meeting_title(state, response.meeting).await;
                         if not_yet {
                             poll_until_open(code, state);
                         }
@@ -409,7 +428,7 @@ pub fn Prejoin(
 
             <section class="prejoin">
                 <div class="prejoin-media">
-                    <h1 class="page-title">{heading}</h1>
+                    <h1 class="page-title" data-testid="prejoin-title">{heading}</h1>
                     <p class="schedule-hint">
                         {move || schedule_hint().map(|hint| view! { <span class="chip">{hint}</span> })}
                         {move || {

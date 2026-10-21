@@ -242,12 +242,24 @@ fn Dashboard() -> impl IntoView {
     // The E2EE trust mode is chosen at creation (issue #27, ADR 010).
     let create_e2ee = RwSignal::new(false);
 
-    // Refresh the owned-meetings list in the background.
+    // Refresh the owned-meetings list in the background. Encrypted
+    // titles (issue #29) are decrypted per row: this is the
+    // organizer's dashboard, and the title key is the organizer
+    // identity's self-ECDH, so rows this browser created open; ones
+    // from other devices keep the masked label.
     fn refresh(meetings: RwSignal<Vec<MeetingResponse>>) {
         spawn_local(async move {
             if let Ok((200, body)) = api::fetch_text("GET", "/api/meetings/mine", None).await
-                && let Ok(list) = serde_json::from_str::<Vec<MeetingResponse>>(&body)
+                && let Ok(mut list) = serde_json::from_str::<Vec<MeetingResponse>>(&body)
             {
+                for row in &mut list {
+                    if let Some(ciphertext) = row.meeting.title_ciphertext.clone()
+                        && let Ok(Some(title)) =
+                            crate::e2ee::titles::decrypt_title(&ciphertext).await
+                    {
+                        row.meeting.title = title;
+                    }
+                }
                 meetings.set(list);
             }
         });
@@ -314,7 +326,7 @@ fn Dashboard() -> impl IntoView {
             _ => None,
         };
         let passcode = create_passcode.get_untracked().trim().to_owned();
-        let request = CreateMeetingRequest {
+        let mut request = CreateMeetingRequest {
             title: title.get_untracked().trim().to_owned(),
             starts_at,
             ends_at,
@@ -322,16 +334,29 @@ fn Dashboard() -> impl IntoView {
             passcode: (!passcode.is_empty()).then_some(passcode),
             e2ee: create_e2ee.get_untracked(),
         };
+        // Validate the *plaintext* shape before sealing it — the server
+        // can no longer see the title to check (issue #29).
         if let Err(message) = request.validate() {
             status.set(Some(message.to_owned()));
             return;
         }
-        let Ok(body) = serde_json::to_string(&request) else {
-            status.set(Some("Could not encode the meeting.".to_owned()));
-            return;
-        };
         status.set(Some("Creating…".to_owned()));
         spawn_local(async move {
+            // E2EE meetings store the title as an enc1 blob sealed to
+            // this browser's identity; plaintext meetings send it as-is.
+            if request.e2ee {
+                match crate::e2ee::titles::encrypt_title(&request.title).await {
+                    Ok(blob) => request.title = blob,
+                    Err(e) => {
+                        status.set(Some(format!("Could not encrypt the title: {e}")));
+                        return;
+                    }
+                }
+            }
+            let Ok(body) = serde_json::to_string(&request) else {
+                status.set(Some("Could not encode the meeting.".to_owned()));
+                return;
+            };
             match api::fetch_text("POST", "/api/meetings", Some(body)).await {
                 Ok((201, _)) => {
                     status.set(None);
@@ -662,6 +687,7 @@ fn Dashboard() -> impl IntoView {
                                     let is_e2ee = current.meeting.e2ee;
                                     let e2ee_testid = format!("e2ee-state-{code}");
                                     let row_testid = format!("meeting-row-{code}");
+                                    let title_testid = format!("meeting-title-{code}");
                                     let join_href = format!("/m/{code}");
                                     let ics_href = format!("/api/meetings/{code}/ics");
                                     let ics_testid = format!("ics-{code}");
@@ -670,7 +696,7 @@ fn Dashboard() -> impl IntoView {
                                     view! {
                                         <li data-testid=row_testid class="meeting-row">
                                             <div class="meeting-row-main">
-                                                <strong class="meeting-title">
+                                                <strong class="meeting-title" data-testid=title_testid>
                                                     {current.meeting.title.clone()}
                                                 </strong>
                                                 <p class="meeting-when">
