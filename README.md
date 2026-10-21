@@ -36,8 +36,9 @@ See [Development](#development) for the dev loop or
   dashboard, ICS export for calendars, and join windows; guests join with just
   a display name, no account.
 - **Small and observable** — one static binary with the web UI baked in (~10 MB
-  idle RSS), SQLite storage, a Prometheus `/metrics` endpoint, per-IP rate
-  limiting, and TURN via coturn for locked-down networks.
+  idle RSS), SQLite storage, built-in HTTPS with automatic Let's Encrypt
+  certificates, a Prometheus `/metrics` endpoint, per-IP rate limiting, and
+  TURN via coturn for locked-down networks.
 
 **Project status:** the MVP is complete — see the
 [post-MVP milestone](https://github.com/aron98/huddle/milestone/1) for what's
@@ -49,6 +50,7 @@ next (SSO, simulcast, passcodes, E2EE, recording, and more).
 |---|---|
 | Media routing (SFU) | Hand-rolled on [`str0m`](https://github.com/lookback-io/str0m) — pure Rust, sans-io WebRTC |
 | Server | Rust, `axum` + `tokio`, WebSockets, `sqlx` |
+| TLS | Built in: rustls termination + ACME (Let's Encrypt) via `axum-server` / `rustls-acme` — no reverse proxy required ([ADR 008](docs/adr/008-built-in-tls-termination.md)) |
 | Storage | SQLite (single file) |
 | Web client | Rust → WASM with [`Leptos`](https://github.com/leptos-rs/leptos); browser-native WebRTC via `web-sys` |
 | Desktop (later) | Tauri shell reusing the web client |
@@ -159,7 +161,7 @@ A stock huddle needs exactly three holes in the firewall:
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 3000 | TCP | web UI, REST API, and websocket signaling (`HUDDLE_BIND`) |
+| 3000 (or 443, see [TLS](#tls)) | TCP | web UI, REST API, and websocket signaling (`HUDDLE_BIND`) |
 | 40000 | UDP | SFU media socket (`HUDDLE_MEDIA_PORT`) — one port for all calls |
 | 3478 + 49160–49200 | UDP | coturn: TURN listener + relay port range (optional but recommended) |
 
@@ -167,6 +169,61 @@ The two huddle ports must be open to every participant's browser; the coturn
 range only matters when you run the TURN companion (below). A browser that
 cannot reach the UDP media port directly will fall back to TURN — which is
 why coturn matters even for small self-hosted setups behind NAT.
+
+### TLS
+
+The binary terminates TLS itself ([ADR 008](docs/adr/008-built-in-tls-termination.md))
+— no Caddy/Nginx/certbot layer required. Two modes, selected through the
+`[tls]` section of `huddle.toml` (or `HUDDLE_TLS_*` env vars):
+
+**ACME (recommended on a VPS).** Automatic Let's Encrypt certificates over
+TLS-ALPN-01 — the challenge is answered on the serving port itself, so bind
+443 and let the domain's A/AAAA record point at the box:
+
+```toml
+[tls]
+mode = "acme"
+
+[tls.acme]
+domains = ["meet.example.com"]
+contact = "admin@example.com"     # optional; mailto: is prepended if missing
+# staging = true                   # issue against the LE staging CA while testing
+```
+
+Certificate and account state live in `<data_dir>/acme-cache` and renew
+automatically in-process. Use `staging = true` while testing issuance to
+avoid burning Let's Encrypt rate limits.
+
+**Static certificates.** For certs from any other source (an existing
+wildcard, an internal CA), point at PEM files:
+
+```toml
+[tls]
+mode = "static"
+
+[tls.certs]
+cert = "/path/to/fullchain.pem"
+key = "/path/to/privkey.pem"
+```
+
+Selection follows the `[mail]` pattern: an explicit `mode` always wins;
+without one it is detected from whichever sub-section is present; ambiguous
+or half-configured setups fail loudly at startup. Missing cert/key files
+fail fast at config load.
+
+Without a `[tls]` section huddle serves plain HTTP — that is meant for local
+development and tests only, and the server logs a warning saying so. In TLS
+mode responses carry `Strict-Transport-Security` and session cookies are
+marked `Secure` (plain-HTTP localhost development keeps working either way).
+
+The same settings work as environment variables — useful in containers:
+`HUDDLE_TLS_MODE` (`acme`/`static`), and for ACME `HUDDLE_TLS_DOMAINS`
+(figment value syntax: `'["meet.example.com"]'`), `HUDDLE_TLS_CONTACT`,
+`HUDDLE_TLS_STAGING`; for static certs `HUDDLE_TLS_CERT` / `HUDDLE_TLS_KEY`.
+
+A reverse proxy in front is still a fully supported option — it is the
+natural shape behind a load balancer or on Kubernetes, where the ingress
+owns 443 — it just is no longer *required* to get HTTPS on a single VPS.
 
 ### coturn (TURN relay)
 
@@ -206,7 +263,11 @@ coturn.
 Production checklist: real credentials (not the dev pair), TLS on 5349 for
 clients that split-tunnel TCP, and — unless you are building an internal
 setup — do **not** copy `allow-loopback-peers` from the e2e configs; coturn
-refuses loopback peers by default for good reason.
+refuses loopback peers by default for good reason. A ready-to-edit
+production `turnserver.conf` with the TLS listener enabled ships at
+[`deploy/turn/turnserver.conf`](deploy/turn/turnserver.conf); the snippet
+above (mirroring `deploy/coturn/turnserver.conf`) is the plain-UDP dev
+setup.
 
 ### Email delivery
 
@@ -307,6 +368,14 @@ candidate must be directly reachable. `helm install huddle deploy/helm/huddle
 --set server.baseUrl=https://meet.example.com` and check `helm show values`
 for the knobs (`server.publicIp`, `server.iceServers`, an existing session
 secret, persistence).
+
+On k8s the ingress/LB usually owns 443 and the pod serves plain HTTP behind
+it. If you would rather have the pod terminate TLS itself (single-node,
+hostNetwork), set `server.baseUrl` to the HTTPS URL and configure `[tls]` via
+a `HUDDLE_TLS_*`-bearing ConfigMap — with ACME the pod must own port 443
+directly, which hostNetwork makes possible. For TURN over TLS on the
+sidecar/host coturn, see the [`deploy/turn/turnserver.conf`](deploy/turn/turnserver.conf)
+template.
 
 Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`

@@ -5,7 +5,8 @@
 # - `web` watches the web crate and rebuilds crates/web/dist on every change;
 # - `server` serves that directory via HUDDLE_WEB_DIR, so UI edits show up on
 #   the next browser refresh (server code changes need a container restart);
-# - `coturn` is the TURN companion from the architecture doc (dev credentials);
+# - `coturn` is the TURN companion from the architecture doc (dev credentials;
+#   the production template with TURN over TLS is deploy/turn/turnserver.conf);
 # - `mux` (profile `recording`) post-processes meeting recordings; see below.
 #
 # Both `server` and `coturn` use host networking (Linux only): WebRTC media
