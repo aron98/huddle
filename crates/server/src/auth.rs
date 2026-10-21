@@ -36,7 +36,8 @@ pub const OIDC_LOGIN_COOKIE: &str = "huddle_oidc_login";
 // Cookie format
 // ---------------------------------------------------------------------------
 
-fn hmac_for(key: &[u8]) -> Hmac<Sha256> {
+/// HMAC-SHA256 over any key length; shared with the OAuth module.
+pub(crate) fn hmac_for(key: &[u8]) -> Hmac<Sha256> {
     // HMAC accepts keys of any length, so this cannot fail.
     match Hmac::<Sha256>::new_from_slice(key) {
         Ok(mac) => mac,
@@ -44,7 +45,8 @@ fn hmac_for(key: &[u8]) -> Hmac<Sha256> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// Hex encoding, shared with the OAuth module's token machinery.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -325,12 +327,17 @@ fn oidc_not_configured() -> Response {
         .into_response()
 }
 
-/// GET /api/auth/me — the signed-in organizer, or 401.
+/// GET /api/auth/me — the signed-in organizer, or 401. Bearer access
+/// tokens (agent credentials) answer too: `whoami` works from the CLI
+/// with either credential.
 pub async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match session_organizer(&state, &headers) {
-        Some(organizer) => (
+    match crate::oauth::requestor(&state, &headers).await {
+        Some(requestor) => (
             StatusCode::OK,
-            Json(json!({ "id": organizer.id, "email": organizer.email })),
+            Json(json!({
+                "id": requestor.organizer.id,
+                "email": requestor.organizer.email,
+            })),
         )
             .into_response(),
         None => unauthorized("no session"),

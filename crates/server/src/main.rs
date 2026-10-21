@@ -11,6 +11,7 @@ mod identity;
 mod mailer;
 mod meetings;
 mod metrics;
+mod oauth;
 #[cfg(test)]
 mod oidc_test_idp;
 mod ratelimit;

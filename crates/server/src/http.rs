@@ -14,7 +14,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 use huddle_protocol::{
-    ApiError, ChatMessage, CreateMeetingRequest, ErrorCode, MeetingResponse, RecordingDto,
+    ApiError, ChatMessage, CreateMeetingRequest, ErrorCode, MeetingResponse, RecordingDto, Scope,
     UpdateMeetingRequest,
 };
 
@@ -23,6 +23,7 @@ use crate::chat;
 use crate::ics;
 use crate::meetings::{self, MeetingError};
 use crate::metrics;
+use crate::oauth;
 use crate::recording;
 use crate::session;
 use crate::state::AppState;
@@ -61,6 +62,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/oidc/login", get(auth::oidc_login))
         .route("/api/auth/oidc/callback", get(auth::oidc_callback))
+        .route("/api/oauth/device/register", post(oauth::register))
+        .route("/api/oauth/token", post(oauth::token))
+        .route("/api/oauth/revoke", post(oauth::revoke))
+        .route("/api/oauth/authorizations", get(oauth::authorizations))
+        .route(
+            "/api/oauth/authorizations/{id}",
+            delete(oauth::delete_authorization),
+        )
+        .route("/oauth/device", get(oauth::device_page))
+        .route("/oauth/device/approve", post(oauth::device_approve))
+        .route("/oauth/device/deny", post(oauth::device_deny))
+        .route("/oauth/device/done", get(oauth::device_done))
         .route("/metrics", get(metrics_scrape))
         .route("/ws", get(session::ws))
         .fallback(fallback)
@@ -146,8 +159,20 @@ async fn create_meeting(
     Json(req): Json<CreateMeetingRequest>,
 ) -> Result<(StatusCode, Json<MeetingResponse>), ApiErr> {
     // A logged-in organizer owns what they create; anonymous meetings
-    // stay open (the link is the only capability, by design).
-    let organizer = auth::session_organizer(&state, &headers);
+    // stay open (the link is the only capability, by design). Bearer
+    // tokens are agent credentials: they may create only with
+    // `meetings:write`, and a scoped token must not silently degrade
+    // to anonymous.
+    let organizer = match oauth::requestor(&state, &headers).await {
+        None => None,
+        Some(requestor) if requestor.via_session => Some(requestor.organizer),
+        Some(requestor) => {
+            if !requestor.allows(Scope::MeetingsWrite) {
+                return Err(ApiErr::forbidden());
+            }
+            Some(requestor.organizer)
+        }
+    };
     let meeting = meetings::create(
         state.pool(),
         &req,
@@ -234,10 +259,14 @@ async fn my_meetings(
     state: State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<MeetingResponse>>, ApiErr> {
-    let Some(organizer) = auth::session_organizer(&state, &headers) else {
+    let Some(requestor) = oauth::requestor(&state, &headers).await else {
         return Err(ApiErr::unauthorized());
     };
-    let meetings = meetings::list_for_organizer(state.pool(), organizer.id)
+    // Sessions see their dashboard; bearer tokens need `meetings:read`.
+    if !requestor.allows(Scope::MeetingsRead) {
+        return Err(ApiErr::forbidden());
+    }
+    let meetings = meetings::list_for_organizer(state.pool(), requestor.organizer.id)
         .await
         .map_err(ApiErr::internal)?;
     let now = OffsetDateTime::now_utc();
@@ -524,8 +553,14 @@ async fn require_owner(state: &AppState, headers: &HeaderMap, code: &str) -> Res
         return Ok(());
     };
     if let Some(owner) = meeting.organizer_id {
-        let session = auth::session_organizer(state, headers);
-        if session.as_ref().map(|o| o.id) != Some(owner) {
+        let Some(requestor) = oauth::requestor(state, headers).await else {
+            return Err(ApiErr::forbidden());
+        };
+        // Sessions carry every scope; bearer tokens must hold
+        // `meetings:write` and be the owner's own credential.
+        let authorized = requestor.organizer.id == owner
+            && (requestor.via_session || requestor.allows(Scope::MeetingsWrite));
+        if !authorized {
             return Err(ApiErr::forbidden());
         }
     }
@@ -2340,5 +2375,1004 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- OAuth device flow (issue 9) ---------------------------------------
+
+    use huddle_protocol::{
+        AuthorizationDto, DEVICE_GRANT_TYPE, DeviceAuthorizationResponse, OAuthTokenResponse,
+    };
+    use sqlx::Row as _;
+
+    const FORM: &str = "application/x-www-form-urlencoded";
+
+    /// POST a form body, optionally with a session cookie, through the
+    /// real router. OAuth routes are rate-limited, so the request
+    /// carries a ConnectInfo like the live server would.
+    async fn post_form(
+        app: &Router,
+        uri: &str,
+        body: &str,
+        cookie: Option<&str>,
+        port: u16,
+    ) -> (StatusCode, String) {
+        let mut request = Request::post(uri)
+            .header("content-type", FORM)
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))))
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        if let Some(cookie) = cookie {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, cookie.parse().unwrap());
+        }
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let text =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        (status, text)
+    }
+
+    fn sha256_hex(value: &str) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(value.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Pull the CSRF hidden input's value out of the approval page.
+    fn extract_csrf(html: &str) -> Option<String> {
+        let marker = "name=\"csrf\" value=\"";
+        let start = html.find(marker)? + marker.len();
+        let end = html[start..].find('"')? + start;
+        Some(html[start..end].to_owned())
+    }
+
+    async fn device_register(
+        app: &Router,
+        scope: Option<&str>,
+        port: u16,
+    ) -> DeviceAuthorizationResponse {
+        let mut body = "client_name=huddle-test".to_owned();
+        if let Some(scope) = scope {
+            body.push_str("&scope=");
+            body.push_str(scope);
+        }
+        let (status, text) = post_form(app, "/api/oauth/device/register", &body, None, port).await;
+        assert_eq!(status, StatusCode::OK, "body: {text}");
+        serde_json::from_str(&text).expect("register response parses")
+    }
+
+    /// The CSRF token off the rendered approval page for `user_code`.
+    async fn page_csrf(app: &Router, cookie: &str, user_code: &str) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/oauth/device?user_code={user_code}"))
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(html.contains("huddle-test"), "client shown: {html}");
+        extract_csrf(&html).expect("csrf hidden input on the page")
+    }
+
+    /// Drive the whole flow through the real routes — register, poll,
+    /// approve on the browser page, poll again — and return the pair.
+    async fn approved_token(
+        state: &AppState,
+        app: &Router,
+        email: &str,
+        scope: Option<&str>,
+        port: u16,
+    ) -> (OAuthTokenResponse, DeviceAuthorizationResponse) {
+        let cookie = session_cookie_for(state, app, email).await;
+        let device = device_register(app, scope, port).await;
+
+        let (status, text) = post_form(
+            app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(text.contains("authorization_pending"), "{text}");
+
+        let csrf = page_csrf(app, &cookie, &device.user_code).await;
+        let (status, text) = post_form(
+            app,
+            "/oauth/device/approve",
+            &format!("user_code={}&csrf={csrf}", device.user_code),
+            Some(&cookie),
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{text}");
+
+        let (status, text) = post_form(
+            app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let tokens: OAuthTokenResponse =
+            serde_json::from_str(&text).expect("token response parses");
+        (tokens, device)
+    }
+
+    #[tokio::test]
+    async fn device_flow_grants_scoped_revocable_tokens() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6000;
+        let cookie = session_cookie_for(&state, &app, "agent@example.com").await;
+
+        // Register: default scopes are both, the URI is the real page.
+        let device = device_register(&app, None, port).await;
+        assert_eq!(device.user_code.len(), 9, "XXXX-XXXX: {}", device.user_code);
+        assert!(
+            device.verification_uri.ends_with("/oauth/device"),
+            "uri: {}",
+            device.verification_uri
+        );
+        assert!(
+            device
+                .verification_uri_complete
+                .as_deref()
+                .is_some_and(|uri| uri.contains("user_code="))
+        );
+        assert_eq!(device.interval, 5);
+        assert_eq!(device.expires_in, 600);
+
+        // Poll before approval: pending.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("authorization_pending"), "{text}");
+
+        // The approval page names the client and both scopes.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/oauth/device?user_code={}", device.user_code))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(html.contains("huddle-test"), "page: {html}");
+        assert!(html.contains("meetings:read"), "page: {html}");
+        assert!(html.contains("meetings:write"), "page: {html}");
+        let csrf = extract_csrf(&html).expect("csrf on the page");
+
+        // Approve; the page redirects to the done page.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/device/approve")
+                    .header("content-type", FORM)
+                    .header(header::COOKIE, &cookie)
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))))
+                    .body(Body::from(format!(
+                        "user_code={}&csrf={csrf}",
+                        device.user_code
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/oauth/device/done?result=approved")
+        );
+
+        // Poll after approval: the token pair.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let granted: OAuthTokenResponse = serde_json::from_str(&text).unwrap();
+        assert_eq!(granted.token_type, "Bearer");
+        assert_eq!(granted.scope, "meetings:read meetings:write");
+        assert_eq!(granted.expires_in, 1800);
+        let refresh = granted
+            .refresh_token
+            .clone()
+            .expect("device grant issues a refresh token");
+        let access = granted.access_token.clone();
+
+        // Device codes are single-use.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+
+        // Only the hash of the refresh token is stored.
+        let row: String = sqlx::query("SELECT hash FROM oauth_refresh_tokens")
+            .fetch_one(state.pool())
+            .await
+            .unwrap()
+            .try_get("hash")
+            .unwrap();
+        assert_eq!(row, sha256_hex(&refresh), "sha256 at rest");
+        assert_ne!(row, refresh);
+
+        // The access token works as a bearer credential on /me.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let me: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(me["email"], "agent@example.com");
+
+        // Bearer with write: create owns the meeting.
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Agent sync",
+            "starts_at": (now + time::Duration::minutes(10)).format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(40)).format(&Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let code = created.meeting.code.clone();
+
+        // Bearer with read: the dashboard list works.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mine: Vec<MeetingResponse> =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(mine.iter().any(|m| m.meeting.code == code));
+
+        // Garbage bearer credentials are a plain 401.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::AUTHORIZATION, "Bearer at1.nonsense")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Refresh: a fresh access token, the same refresh credential.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type=refresh_token&refresh_token={refresh}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let refreshed: OAuthTokenResponse = serde_json::from_str(&text).unwrap();
+        assert_eq!(refreshed.refresh_token, None, "no rotation");
+        assert_eq!(refreshed.scope, granted.scope);
+        // The mint is second-granular, so an immediate refresh may produce a
+        // byte-identical access token; what matters is that it authenticates.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", refreshed.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let me: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(me["email"], "agent@example.com");
+
+        // The dashboard lists the authorization, with its use recorded.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/oauth/authorizations")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let auths: Vec<AuthorizationDto> =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].client_name, "huddle-test");
+        assert!(auths[0].last_used_at.is_some(), "refresh use recorded");
+        let auth_id = auths[0].id;
+
+        // Bearer tokens cannot enumerate authorizations: dashboard only.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/oauth/authorizations")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Revoke from the dashboard: the refresh dies immediately.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/oauth/authorizations/{auth_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type=refresh_token&refresh_token={refresh}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+
+        // A second revoke of the same id is a 404.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/oauth/authorizations/{auth_id}"))
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The list is empty again.
+        let response = app
+            .oneshot(
+                Request::get("/api/oauth/authorizations")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let auths: Vec<AuthorizationDto> =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(auths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_devices_get_access_denied() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6005;
+        let cookie = session_cookie_for(&state, &app, "deny@example.com").await;
+        let device = device_register(&app, None, port).await;
+
+        let csrf = page_csrf(&app, &cookie, &device.user_code).await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/oauth/device/deny")
+                    .header("content-type", FORM)
+                    .header(header::COOKIE, &cookie)
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))))
+                    .body(Body::from(format!(
+                        "user_code={}&csrf={csrf}",
+                        device.user_code
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/oauth/device/done?result=denied")
+        );
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("access_denied"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_only_tokens_cannot_write() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6010;
+        let (tokens, _) =
+            approved_token(&state, &app, "ro@example.com", Some("meetings:read"), port).await;
+        assert_eq!(tokens.scope, "meetings:read");
+        let access = &tokens.access_token;
+
+        // The acceptance criterion: a read-only token must NOT create.
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Nope",
+            "starts_at": now.format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(30)).format(&Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // But reading the dashboard is exactly what it may do.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // And it cannot cancel the organizer's own meeting either —
+        // require_owner checks meetings:write on the bearer path.
+        let cookie = session_cookie_for(&state, &app, "ro@example.com").await;
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Owned",
+            "starts_at": now.format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(30)).format(&Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/meetings/{}", created.meeting.code))
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn write_only_tokens_cannot_list() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6015;
+        let (tokens, _) =
+            approved_token(&state, &app, "wo@example.com", Some("meetings:write"), port).await;
+        assert_eq!(tokens.scope, "meetings:write");
+        let access = &tokens.access_token;
+
+        // Create works…
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Write-only sync",
+            "starts_at": now.format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(30)).format(&Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+
+        // …listing does not — write does not imply read…
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/meetings/mine")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // …but cancel does, because it is a write.
+        let response = app
+            .oneshot(
+                Request::delete(format!("/api/meetings/{}", created.meeting.code))
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn polling_faster_than_the_interval_gets_slow_down() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6020;
+        let device = device_register(&app, None, port).await;
+
+        let poll = |app: Router, device_code: String| async move {
+            post_form(
+                &app,
+                "/api/oauth/token",
+                &format!("grant_type={DEVICE_GRANT_TYPE}&device_code={device_code}"),
+                None,
+                port,
+            )
+            .await
+        };
+        let (status, text) = poll(app.clone(), device.device_code.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("authorization_pending"), "{text}");
+
+        // An immediate second poll is refused: slow_down.
+        let (status, text) = poll(app, device.device_code).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("slow_down"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn token_and_register_errors_match_the_rfc() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6025;
+
+        // Missing grant_type, unknown grant, missing/unknown codes.
+        let (status, text) = post_form(&app, "/api/oauth/token", "", None, port).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_request"), "{text}");
+
+        let (status, text) =
+            post_form(&app, "/api/oauth/token", "grant_type=password", None, port).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("unsupported_grant_type"), "{text}");
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type={DEVICE_GRANT_TYPE}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_request"), "{text}");
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type={DEVICE_GRANT_TYPE}&device_code=no-such-code"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            "grant_type=refresh_token&refresh_token=no-such-token",
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+
+        // Unknown scopes are refused at registration.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/device/register",
+            "client_name=x&scope=meetings:admin",
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_scope"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn expired_credentials_answer_expired_token_or_invalid_grant() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6030;
+
+        // An expired device request, planted directly.
+        let past = (OffsetDateTime::now_utc() - time::Duration::minutes(1))
+            .format(&Rfc3339)
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_device_requests \
+             (id, device_code_hash, user_code, client_name, scopes, expires_at) \
+             VALUES (?1, ?2, 'ABCD-2345', 'old client', 'meetings:read', ?3)",
+        )
+        .bind("11111111-1111-1111-1111-111111111111")
+        .bind(sha256_hex("expired-device-code"))
+        .bind(&past)
+        .execute(state.pool())
+        .await
+        .unwrap();
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type={DEVICE_GRANT_TYPE}&device_code=expired-device-code"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("expired_token"), "{text}");
+
+        // An expired refresh token, planted against a real organizer
+        // (the FK is enforced).
+        let cookie = session_cookie_for(&state, &app, "expired@example.com").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/me")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let me: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let organizer_id: String = me["id"].as_str().unwrap().to_owned();
+        sqlx::query(
+            "INSERT INTO oauth_refresh_tokens \
+             (id, hash, organizer_id, client_name, scopes, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, 'old client', 'meetings:read', ?4, ?4)",
+        )
+        .bind("22222222-2222-2222-2222-222222222222")
+        .bind(sha256_hex("expired-refresh-token"))
+        .bind(&organizer_id)
+        .bind(&past)
+        .execute(state.pool())
+        .await
+        .unwrap();
+
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            "grant_type=refresh_token&refresh_token=expired-refresh-token",
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn oauth_registration_is_rate_limited() {
+        let app = router(test_state().await);
+        let port = 6035;
+        for i in 0..30 {
+            let (status, _) = post_form(
+                &app,
+                "/api/oauth/device/register",
+                "client_name=x",
+                None,
+                port,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "request {i}");
+        }
+        let (status, _) = post_form(
+            &app,
+            "/api/oauth/device/register",
+            "client_name=x",
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn device_pages_guard_the_session_and_the_code() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6040;
+
+        // No session: a 401 page pointing at /login.
+        let response = app
+            .clone()
+            .oneshot(Request::get("/oauth/device").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Signed in: the enter-code page.
+        let cookie = session_cookie_for(&state, &app, "page@example.com").await;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/device")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .into_owned();
+        assert!(html.contains("user_code"), "enter-code form: {html}");
+
+        // A well-formed but unknown code is a 404 page.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/oauth/device?user_code=ABCD-2345")
+                    .header(header::COOKIE, &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // A foreign CSRF token cannot approve anything.
+        let device = device_register(&app, None, port).await;
+        let (status, text) = post_form(
+            &app,
+            "/oauth/device/approve",
+            &format!("user_code={}&csrf=deadbeef", device.user_code),
+            Some(&cookie),
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        // The request is untouched: still pending.
+        let (_status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!(
+                "grant_type={DEVICE_GRANT_TYPE}&device_code={}",
+                device.device_code
+            ),
+            None,
+            port,
+        )
+        .await;
+        assert!(text.contains("authorization_pending"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn revocation_endpoint_kills_refresh_tokens() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6045;
+        let (tokens, _) = approved_token(&state, &app, "revoke@example.com", None, port).await;
+        let refresh = tokens.refresh_token.expect("device grant issues refresh");
+
+        // RFC 7009 flavor: always 200, never revealing whether the
+        // token existed.
+        let (status, _) = post_form(
+            &app,
+            "/api/oauth/revoke",
+            &format!("token={refresh}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_form(
+            &app,
+            "/api/oauth/revoke",
+            &format!("token={refresh}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The refresh credential is dead.
+        let (status, text) = post_form(
+            &app,
+            "/api/oauth/token",
+            &format!("grant_type=refresh_token&refresh_token={refresh}"),
+            None,
+            port,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("invalid_grant"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn bearer_tokens_cannot_touch_other_organizers_meetings() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let port = 6050;
+        let alice = session_cookie_for(&state, &app, "alice@example.com").await;
+        let (bob_tokens, _) = approved_token(&state, &app, "bob@example.com", None, port).await;
+
+        let now = OffsetDateTime::now_utc();
+        let body = serde_json::json!({
+            "title": "Alice's private sync",
+            "starts_at": now.format(&Rfc3339).unwrap(),
+            "ends_at": (now + time::Duration::minutes(30)).format(&Rfc3339).unwrap(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/api/meetings")
+                    .header(header::COOKIE, &alice)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let created: MeetingResponse =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+
+        // Bob's fully-scoped token still cannot cancel Alice's meeting.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/meetings/{}", created.meeting.code))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", bob_tokens.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 }
