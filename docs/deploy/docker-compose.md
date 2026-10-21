@@ -52,16 +52,16 @@ cp .env.example .env
 # generate secrets:
 openssl rand -hex 32   # -> HUDDLE_SESSION_SECRET
 openssl rand -hex 16   # -> HUDDLE_STATS_TOKEN
-openssl rand -hex 16   # -> TURN_PASSWORD
+openssl rand -hex 32   # -> TURN_SHARED_SECRET
 ${EDITOR:-vi} .env
 ```
 
-Write the TURN password into the coturn template (its config file cannot read
-environment variables):
+Write the TURN shared secret into the coturn template (its config file cannot
+read environment variables):
 
 ```sh
 source .env
-sed -i "s/REPLACE_WITH_TURN_PASSWORD/${TURN_PASSWORD}/" turnserver.conf
+sed -i "s/REPLACE_WITH_TURN_SHARED_SECRET/${TURN_SHARED_SECRET}/" turnserver.conf
 ```
 
 Point `HUDDLE_DOMAIN` (and `TURN_DOMAIN`) DNS A records at the host first — the
@@ -143,6 +143,6 @@ binary — no migration files to copy). There is no downgrade path: back up the
 | `HUDDLE_DOMAIN: required variable not set` | You skipped `cp .env.example .env` / didn't fill a value |
 | ACME challenge fails | DNS A record; `HUDDLE_BIND` must be `0.0.0.0:443`; 443/tcp reachable |
 | Local video, remote black | `40000/udp` + `49160-49200/udp` firewall rules; coturn relay range matches `min/max-port` |
-| TURN auth fails (401 in coturn log) | `user=` in turnserver.conf must match `username`/`credential` in `HUDDLE_ICE_SERVERS` byte-for-byte |
+| TURN auth fails (401 in coturn log) | `static-auth-secret=` in turnserver.conf must match `HUDDLE_TURN_SHARED_SECRET` in .env byte-for-byte |
 | Cert errors after restart | `huddle-data` volume was recreated — the acme-cache must persist |
 | Everyone logged out after restart | `HUDDLE_SESSION_SECRET` unset or changed |

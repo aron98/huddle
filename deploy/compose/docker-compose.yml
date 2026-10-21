@@ -50,11 +50,16 @@ services:
       # cert/account cache persisted in <data_dir>/acme-cache.
       HUDDLE_TLS_MODE: acme
       HUDDLE_TLS_DOMAINS: ${HUDDLE_DOMAIN:?set HUDDLE_DOMAIN in .env}
-      # TURN servers advertised to clients. Static username/credential pairs
-      # only (config.rs IceServerConfig) — they must match coturn's lt-cred-mech
-      # user below. Figment array-of-structs value syntax (TOML-ish, not JSON).
+      # TURN REST API (issue #59): huddle mints time-limited coturn
+      # credentials per join from the shared secret — coturn must run
+      # use-auth-secret with the same static-auth-secret (turnserver.conf).
+      # Generate: openssl rand -hex 32
+      HUDDLE_TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set TURN_SHARED_SECRET in .env}
+      # TURN servers advertised to clients — URLs only, no credentials:
+      # they are minted at join time from the shared secret above.
+      # Figment array-of-structs value syntax (TOML-ish, not JSON).
       # Drop the turns: URL if you did not configure coturn TLS.
-      HUDDLE_ICE_SERVERS: '[{urls=["turn:${TURN_DOMAIN:?set TURN_DOMAIN in .env}:3478?transport=udp","turn:${TURN_DOMAIN}:3478?transport=tcp","turns:${TURN_DOMAIN}:5349?transport=tcp"],username="huddle",credential="${TURN_PASSWORD:?set TURN_PASSWORD in .env}"}]'
+      HUDDLE_ICE_SERVERS: '[{urls=["turn:${TURN_DOMAIN:?set TURN_DOMAIN in .env}:3478?transport=udp","turn:${TURN_DOMAIN}:3478?transport=tcp","turns:${TURN_DOMAIN}:5349?transport=tcp"]}]'
     volumes:
       - huddle-data:/data
     # NOTE: no healthcheck — the runtime image ships without curl/wget by

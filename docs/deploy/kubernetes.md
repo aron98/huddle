@@ -117,10 +117,12 @@ server:
   # IP advertised in ICE candidates. Empty = auto-detect the node IP.
   publicIp: ""
   mediaPort: 40000
-  # TURN servers advertised to clients — static username/credential pairs only
-  # (huddle has no REST-auth helper), must match coturn exactly.
+  # TURN servers advertised to clients — URLs only: with the REST-auth
+  # shared secret (section 5) huddle mints time-limited credentials at
+  # every join, so no credentials are stored here. Static pairs work
+  # too — then they must match coturn's user= byte-for-byte.
   # Figment array syntax, TOML-ish:
-  iceServers: '[{urls=["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp","turns:turn.example.com:5349?transport=tcp"],username="huddle",credential="REPLACE_WITH_TURN_PASSWORD"}]'
+  iceServers: '[{urls=["turn:turn.example.com:3478?transport=udp","turn:turn.example.com:3478?transport=tcp","turns:turn.example.com:5349?transport=tcp"]}]'
 
 # Secret with key HUDDLE_SESSION_SECRET (created above):
 existingSecret: huddle-session
@@ -229,44 +231,51 @@ TURN relay ports (49160–49200/udp) cannot be proxied by a Service any more tha
 SFU media can, so coturn also runs hostNetwork — as a DaemonSet on the same nodes
 (or a dedicated set of nodes via nodeSelector/labels).
 
-**Credential model:** the issue-shaped approach would be coturn's
-`use-auth-secret` (REST-rotatable shared secret) with the secret delivered from a
-Kubernetes Secret. That is exactly the right shape for coturn — **but huddle can
-only advertise static `username`/`credential` pairs** (`IceServerConfig` in
-`crates/server/src/config.rs`; the template `deploy/turn/turnserver.conf` says the
-same), and it has no REST-auth credential helper to generate auth-secret
-credentials. So today the working pair is: coturn `lt-cred-mech` + `user=`, with
-the password sourced from a Secret. `use-auth-secret` remains the recommendation
-*for when* huddle gains REST-auth support — flagged as a feature gap, not hidden.
+**Credential model:** huddle supports coturn's `use-auth-secret` (TURN REST
+API, issue #59): huddle holds the same shared secret and mints time-limited
+credentials at every join — `username` is the expiry timestamp and
+`credential` is `base64(HMAC-SHA1(secret, username))` — so no static TURN
+password is stored anywhere. The chart gap: the Helm chart has no
+extra-env/extra-envFrom knob (see [Known chart limitations](#known-chart-limitations)),
+so `HUDDLE_TURN_SHARED_SECRET` cannot be set through chart values today.
+Create the secret and patch the Deployment env until the chart grows a knob
+(the patch must be re-applied after every `helm upgrade`).
 
-Create the TURN password Secret and a coturn config referencing it (the config is
+Create the TURN shared secret and a coturn config referencing it (the config is
 mounted as a Secret so the credential never appears in a ConfigMap):
 
 ```sh
-TURN_PASSWORD="$(openssl rand -hex 16)"
+TURN_SHARED_SECRET="$(openssl rand -hex 32)"
+kubectl create secret generic huddle-turn -n huddle \
+  --from-literal=HUDDLE_TURN_SHARED_SECRET="${TURN_SHARED_SECRET}"
 kubectl create secret generic coturn-config -n huddle \
   --from-literal=turnserver.conf="listening-port=3478
 tls-listening-port=5349
 min-port=49160
 max-port=49200
-lt-cred-mech
+use-auth-secret
+static-auth-secret=${TURN_SHARED_SECRET}
 realm=turn.example.com
-user=huddle:${TURN_PASSWORD}
 fingerprint
 no-cli
 no-multicast-peers
 "
-kubectl create secret generic huddle-ice -n huddle \
-  --from-literal=HUDDLE_ICE_SERVERS="[{urls=[\"turn:turn.example.com:3478?transport=udp\",\"turn:turn.example.com:3478?transport=tcp\",\"turns:turn.example.com:5349?transport=tcp\"],username=\"huddle\",credential=\"${TURN_PASSWORD}\"}]"
-echo "TURN_PASSWORD (mirror into my-values.yaml server.iceServers): ${TURN_PASSWORD}"
 ```
 
-> With plain `lt-cred-mech`, the same static password must appear in huddle's
-> `server.iceServers` — which the chart stores in a ConfigMap (see
-> [Known limitations](#known-chart-limitations)). Until the chart grows a Secret
-> knob, restrict ConfigMap reads with RBAC (`configmaps` are readable by any
-> authenticated principal by default in hardening-sensitive setups — verify your
-> cluster's policy).
+Deliver the secret to the huddle pod (workaround for the missing chart knob —
+re-apply after every `helm upgrade`):
+
+```sh
+kubectl patch deployment huddle -n huddle --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":{"name":"HUDDLE_TURN_SHARED_SECRET","valueFrom":{"secretKeyRef":{"name":"huddle-turn","key":"HUDDLE_TURN_SHARED_SECRET"}}}}]'
+kubectl -n huddle rollout status deploy/huddle
+```
+
+> With REST auth, `server.iceServers` carries only URL lists — safe to keep in
+> the chart's ConfigMap (see
+> [Known limitations](#known-chart-limitations)). The shared secret lives in a
+> Secret, which is not readable cluster-wide by default — strictly better than
+> the old static-password-in-ConfigMap shape.
 
 DaemonSet manifest:
 
@@ -383,9 +392,10 @@ Until then, the ingress path above is the supported shape on Kubernetes; the
 
 1. **No extra-env / extra-envFrom knob** — pod-terminated TLS (README mentions a
    "`HUDDLE_TLS_*`-bearing ConfigMap") is not reachable through chart values today.
-2. **`server.iceServers` lands in a ConfigMap**, so TURN credentials are stored in
-   plaintext config even when coturn's side is Secret-mounted. A
-   `server.existingIceSecret` knob would fix it.
+2. **`server.iceServers` lands in a ConfigMap** — with TURN REST auth (issue #59)
+   that list carries only URLs, so the fix is delivering the shared secret:
+   an `extraEnv`/`extraEnvFrom` knob would let `HUDDLE_TURN_SHARED_SECRET` come
+   from a Secret instead of the section-5 patch workaround.
 3. `image.repository` defaults to `ghcr.io/aron98/huddle`, which no CI workflow
    publishes — you must build and push it yourself.
 
@@ -398,7 +408,7 @@ they land upstream rather than as a local fork.
 |---------|-------|
 | Pod `Pending`: nodePort collision | Another pod holds 3000/40000 on the node — one replica per node |
 | Join works, remote media black | Node security group: 40000/udp open? `publicIp` detected the right interface? |
-| ICE relay never engages | coturn DaemonSet scheduled (nodeSelector)? TURN URL list matches coturn's actual user/realm? |
+| ICE relay never engages | coturn DaemonSet scheduled (nodeSelector)? TURN URL list matches coturn's realm, and the `HUDDLE_TURN_SHARED_SECRET` patch matches `static-auth-secret`? |
 | Ingress 502 on `/ws` | Ingress class nginx upgrades WS automatically; check the backend Service port is 3000 and the pod is Ready |
 | 429 "too many connections" for everyone | All traffic shares the ingress pod IP — see the rate-limit trade-off in step 4 |
 | Certificates stuck `False` | cert-manager solver can't reach the challenge — check ingress LB IP and DNS A record |

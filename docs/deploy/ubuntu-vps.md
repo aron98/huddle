@@ -148,14 +148,17 @@ contact = "admin@example.com"    # optional; "mailto:" is prepended automaticall
 rate_limit_per_min = 30
 
 # --- TURN (coturn, installed below) ---------------------------------------
+# REST API auth (issue #59): the secret matches coturn's
+# static-auth-secret (step 6.2); huddle mints time-limited credentials
+# at every join, so no static TURN password is stored anywhere.
+[turn]
+shared_secret = "REPLACE_WITH_turn_shared_secret"
 [[ice_servers]]
 urls = [
   "turn:turn.example.com:3478?transport=udp",
   "turn:turn.example.com:3478?transport=tcp",
   "turns:turn.example.com:5349?transport=tcp",
 ]
-username = "huddle"
-credential = "REPLACE_WITH_turn_password"
 EOF
 chown root:huddle /opt/huddle/huddle.toml
 chmod 0640 /opt/huddle/huddle.toml
@@ -166,7 +169,7 @@ Generate the two secrets and paste them in:
 ```sh
 openssl rand -hex 32   # session_secret
 openssl rand -hex 16   # stats_token
-openssl rand -hex 16   # TURN password, used again in step 5
+openssl rand -hex 32   # TURN shared secret, used again in step 6
 ```
 
 ### Email delivery
@@ -324,12 +327,14 @@ sed -i 's/#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn
 
 ### 6.2 Configure `/etc/turnserver.conf`
 
-Huddle advertises TURN servers with **static username/credential pairs**
-(`[[ice_servers]]` in `huddle.toml`), so coturn must validate them with
-`lt-cred-mech` + a matching `user=` line. (`use-auth-secret` — the shared-secret
-REST-credential scheme — is what many guides recommend, but Huddle has no
-REST-auth credential helper, so with `use-auth-secret` participants could never
-authenticate. The shipped template `deploy/turn/turnserver.conf` notes the same.)
+Huddle mints time-limited TURN REST API credentials (issue #59): the
+`[turn] shared_secret` in `huddle.toml` matches coturn's `static-auth-secret`, and
+every join gets a fresh pair — the username is the expiry timestamp, the
+credential is `base64(HMAC-SHA1(shared_secret, username))`, exactly what
+coturn's `use-auth-secret` validates. No static TURN password is stored anywhere.
+(Static `lt-cred-mech` + `user=` still works for dev setups — then mirror the
+pair in `[[ice_servers]]` username/credential instead of the `[turn]` section;
+the shipped template `deploy/turn/turnserver.conf` shows both.)
 
 ```sh
 cat >/etc/turnserver.conf <<'EOF'
@@ -341,10 +346,10 @@ tls-listening-port=5349
 min-port=49160
 max-port=49200
 
-# Static credentials, mirrored exactly in huddle.toml [[ice_servers]].
-lt-cred-mech
+# TURN REST API: must match [turn] shared_secret in huddle.toml.
+use-auth-secret
+static-auth-secret=REPLACE_WITH_turn_shared_secret
 realm=turn.example.com
-user=huddle:REPLACE_WITH_turn_password
 
 # Certificate for TURN over TLS (5349/tcp) and DTLS on the UDP listener.
 # Provisioned in 6.3; comment these two lines out until the files exist.
@@ -409,7 +414,10 @@ If you skip this section, comment out `cert=`/`pkey=` and `tls-listening-port` i
 ### 6.4 Verify TURN
 
 ```sh
-turnutils_uclient -u huddle -w REPLACE_WITH_turn_password -p 3478 turn.example.com
+# Mint a pair the same way huddle does (expiry = now + 1h) and use it:
+username=$(($(date +%s) + 3600))
+credential=$(printf %s "$username" | openssl dgst -sha1 -hmac "REPLACE_WITH_turn_shared_secret" -binary | base64)
+turnutils_uclient -u "$username" -w "$credential" -p 3478 turn.example.com
 # or from a browser: https://ice-test.appspot.com/ (tracer) / webrtc internals
 ```
 

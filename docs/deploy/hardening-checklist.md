@@ -42,10 +42,12 @@ say *who* enforces them (the server by construction, or you via configuration).
   dots. There is **no sessions table**; nothing to revoke server-side except by
   rotating the secret. A leaked secret forges sessions until expiry
   (`session_ttl_min`, default 120) — treat it as a root credential.
-- [ ] **TURN credentials are shared secrets.** They appear in `[[ice_servers]]`
-  (huddle side) and coturn's `user=` line. Generate a strong random password; see
-  the platform guides for the honest limits (huddle has no REST-auth credential
-  helper today — static `lt-cred-mech` pairs only).
+- [ ] **TURN credentials are handled by REST auth (issue #59).** Preferred setup:
+  coturn `use-auth-secret` + `static-auth-secret`, mirrored in huddle's
+  `[turn] shared_secret` — huddle then mints time-limited credentials per join
+  and no static TURN password exists anywhere. The static `lt-cred-mech` shape
+  still works (pair in `[[ice_servers]]` + coturn's `user=` line): generate a
+  strong random password and see the platform guides for the honest limits.
 
 ## Authentication and abuse control
 
