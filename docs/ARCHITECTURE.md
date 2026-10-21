@@ -36,7 +36,7 @@ huddle/
 │   ├── sfu/        # str0m media plane: Router → Room → Peer
 │   ├── server/     # bin: axum HTTP+WS, sqlx/SQLite, magic-link auth, embedded static UI
 │   └── web/        # lib→cdylib: Leptos app compiled to WASM
-├── desktop/        # later: Tauri shell reusing web/
+├── electron/       # desktop shell (Electron) loading the server's web client — not a Cargo member
 └── deploy/         # docker-compose, coturn config, Helm chart
 ```
 
@@ -137,8 +137,11 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 - Prejoin page: device pickers, preview, name entry. In-call: adaptive video tile
   grid, mute/camera toggles, screen share button, chat sidebar.
 - **Bundle budget:** < 300 KB gzipped WASM+JS. No heavyweight component libraries.
-- Desktop (post-MVP): Tauri wraps the same web UI. A native Rust client (egui +
-  webrtc-rs) was rejected for MVP — it would re-implement the entire media stack.
+- Desktop (post-MVP): an Electron shell loads the same web UI from the
+  server's origin ([ADR 014](adr/014-desktop-shell-electron.md)). A native
+  Rust client (egui + webrtc-rs) was rejected for MVP — it would re-implement
+  the entire media stack; a system-webview shell (Tauri) was rejected because
+  the OS engines break media/E2EE parity on Linux and macOS.
 
 ## Deployment targets
 

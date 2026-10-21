@@ -54,7 +54,7 @@ next (SSO, simulcast, passcodes, E2EE, recording, and more).
 | TLS | Built in: rustls termination + ACME (Let's Encrypt) via `axum-server` / `rustls-acme` — no reverse proxy required ([ADR 008](docs/adr/008-built-in-tls-termination.md)) |
 | Storage | SQLite (single file) |
 | Web client | Rust → WASM with [`Leptos`](https://github.com/leptos-rs/leptos); browser-native WebRTC via `web-sys` |
-| Desktop (later) | Tauri shell reusing the web client |
+| Desktop (later) | Electron shell loading the server's web client ([ADR 014](docs/adr/014-desktop-shell-electron.md)) |
 | TURN | `coturn` (self-hosted companion) |
 | Deploy | Single binary on a VPS · AWS EC2/Fargate · Kubernetes (Helm) |
 
@@ -389,7 +389,29 @@ For TURN over TLS on the sidecar/host coturn, see the
 
 Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
-(+ sha256) to the GitHub release.
+(+ sha256) to the GitHub release. The same tag also builds **unsigned**
+desktop installers (Windows exe, macOS dmg, Linux AppImage/deb) from
+[`electron/`](electron/) — see [ADR 014](docs/adr/014-desktop-shell-electron.md)
+and [electron/README.md](electron/README.md).
+
+## Desktop
+
+The desktop app is an Electron shell (bundled Chromium — system webviews
+break WebRTC/screen-share/E2EE parity on Linux and macOS; details in
+[ADR 014](docs/adr/014-desktop-shell-electron.md)). It loads your Huddle
+server's web client, so it needs a server to talk to: on first run it asks
+for the server address (e.g. `https://meet.example.com` or
+`localhost:3000` for a local dev server) and remembers it. Building it
+yourself:
+
+```sh
+(cd crates/web && trunk build)          # the client the server serves
+HUDDLE_WEB_DIR=crates/web/dist cargo run -p huddle-server
+cd electron && npm ci && npm run dev     # shell against localhost:3000
+```
+
+Dev details, per-OS manual verification checklist, and the version policy
+live in [electron/README.md](electron/README.md).
 
 ## License
 
