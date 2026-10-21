@@ -1,15 +1,31 @@
 #!/usr/bin/env node
-// E2EE key exchange end-to-end test (issue #27, ADR 010): a meeting
-// created with the E2EE trust mode flags itself in the UI, two
-// participants in isolated browser contexts (so each gets its own
-// IndexedDB identity) derive the SAME pairwise safety number on both
-// sides, and confirming the comparison on one side propagates the
-// verified mark to the other through the encrypted relay.
+// E2EE end-to-end tests (issues #27 + #28, ADR 010/011).
 //
-// What makes this assertable where decryption is not (ADR 009): the
-// safety number is a pure function of BOTH identity keys — it can only
-// match if the two browsers hold the same view of each other's public
-// keys, i.e. the server relayed the announces faithfully.
+// Scenario 1 (key exchange, #27): a meeting created with the E2EE
+// trust mode flags itself in the UI, two participants in isolated
+// browser contexts (so each gets its own IndexedDB identity) derive
+// the SAME pairwise safety number on both sides, and confirming the
+// comparison on one side propagates the verified mark to the other
+// through the encrypted relay. What makes this assertable where raw
+// key material is not (ADR 009): the safety number is a pure function
+// of BOTH identity keys.
+//
+// Scenario 1 continues (#28): with the SFrame media transform worker
+// live on every sender and receiver, media still flows (inbound-rtp
+// framesDecoded/bytesReceived grow through the transforms), the probe
+// reports real encrypt/decrypt counters with zero decrypt failures,
+// chat bodies round-trip as ciphertext-encrypted-but-readable, and a
+// LATE joiner sees only the placeholder for earlier messages —
+// proving chat persists as ciphertext server-side (ADR 011, D7/D8).
+//
+// Scenario 2 (#28, D5): the `?e2eeDegrade=1` knob forces the worker's
+// EMA over the 20ms threshold, tripping the one-shot degrade notice
+// and the probe's degraded flag.
+//
+// Scenario 3 (#28, D10): a PLAINTEXT meeting with `?e2eeTag=1` runs
+// the transform plumbing in tag-only mode — media flows through
+// transforms and the SFU without real crypto, pinning the whole
+// attach/forward/strip path independently of WebCrypto.
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -83,27 +99,29 @@ async function bootServer() {
   };
 }
 
-async function createE2eeMeeting() {
+async function createMeeting(e2ee) {
   const rfc3339 = (date) => date.toISOString().replace(/\.\d+Z$/, 'Z');
   const res = await fetch(`${BASE}/api/meetings`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      title: 'e2e encrypted',
+      title: e2ee ? 'e2e encrypted' : 'e2e tag-mode plumbing',
       starts_at: rfc3339(new Date()),
       ends_at: rfc3339(new Date(Date.now() + 60 * 60 * 1000)),
-      e2ee: true,
+      e2ee,
     }),
   });
-  if (!res.ok) fail(`e2ee meeting creation failed: ${res.status} ${await res.text()}`);
+  if (!res.ok) fail(`meeting creation failed: ${res.status} ${await res.text()}`);
   const meeting = (await res.json()).meeting;
-  if (meeting.e2ee !== true) fail(`created meeting has no e2ee flag: ${JSON.stringify(meeting)}`);
-  console.log(`meeting ${meeting.code} created with the e2ee trust mode`);
+  if (meeting.e2ee !== e2ee) fail(`created meeting has the wrong trust mode: ${JSON.stringify(meeting)}`);
+  console.log(`meeting ${meeting.code} created (e2ee=${e2ee})`);
   return meeting.code;
 }
 
-async function openPrejoin(page, code, name) {
-  await page.goto(`${BASE}/m/${code}?test=1`, { waitUntil: 'domcontentloaded' });
+// `extra` carries the #28 test knobs (`&e2eeDegrade=1`, `&e2eeTag=1`);
+// the app parses them with plain substring checks, so order is free.
+async function openPrejoin(page, code, name, extra = '') {
+  await page.goto(`${BASE}/m/${code}?test=1${extra}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-testid="name-input"]');
   await page.type('[data-testid="name-input"]', name);
   await page.waitForSelector('[data-testid="join-btn"]:not([disabled])', { timeout: 30_000 })
@@ -130,14 +148,93 @@ async function peerFromStats(page, name) {
   return stats.peers.find((p) => p.name === name) ?? null;
 }
 
+async function sendChat(page, body) {
+  await page.type('[data-testid="chat-input"]', body);
+  await page.click('[data-testid="chat-send"]');
+}
+
+const chatLogText = (page) =>
+  page.$eval('[data-testid="chat-log"]', (el) => el.textContent ?? '');
+
+// Inbound video ssrcs -> decoded frames. ssrcs are stable RTP
+// identifiers, unlike the provisional track/stream wrappers Chrome
+// hands out at ontrack time; framesDecoded only grows if the receiver
+// transform actually decrypts what arrives (a dropped or garbled
+// frame never reaches the decoder).
+async function videoInboundSnapshot(page) {
+  return page.evaluate(async () => {
+    const stats = await window.__huddlePc.getStats();
+    const live = {};
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+        live[report.ssrc] = report.framesDecoded ?? 0;
+      }
+    });
+    return live;
+  });
+}
+
+async function audioInboundSnapshot(page) {
+  return page.evaluate(async () => {
+    const stats = await window.__huddlePc.getStats();
+    const live = {};
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+        live[report.ssrc] = report.bytesReceived ?? 0;
+      }
+    });
+    return live;
+  });
+}
+
+const sumValues = (map) => Object.values(map).reduce((a, b) => a + b, 0);
+
+// True once inbound media is demonstrably flowing (a couple of
+// seconds of decoded video frames and received audio bytes).
+async function mediaFlows(page) {
+  const videoBefore = await videoInboundSnapshot(page);
+  const audioBefore = await audioInboundSnapshot(page);
+  await delay(2000);
+  const videoAfter = await videoInboundSnapshot(page);
+  const audioAfter = await audioInboundSnapshot(page);
+  return (
+    sumValues(videoAfter) - sumValues(videoBefore) > 5 &&
+    sumValues(audioAfter) - sumValues(audioBefore) > 1000
+  );
+}
+
+// The probe object only republishes when the client handles a server
+// message, so while waiting on the counters we nudge it with a chat
+// message (relayed to everyone, including the sender).
+const waitTransformStats = (who, page, refresh, { requireDecrypted = true } = {}) =>
+  waitFor(`${who}: transform counters in the probe`, async () => {
+    const s = await e2eeStats(page);
+    if (
+      s && s.attached > 0 && s.encryptedFrames > 0 &&
+      (!requireDecrypted || s.decryptedFrames > 0)
+    ) {
+      return s;
+    }
+    await refresh();
+    return null;
+  });
+
+function assertHealthyTransform(who, stats) {
+  if (stats.decryptFail !== 0) {
+    fail(`${who}: transform reported decrypt failures: ${JSON.stringify(stats)}`);
+  }
+  if (stats.degraded !== false) {
+    fail(`${who}: transform reported degraded in a healthy call: ${JSON.stringify(stats)}`);
+  }
+}
+
 async function main() {
   console.log(`booting server (${SERVER})`);
   const srv = await bootServer();
   let browser;
   const contexts = [];
+  let refreshN = 0;
   try {
-    const code = await createE2eeMeeting();
-
     browser = await puppeteer.launch({
       executablePath: CHROME,
       headless: true,
@@ -165,6 +262,16 @@ async function main() {
       page.on('pageerror', (e) => console.log(`[${who} pageerror]`, e.message));
       return page;
     };
+
+    const closeContexts = async () => {
+      for (const context of contexts.splice(0)) await context.close().catch(() => {});
+    };
+
+    // ---------------------------------------------------------------
+    // Scenario 1: E2EE meeting — key exchange, verification, media
+    // transform, chat round trip, late-joiner placeholder.
+    // ---------------------------------------------------------------
+    const code = await createMeeting(true);
 
     console.log('alice and bob join the encrypted meeting');
     const alice = await newClient('alice');
@@ -263,7 +370,110 @@ async function main() {
       fail('safety numbers changed across the verification flow');
     }
 
-    console.log('PASS: same safety number on both sides, verification propagates via the relay');
+    console.log('encrypted media still flows through the SFrame transforms');
+    await waitFor('decoded inbound media on alice', () => mediaFlows(alice));
+    await waitFor('decoded inbound media on bob', () => mediaFlows(bob));
+
+    console.log('chat bodies round-trip encrypted but readable to key holders');
+    const secret = 'the cake is a lie';
+    await sendChat(alice, secret);
+    await waitFor("alice's own chat log to show the message",
+      async () => (await chatLogText(alice)).includes(secret));
+    await waitFor("bob's chat log to show the message",
+      async () => (await chatLogText(bob)).includes(secret));
+
+    console.log('the probe reports live transform counters with zero decrypt failures');
+    const refreshProbes = async () => {
+      refreshN += 1;
+      await sendChat(alice, `probe refresh ${refreshN}`);
+    };
+    const aliceTransform = await waitTransformStats('alice', alice, refreshProbes);
+    const bobTransform = await waitTransformStats('bob', bob, refreshProbes);
+    assertHealthyTransform('alice', aliceTransform);
+    assertHealthyTransform('bob', bobTransform);
+    console.log(`transforms healthy: ${JSON.stringify(aliceTransform)}`);
+
+    console.log('a late joiner sees only placeholders for earlier chat (ciphertext persists)');
+    const carol = await newClient('carol');
+    await openPrejoin(carol, code, 'carol');
+    await clickJoin(carol);
+    await expectInCall(carol, 'carol');
+    await waitFor("carol's replayed history to show the placeholder",
+      async () => (await chatLogText(carol)).includes('Encrypted message'));
+    await carol.waitForSelector('[data-testid="e2ee-indicator"]', { timeout: 30_000 })
+      .catch(async () => fail('carol: the e2ee indicator never showed'));
+
+    await closeContexts();
+
+    // ---------------------------------------------------------------
+    // Scenario 2: the degrade knob trips the EMA detector (D5).
+    // ---------------------------------------------------------------
+    const degradeCode = await createMeeting(true);
+    const dAlice = await newClient('degrade-alice');
+    const dBob = await newClient('degrade-bob');
+    console.log('a forced-slow transform trips the degrade notice');
+    // Two participants: the EMA only sees frames once the key exchange
+    // delivers a sender key, and a solo caller never mints one.
+    await openPrejoin(dAlice, degradeCode, 'alice', '&e2eeDegrade=1');
+    await clickJoin(dAlice);
+    await expectInCall(dAlice, 'alice');
+    await openPrejoin(dBob, degradeCode, 'bob', '&e2eeDegrade=1');
+    await clickJoin(dBob);
+    await expectInCall(dBob, 'bob');
+    await dAlice.waitForFunction(
+      () => document.querySelector('[data-testid="call-status"]')?.textContent.includes('struggling'),
+      { timeout: 30_000 },
+    ).catch(async () => fail('the degrade notice never appeared'));
+    const degradeStats = await waitFor('degraded flag in the probe', async () => {
+      const s = await e2eeStats(dAlice);
+      if (s && s.degraded === true && s.encryptedFrames > 0) return s;
+      refreshN += 1;
+      await sendChat(dAlice, `degrade refresh ${refreshN}`);
+      return null;
+    });
+    if (degradeStats.emaMs <= 20) {
+      fail(`degraded but emaMs is not over threshold: ${JSON.stringify(degradeStats)}`);
+    }
+    console.log(`degrade fired: ${JSON.stringify(degradeStats)}`);
+
+    await closeContexts();
+
+    // ---------------------------------------------------------------
+    // Scenario 3: plaintext meeting in tag-only mode proves the whole
+    // transform + SFU plumbing without WebCrypto (D10).
+    // ---------------------------------------------------------------
+    const tagCode = await createMeeting(false);
+    const tAlice = await newClient('tag-alice');
+    const tBob = await newClient('tag-bob');
+    console.log('a plaintext meeting runs the transform plumbing in tag-only mode');
+    await openPrejoin(tAlice, tagCode, 'alice', '&e2eeTag=1');
+    await clickJoin(tAlice);
+    await expectInCall(tAlice, 'alice');
+    await openPrejoin(tBob, tagCode, 'bob', '&e2eeTag=1');
+    await clickJoin(tBob);
+    await expectInCall(tBob, 'bob');
+    await tAlice.waitForSelector('[data-testid="roster-bob"]', { timeout: 30_000 })
+      .catch(async () => fail('tag mode: alice never saw bob join'));
+    if (await tAlice.$('[data-testid="e2ee-indicator"]')) {
+      fail('the e2ee indicator showed in a plaintext meeting');
+    }
+
+    console.log('tagged media flows through the transforms and the SFU');
+    await waitFor('decoded inbound media on tag-alice', () => mediaFlows(tAlice));
+    await waitFor('decoded inbound media on tag-bob', () => mediaFlows(tBob));
+
+    const refreshTagProbes = async () => {
+      refreshN += 1;
+      await sendChat(tAlice, `tag refresh ${refreshN}`);
+    };
+    const tAliceStats = await waitTransformStats('tag-alice', tAlice, refreshTagProbes);
+    const tBobStats = await waitTransformStats('tag-bob', tBob, refreshTagProbes);
+    assertHealthyTransform('tag-alice', tAliceStats);
+    assertHealthyTransform('tag-bob', tBobStats);
+    if (tAliceStats.enabled !== false) fail('probe says e2ee is on in a plaintext meeting');
+    console.log(`tag-mode plumbing healthy: ${JSON.stringify(tAliceStats)}`);
+
+    console.log('PASS: key exchange, verification, SFrame media, e2ee chat, degrade, tag-mode plumbing');
   } finally {
     for (const context of contexts) await context.close().catch(() => {});
     if (browser) await browser.close().catch(() => {});
