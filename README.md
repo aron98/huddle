@@ -14,6 +14,7 @@ See [Development](#development) for the dev loop or
 ## Documentation
 
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
+- [Deployment guides](docs/deploy/) — Ubuntu VPS, Docker Compose, Kubernetes, hardening checklist
 - [ADRs](docs/adr/) — the decisions we've made and why
 - [Post-MVP milestone](https://github.com/aron98/huddle/milestone/1) — what's
   next
@@ -154,6 +155,12 @@ scrape_configs:
 ```
 
 ## Self-hosting
+
+Step-by-step production guides: [Ubuntu VPS](docs/deploy/ubuntu-vps.md) (static
+binary + systemd + coturn), [Docker Compose](docs/deploy/docker-compose.md),
+[Kubernetes](docs/deploy/kubernetes.md), and a cross-platform
+[hardening checklist](docs/deploy/hardening-checklist.md). This section is the
+configuration reference those guides link back to.
 
 ### Ports and firewall
 
@@ -357,9 +364,10 @@ accepts asymmetric signature algorithms (RS/ES/PS families) from its JWKS.
 
 ### Docker / Kubernetes
 
-Docker: `docker build -t huddle .` produces the single-binary image; and
-`docker compose up` runs a hot-reloading dev stack (web + server + coturn dev
-credentials).
+Docker: `docker build -t huddle .` produces the single-binary image. For
+production use the [secure-by-default compose stack](deploy/compose/) (huddle +
+coturn, guide: [docs/deploy/docker-compose.md](docs/deploy/docker-compose.md));
+the root `docker-compose.yml` is a hot-reloading *dev* stack.
 
 Kubernetes: the [Helm chart](deploy/helm/huddle) deploys one pod with the web
 client embedded in the binary. It defaults to host networking because a k8s
@@ -367,15 +375,17 @@ Service cannot proxy the SFU's UDP media correctly for ICE — the advertised
 candidate must be directly reachable. `helm install huddle deploy/helm/huddle
 --set server.baseUrl=https://meet.example.com` and check `helm show values`
 for the knobs (`server.publicIp`, `server.iceServers`, an existing session
-secret, persistence).
+secret, persistence). Full walkthrough incl. cert-manager/ingress and a coturn
+DaemonSet: [docs/deploy/kubernetes.md](docs/deploy/kubernetes.md).
 
 On k8s the ingress/LB usually owns 443 and the pod serves plain HTTP behind
-it. If you would rather have the pod terminate TLS itself (single-node,
-hostNetwork), set `server.baseUrl` to the HTTPS URL and configure `[tls]` via
-a `HUDDLE_TLS_*`-bearing ConfigMap — with ACME the pod must own port 443
-directly, which hostNetwork makes possible. For TURN over TLS on the
-sidecar/host coturn, see the [`deploy/turn/turnserver.conf`](deploy/turn/turnserver.conf)
-template.
+it. Pod-terminated TLS (single-node, hostNetwork) is also possible — with ACME
+the pod must own port 443 directly, which hostNetwork makes possible — but the
+chart does not yet expose an extra-env/config knob to pass `HUDDLE_TLS_*`
+through, so that variant needs a small chart extension (documented in the
+[kubernetes guide](docs/deploy/kubernetes.md#pod-terminated-tls-variant-chart-extension-required)).
+For TURN over TLS on the sidecar/host coturn, see the
+[`deploy/turn/turnserver.conf`](deploy/turn/turnserver.conf) template.
 
 Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`

@@ -149,6 +149,11 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
 | Kubernetes | Helm chart (post-MVP hardening phase). |
 | Cloudflare | Not a primary target: full self-host keeps the media path open for E2EE. A Workers/D1 signaling port remains possible later. |
 
+Step-by-step production guides per platform: [Ubuntu VPS](deploy/ubuntu-vps.md),
+[Docker Compose](deploy/docker-compose.md), [Kubernetes](deploy/kubernetes.md), plus a
+cross-platform [hardening checklist](deploy/hardening-checklist.md) — see
+[docs/deploy/](deploy/).
+
 **Firewall ports (self-host story — document early):**
 
 | Port | Protocol | Purpose |
@@ -185,6 +190,9 @@ trait, not a rewrite. Anonymous guests never touch `IdentityProvider`.
   self-hosted SFU path — a managed-media port (e.g. Cloudflare Calls) would
   preclude it. Decide before ever promising it — tracked by
   [issue #14](https://github.com/aron98/huddle/issues/14).
+- For a deployment-oriented view of these guarantees (HSTS/cookie behavior,
+  rate limits, log hygiene, backups, upgrade path), see the
+  [hardening checklist](deploy/hardening-checklist.md).
 
 ## Risks
 
