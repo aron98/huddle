@@ -88,6 +88,16 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 - Release workflow on `v*` tags: alpine musl static binary with the web client **baked in** via rust-embed (`crates/web/dist` → `crates/server/assets`).
 - Trunk **release** builds need `data-wasm-opt-params="--enable-bulk-memory-opt"` (already on the rust link in `index.html`) — trunk's pinned binaryen rejects `memory.copy` without it; debug builds skip wasm-opt.
 
+## Desktop shell (`electron/`)
+
+Electron shell (ADR 014) that **loads a Huddle server's HTTP origin** — the web client is same-origin by design, so the shell never serves `crates/web/dist` itself. NOT a Cargo workspace member; it has its own npm package, never touches the Rust gates.
+
+- Exact pins: `electron@45.0.0` (Chromium 156.0.8078.48) and `electron-builder@26.15.3`; bump deliberately, keep Chromium ≥ 141 (E2EE floor, ADR 009), and record the new Chromium version in `electron/README.md`.
+- Main-process modules are ESM `.mjs`; preloads are sandbox-compatible plain `.js` (package.json has no `"type"`). Pure logic (settings, deep-link parsing) is fs-injected and covered by `node --test`.
+- Gates (CI `desktop` job, no `npm install` needed): `cd electron && npm run check && npm test`.
+- No E2E: releases rely on the manual per-OS checklist in `electron/README.md` — keep it in sync with shell behaviour.
+- Known web-side gap: the client hard-codes `ws://` (see `crates/web/src/call.rs`), so the shell only works against plain-HTTP/localhost servers until that is fixed web-side.
+
 ## VM quirks (this environment)
 
 - `/tmp` is tmpfs with a tight quota — clean failed cargo installs before big builds.

@@ -45,3 +45,10 @@ app: Leptos, Dioxus, Yew. Native-only clients (egui, iced) were also considered.
 
 - The post-MVP Tauri shell is tracked in
   [#18](https://github.com/aron98/huddle/issues/18).
+
+## Amendment (2026-10-21)
+
+- The desktop shell ships as **Electron**, not Tauri — system webviews break
+  WebRTC/screen-share/E2EE parity on Linux and macOS. See
+  [ADR 014](014-desktop-shell-electron.md), which supersedes the "Tauri
+  desktop later" line above.
