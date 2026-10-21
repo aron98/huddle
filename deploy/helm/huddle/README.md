@@ -15,7 +15,7 @@ for the full production guide (ingress, cert-manager, coturn companion).
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/aron98/huddle` / `""` (= `appVersion`) / `IfNotPresent` | Container image. No CI workflow publishes the default repository — build and push it yourself. |
+| `image.repository` / `image.tag` / `image.pullPolicy` | `ghcr.io/aron98/huddle` / `""` (= `appVersion`) / `IfNotPresent` | Container image, published by `release-image.yml` on every `v*` tag (tag minus the leading `v`, plus `latest`). |
 | `hostNetwork` | `true` | Pod shares the node network namespace (required for direct media). |
 | `service.port` | `3000` | Web/signaling port (TCP). |
 | `server.baseUrl` | `http://localhost:3000` | External URL used in join links, magic links, ICS invites. |
