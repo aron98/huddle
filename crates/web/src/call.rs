@@ -6,6 +6,7 @@
 use crate::api;
 use crate::audio_settings;
 use crate::e2ee::session::{E2eeSession, PeerView};
+use crate::e2ee::transform::{TransformWorker, supports_e2ee};
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
 use crate::prejoin::{Prejoin, PrejoinState};
@@ -293,11 +294,14 @@ async fn run_session(
 
     // Test hooks (`?test=1`): let e2e reach the peer connection via
     // getStats, and the E2EE keying state via `__huddleE2eeStats`.
-    let test_mode = window()
-        .location()
-        .search()
-        .unwrap_or_default()
-        .contains("test=1");
+    let search = window().location().search().unwrap_or_default();
+    let test_mode = search.contains("test=1");
+    // E2EE transform knobs (test-gated, so production behavior can
+    // never change): `?e2eeDegrade=1` forces the worker's degrade path;
+    // `?e2eeTag=1` attaches a tag-only transform in a PLAINTEXT meeting
+    // to prove the transform plumbing without touching real crypto.
+    let degrade_knob = test_mode && search.contains("e2eeDegrade=1");
+    let tag_knob = test_mode && search.contains("e2eeTag=1");
     if test_mode {
         let _ = js_sys::Reflect::set(
             &window().into(),
@@ -360,6 +364,106 @@ async fn run_session(
     if let Some(meeting) = client.meeting() {
         signals.prejoin.meeting.set(Some(meeting.clone()));
     }
+
+    // E2EE (issues #27/#28, ADRs 010/011): set up the keying session and
+    // the media transform worker BEFORE the first publish, so no frame
+    // is ever encoded without a sender transform attached. The camera
+    // and mic senders already exist (`attach_stream` above); the worker
+    // drops their frames until the first sender key arrives, so
+    // publishing before the exchange completes is still safe.
+    let mut e2ee: Option<E2eeSession> = None;
+    let mut transform: Option<TransformWorker> = None;
+    if client.e2ee_enabled() {
+        signals.e2ee_enabled.set(true);
+        // A browser without worker-based RTP transforms cannot honor an
+        // E2EE meeting — leaving cleanly beats streaming plaintext
+        // nobody could decrypt (ADR 011, D6).
+        if !supports_e2ee() {
+            let _ = client.leave().await;
+            signals.connection_lost(
+                "This meeting is end-to-end encrypted, but this browser cannot encrypt media (needs Chrome/Edge 141+, Firefox 117+, or Safari 15.4+)."
+                    .to_owned(),
+            );
+            return;
+        }
+        match client.you().map(|p| p.id) {
+            Some(you) => {
+                signals.you_id.set(Some(you));
+                match E2eeSession::start(you, client.e2ee_epoch()).await {
+                    Some(mut session) => {
+                        let roster_snapshot = client.roster().to_vec();
+                        session.announce_to_all(&roster_snapshot, &mut client).await;
+                        signals.e2ee_peers.set(session.peer_views());
+                        e2ee = Some(session);
+                    }
+                    // Keying is the backbone of an E2EE meeting: without
+                    // it nobody can decrypt anything, so bail instead of
+                    // continuing broken.
+                    None => {
+                        let _ = client.leave().await;
+                        signals.connection_lost(
+                            "End-to-end encryption is unavailable in this browser, and this meeting requires it."
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                }
+                let worker = match TransformWorker::new(false, degrade_knob) {
+                    Ok(worker) => worker,
+                    Err(e) => {
+                        let _ = client.leave().await;
+                        signals.connection_lost(format!(
+                            "The E2EE media worker could not start ({e})"
+                        ));
+                        return;
+                    }
+                };
+                // The worker detects per-frame slowness (ADR 011, D5)
+                // and reports it once; a true plaintext rejoin is
+                // impossible in an E2EE meeting (server interlock), so
+                // the notice can only suggest leaving.
+                let status_signal = signals.status;
+                worker.set_on_degrade(move || {
+                    status_signal.set(Some(
+                        "E2EE is struggling on this device — video may stutter. Consider leaving and starting a regular (non-E2EE) meeting."
+                            .to_owned(),
+                    ));
+                });
+                client.peer_mut().enable_e2ee(worker.clone());
+                transform = Some(worker);
+            }
+            None => {
+                let _ = client.leave().await;
+                signals.connection_lost(
+                    "Could not determine your participant id for end-to-end encryption.".to_owned(),
+                );
+                return;
+            }
+        }
+    } else if tag_knob {
+        // `?test=1&e2eeTag=1` in a PLAINTEXT meeting: a tag-only
+        // transform (appends a marker, no crypto) proves the worker
+        // plumbing end to end and that the SFU forwards opaque payloads
+        // unharmed. Test knob only — failure is a notice, never a
+        // broken call.
+        match TransformWorker::new(true, false) {
+            Ok(worker) => {
+                client.peer_mut().enable_e2ee(worker.clone());
+                transform = Some(worker);
+            }
+            Err(e) => signals
+                .status
+                .set(Some(format!("E2EE tag transform unavailable ({e})"))),
+        }
+    }
+    // Seed the worker with the current key set (the announce above may
+    // already have produced our own sender key); the session loop
+    // re-syncs whenever keying changes.
+    let mut keys_synced: u64 = 0;
+    if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+        sync_keys_if_changed(e2ee, transform, &mut keys_synced);
+    }
+
     if let Err(e) = client.publish().await {
         signals.connection_lost(format!("Your audio and video could not be published ({e})"));
         return;
@@ -394,30 +498,12 @@ async fn run_session(
         }
     }
 
-    // E2EE (issue #27, ADR 010): in an E2EE meeting load our
-    // long-term identity, announce it to the roster, and derive
-    // pairwise keys from the peers' announces. Failure only disables
-    // the verification UX — the call itself continues.
-    let mut e2ee: Option<E2eeSession> = None;
-    if client.e2ee_enabled() {
-        signals.e2ee_enabled.set(true);
-        if let Some(you) = client.you().map(|p| p.id) {
-            signals.you_id.set(Some(you));
-            match E2eeSession::start(you, client.e2ee_epoch()).await {
-                Some(mut session) => {
-                    let roster_snapshot = client.roster().to_vec();
-                    session.announce_to_all(&roster_snapshot, &mut client).await;
-                    signals.e2ee_peers.set(session.peer_views());
-                    e2ee = Some(session);
-                }
-                None => signals.status.set(Some(
-                    "End-to-end-encryption key exchange is unavailable in this browser; the call continues without verification."
-                        .to_owned(),
-                )),
-            }
-        }
-    }
-    publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
+    publish_e2ee_probe(
+        test_mode,
+        e2ee.as_ref(),
+        transform.as_ref(),
+        client.roster(),
+    );
 
     // The session is live: the controls can reach it, and the flow can
     // move to the in-call view.
@@ -513,11 +599,17 @@ async fn run_session(
                     } else {
                         let _ = client.take_pending_e2ee();
                     }
+                    // New (or rotated) sender keys must reach the
+                    // transform worker before frames encrypted with
+                    // them can arrive.
+                    if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
+                        sync_keys_if_changed(e2ee, transform, &mut keys_synced);
+                    }
                     signals.roster.set(client.roster().to_vec());
                     signals.speaking.set(client.speaking().clone());
                     signals.chat.set(client.chat_log().to_vec());
                     signals.recording.set(client.recording());
-                    publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
+                    publish_e2ee_probe(test_mode, e2ee.as_ref(), transform.as_ref(), client.roster());
                 }
                 Err(e) => {
                     signals.connection_lost(e.to_string());
@@ -736,7 +828,7 @@ async fn run_session(
                             e2ee.confirm_verification(id, &mut client).await;
                             signals.e2ee_peers.set(e2ee.peer_views());
                         }
-                        publish_e2ee_probe(test_mode, e2ee.as_ref(), client.roster());
+                        publish_e2ee_probe(test_mode, e2ee.as_ref(), transform.as_ref(), client.roster());
                     }
                     UiAction::Leave => {
                         let _ = client.leave().await;
@@ -780,8 +872,15 @@ async fn watch_speaking_for(
 
 /// `?test=1` probe (same convention as `__huddlePc`): expose the E2EE
 /// keying state for e2e assertions — trust mode, epoch, and per-peer
-/// safety numbers + verified marks.
-fn publish_e2ee_probe(test_mode: bool, e2ee: Option<&E2eeSession>, roster: &[Participant]) {
+/// safety numbers + verified marks. When a transform worker exists, its
+/// counters ride along (also in tag-only test mode, where `e2ee` is
+/// `None` but the plumbing is what is under test).
+fn publish_e2ee_probe(
+    test_mode: bool,
+    e2ee: Option<&E2eeSession>,
+    transform: Option<&TransformWorker>,
+    roster: &[Participant],
+) {
     if !test_mode {
         return;
     }
@@ -835,11 +934,43 @@ fn publish_e2ee_probe(test_mode: bool, e2ee: Option<&E2eeSession>, roster: &[Par
         peers.push(&peer);
     }
     let _ = js_sys::Reflect::set(&stats, &wasm_bindgen::JsValue::from_str("peers"), &peers);
+    if let Some(worker) = transform {
+        let snapshot = worker.stats();
+        let number = |key: &str, value: f64| {
+            let _ = js_sys::Reflect::set(
+                &stats,
+                &wasm_bindgen::JsValue::from_str(key),
+                &wasm_bindgen::JsValue::from_f64(value),
+            );
+        };
+        number("attached", snapshot.attached);
+        number("encryptedFrames", snapshot.encrypted_frames);
+        number("decryptedFrames", snapshot.decrypted_frames);
+        number("decryptFail", snapshot.decrypt_fail);
+        number("emaMs", snapshot.ema_ms);
+        let _ = js_sys::Reflect::set(
+            &stats,
+            &wasm_bindgen::JsValue::from_str("degraded"),
+            &wasm_bindgen::JsValue::from_bool(snapshot.degraded),
+        );
+    }
     let _ = js_sys::Reflect::set(
         &window().into(),
         &wasm_bindgen::JsValue::from_str("__huddleE2eeStats"),
         &stats,
     );
+}
+
+/// Push the session's SFrame key material to the transform worker
+/// whenever the keying state machine produced (or rotated) keys. The
+/// worker guards against out-of-order `keys` messages by version, so a
+/// redundant post is cheap and a stale one can never win.
+fn sync_keys_if_changed(e2ee: &E2eeSession, worker: &TransformWorker, synced: &mut u64) {
+    let keys = e2ee.media_keys();
+    if keys.version != *synced {
+        worker.post_keys(keys.version, keys.send, &keys.recv);
+        *synced = keys.version;
+    }
 }
 
 /// The join handshake's loading page: prejoin is gone, the call is not

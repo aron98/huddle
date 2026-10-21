@@ -50,6 +50,19 @@ pub struct E2eeSession {
     peers: HashMap<ParticipantId, Peer>,
     /// Fingerprints verified in earlier meetings + this one.
     verified_fingerprints: HashSet<String>,
+    /// Bumped on every key change (own or peer, generation or drop) so
+    /// the session task can cheaply tell when the transform worker
+    /// needs a fresh key table (ADR 011, D1 sync).
+    keys_version: u64,
+}
+
+/// A snapshot of the current-epoch media keys for the transform
+/// worker: our send key (KID + base key) and every KID we can decrypt
+/// with. The SFrame key/salt derivation happens in the glue, not here.
+pub struct MediaKeys {
+    pub version: u64,
+    pub send: Option<(u32, [u8; keying::SENDER_KEY_LEN])>,
+    pub recv: Vec<(u32, [u8; keying::SENDER_KEY_LEN])>,
 }
 
 impl E2eeSession {
@@ -72,6 +85,7 @@ impl E2eeSession {
             own_key: None,
             peers: HashMap::new(),
             verified_fingerprints,
+            keys_version: 0,
         })
     }
 
@@ -100,6 +114,35 @@ impl E2eeSession {
     /// the e2e probe asserts keying has actually happened.
     pub fn has_sender_key(&self) -> bool {
         self.own_key.is_some()
+    }
+
+    /// The key-table version: the session task re-posts the worker's
+    /// key table whenever this changes (ADR 011, D1).
+    pub fn keys_version(&self) -> u64 {
+        self.keys_version
+    }
+
+    /// The current-epoch media keys for the transform worker (ADR 011,
+    /// D2): our send KID and every KID we can decrypt with. Stale-epoch
+    /// peer keys are filtered out defensively.
+    pub fn media_keys(&self) -> MediaKeys {
+        let you = safety::kid(self.epoch, self.you);
+        let mut recv = Vec::with_capacity(self.peers.len() + 1);
+        if let Some(key) = self.own_key {
+            recv.push((you, key));
+        }
+        for (id, peer) in &self.peers {
+            if let Some((epoch, key)) = peer.sender_key
+                && epoch == self.epoch
+            {
+                recv.push((safety::kid(self.epoch, *id), key));
+            }
+        }
+        MediaKeys {
+            version: self.keys_version,
+            send: self.own_key.map(|key| (you, key)),
+            recv,
+        }
     }
 
     /// Announce our identity to every current roster participant.
@@ -151,6 +194,7 @@ impl E2eeSession {
         for peer in self.peers.values_mut() {
             peer.sender_key = None;
         }
+        self.keys_version += 1;
         let targets: Vec<ParticipantId> = self.peers.keys().copied().collect();
         for to in targets {
             self.send_own_key(to, rtc).await;
@@ -251,6 +295,7 @@ impl E2eeSession {
         }
         if let Some(peer) = self.peers.get_mut(&from) {
             peer.sender_key = Some((inner_epoch, key));
+            self.keys_version += 1;
         }
     }
 
@@ -373,6 +418,7 @@ impl E2eeSession {
             .try_into()
             .map_err(|_| "wrong random length".to_owned())?;
         self.own_key = Some(key);
+        self.keys_version += 1;
         Ok(key)
     }
 }

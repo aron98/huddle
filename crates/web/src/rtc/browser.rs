@@ -21,6 +21,8 @@ use web_sys::{
 
 use huddle_protocol::{ClientMessage, IceServer, ServerMessage};
 
+use crate::e2ee::transform::TransformWorker;
+
 use super::peer::{LocalCandidate, PeerConnection, PeerError};
 use super::transport::{SignalingError, SignalingStream};
 
@@ -208,6 +210,11 @@ pub struct BrowserPeerConnection {
     /// Sender of the published camera, kept for `replaceTrack` swaps
     /// (blur on/off) — m-line, simulcast rids and msid all stay put.
     camera_sender: Rc<RefCell<Option<RtcRtpSender>>>,
+    /// The E2EE media transform worker, once enabled for this call
+    /// (issue #28, ADR 011). Sender transforms attach via
+    /// [`BrowserPeerConnection::enable_e2ee`]; receiver transforms
+    /// attach from the `ontrack` closure, which clones this handle.
+    e2ee: Rc<RefCell<Option<TransformWorker>>>,
     _on_ice_candidate: Closure<dyn FnMut(RtcPeerConnectionIceEvent)>,
     _on_track: Closure<dyn FnMut(RtcTrackEvent)>,
 }
@@ -333,7 +340,23 @@ impl BrowserPeerConnection {
         let on_remote_stream: RemoteStreamCallback = Rc::new(RefCell::new(None));
         let streams_sink = Rc::clone(&remote_streams);
         let callback_sink = Rc::clone(&on_remote_stream);
+        // Receiver-side E2EE transforms attach here, not at join time: the
+        // recvonly transceivers the server's offers create only gain their
+        // forwarded tracks when `ontrack` fires, and a
+        // RTCRtpScriptTransform instance is bound to one track for life.
+        // `enable_e2ee` stores the worker in this shared cell before the
+        // server's first forwarded track can arrive (it runs before the
+        // initial publish), so every fire — including later reshuffles —
+        // finds it and attaches. Failures are non-fatal: a dropped attach
+        // degrades to the worker's decrypt path reporting undecryptable
+        // frames, never to a broken call.
+        let e2ee_sink = Rc::new(RefCell::new(None::<TransformWorker>));
+        let e2ee_for_track = Rc::clone(&e2ee_sink);
         let on_track = Closure::<dyn FnMut(RtcTrackEvent)>::new(move |event: RtcTrackEvent| {
+            let kind = event.track().kind();
+            if let Some(worker) = e2ee_for_track.borrow().as_ref() {
+                let _ = worker.attach_to_receiver(&event.receiver(), &kind);
+            }
             let track_id = event.track().id();
             let streams = event.streams();
             for i in 0..streams.length() {
@@ -371,6 +394,7 @@ impl BrowserPeerConnection {
             on_remote_stream,
             screen: Rc::new(RefCell::new(ScreenState::default())),
             camera_sender: Rc::new(RefCell::new(None)),
+            e2ee: e2ee_sink,
             _on_ice_candidate: on_ice_candidate,
             _on_track: on_track,
         })
@@ -391,6 +415,32 @@ impl BrowserPeerConnection {
     /// The underlying JS `RTCPeerConnection`, for debug/test inspection.
     pub fn raw(&self) -> RtcPeerConnection {
         self.pc.clone()
+    }
+
+    /// Enable E2EE media transforms for the rest of this call (issue #28,
+    /// ADR 011): attach a sender transform to every sender that already
+    /// carries a track, remember the worker so senders created later
+    /// (screen shares) and receivers (the `ontrack` closure) attach too.
+    /// Must run before the initial `publish()` so no plaintext frame ever
+    /// leaves in an E2EE meeting; the worker itself drops frames until
+    /// the keying layer delivers a sender key, so the race is safe even
+    /// if a sender sneaks in before this runs.
+    pub fn enable_e2ee(&self, worker: TransformWorker) {
+        let senders = self.pc.get_senders();
+        for i in 0..senders.length() {
+            let Ok(sender) = senders.get(i).dyn_into::<RtcRtpSender>() else {
+                continue;
+            };
+            // Senders without a track (recvonly m-lines) never emit
+            // frames; default to "video" so a sender whose track is being
+            // swapped still gets a transform.
+            let kind = sender
+                .track()
+                .map(|track| track.kind())
+                .unwrap_or_else(|| "video".to_owned());
+            let _ = worker.attach_to_sender(&sender, &kind);
+        }
+        *self.e2ee.borrow_mut() = Some(worker);
     }
 
     /// Publish the local microphone and camera. Camera video goes out as
@@ -631,7 +681,14 @@ impl PeerConnection for BrowserPeerConnection {
         let transceiver = self
             .pc
             .add_transceiver_with_media_stream_track_and_init(&track, &init);
-        self.screen.borrow_mut().sender = Some(transceiver.sender());
+        let video_sender = transceiver.sender();
+        // The share m-lines are created after `enable_e2ee` may have run,
+        // so attach their transforms here (ADR 011: one transform per
+        // sender, instances are not reusable).
+        if let Some(worker) = self.e2ee.borrow().as_ref() {
+            let _ = worker.attach_to_sender(&video_sender, "video");
+        }
+        self.screen.borrow_mut().sender = Some(video_sender);
 
         // The share's computer/tab audio, when the user kept one in the
         // picker: a second sendonly transceiver — never `addTrack`, for
@@ -654,7 +711,11 @@ impl PeerConnection for BrowserPeerConnection {
             let transceiver = self
                 .pc
                 .add_transceiver_with_media_stream_track_and_init(&audio, &init);
-            self.screen.borrow_mut().audio_sender = Some(transceiver.sender());
+            let audio_sender = transceiver.sender();
+            if let Some(worker) = self.e2ee.borrow().as_ref() {
+                let _ = worker.attach_to_sender(&audio_sender, "audio");
+            }
+            self.screen.borrow_mut().audio_sender = Some(audio_sender);
         }
         Ok(())
     }

@@ -281,7 +281,9 @@ mod crypto {
         Ok(key.unchecked_into::<CryptoKey>())
     }
 
-    async fn import_aes_key(raw: &[u8]) -> Result<CryptoKey, String> {
+    /// Import raw bytes as an AES-GCM `CryptoKey` (used for pairwise
+    /// keys and for #28's chat keys).
+    pub async fn import_aes_key(raw: &[u8]) -> Result<CryptoKey, String> {
         let params = js_sys::Object::new();
         set(&params, "name", &JsValue::from_str("AES-GCM"))?;
         let usages = js_sys::Array::new();
@@ -380,4 +382,4 @@ mod crypto {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use crypto::{derive_pairwise_key, open, random_bytes, seal};
+pub use crypto::{derive_pairwise_key, import_aes_key, open, random_bytes, seal};
