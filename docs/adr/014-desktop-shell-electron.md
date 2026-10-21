@@ -64,11 +64,11 @@ be a second origin with no server to talk to.
 - An npm toolchain enters an otherwise Rust-only repo (contained in
   `electron/`, never a Cargo workspace member).
 - Chromium security updates now require deliberate Electron bumps.
-- Loading a remote origin means the shell inherits the client's pre-existing
-  `ws://` hard-coding (see `electron/README.md`, "Known follow-up"): servers
-  terminated at plain HTTP or localhost work today; an https server with the
-  current `ws://` derivation would hit mixed-content blocking — a web-client
-  bug to fix in place, benefiting tab users equally.
+- Loading a remote origin once meant the shell inherited the client's
+  `ws://` hard-coding (fixed since, issue #65: the client now derives
+  `wss://` from the page protocol), which would have hit mixed-content
+  blocking on https servers — the same-origin rule stands and both
+  schemes now work.
 - Unsigned binaries on Windows/macOS mean OS warnings; accepted for a
   self-hosted audience in v0.x.
 
