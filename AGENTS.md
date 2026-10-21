@@ -62,6 +62,7 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 - **Signaling pump cancel-safety**: read inside `futures::select!` (`read_server_message`), handle OUTSIDE (`handle_server_message`) — dropping the handle future mid-JS-promise loses SdpAnswers and wedges renegotiation (~50% flake before the fix).
 - e2e asserts media by **ssrc snapshots** (`inbound-rtp` framesDecoded) — track identity AND `track.id()` are unusable (provisional wrappers).
 - web-sys 0.3.x: builder methods (`.sdp()`, `.ice_transport_policy()`) are deprecated `&mut Self` chains — use `set_*`.
+- **web-sys `Clone` for `MediaStream` lowers to JS `MediaStream.clone()`** — a TRACK SNAPSHOT (new live track objects), not a reference clone. Publishing `stream.clone()` into signals/holders means later track mutations miss the copy, and cloned mic tracks silently keep device captures open (pinning Chrome per-device audio-processing state). Clone the JsValue handle instead (`MediaStream::from(JsValue::as_ref().clone())`) for a refcount bump and publish the original into signals.
 
 ## SFU / str0m
 
