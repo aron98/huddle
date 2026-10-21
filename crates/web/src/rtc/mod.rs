@@ -126,6 +126,14 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
         &self.chat_log
     }
 
+    /// Mutable access to the buffered chat log: the E2EE layer rewrites
+    /// bodies it could not decrypt when they arrived (replayed history and
+    /// anything swallowed while `publish` was mid-negotiation) once the
+    /// keys for their epoch show up.
+    pub fn chat_log_mut(&mut self) -> &mut [ChatMessage] {
+        &mut self.chat_log
+    }
+
     /// Participants the server currently reports as speaking.
     pub fn speaking(&self) -> &HashSet<ParticipantId> {
         &self.speaking

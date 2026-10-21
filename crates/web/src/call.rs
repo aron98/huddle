@@ -5,7 +5,7 @@
 
 use crate::api;
 use crate::audio_settings;
-use crate::e2ee::session::{E2eeSession, PeerView};
+use crate::e2ee::session::{Browser, E2eeSession, PeerView};
 use crate::e2ee::transform::{TransformWorker, supports_e2ee};
 use crate::flow::{FlowPhase, JoinError, LeaveKind};
 use crate::media;
@@ -471,6 +471,12 @@ async fn run_session(
         signals.connection_lost(format!("Your audio and video could not be published ({e})"));
         return;
     }
+    // History replayed around the join lands while `publish` waits for
+    // the SDP answer and skips the select-loop intercept; open whatever
+    // the session can (or placeholder it — ADR 011, D7).
+    if let Some(e2ee) = &e2ee {
+        decrypt_pending_chat(e2ee, &mut client).await;
+    }
 
     // The prejoin toggles survive the handover: the local stream is the
     // same object, so each track's `enabled` state is the truth to seed
@@ -620,6 +626,12 @@ async fn run_session(
                     // them can arrive.
                     if let (Some(e2ee), Some(transform)) = (&e2ee, &transform) {
                         sync_keys_if_changed(e2ee, transform, &mut keys_synced);
+                    }
+                    // Anything the publish negotiation swallowed (the
+                    // replayed history) is still sealed — open it now
+                    // that the session owns keys.
+                    if let Some(e2ee) = &e2ee {
+                        decrypt_pending_chat(e2ee, &mut client).await;
                     }
                     signals.roster.set(client.roster().to_vec());
                     signals.speaking.set(client.speaking().clone());
@@ -1008,6 +1020,29 @@ fn sync_keys_if_changed(e2ee: &E2eeSession, worker: &TransformWorker, synced: &m
     if keys.version != *synced {
         worker.post_keys(keys.version, keys.send, &keys.recv);
         *synced = keys.version;
+    }
+}
+
+/// Decrypt chat bodies still in envelope form. The select-loop intercept
+/// decrypts messages as they arrive, but anything the inner pump loops
+/// buffered during `publish` — the replayed history above all — lands in
+/// the client's log raw. A decrypted body never parses as an envelope and
+/// system messages carry no sender, so the guard rewrites only entries
+/// that are genuinely still sealed; undecryptable ones become the
+/// forward-secrecy placeholder (ADR 011, D7).
+async fn decrypt_pending_chat(e2ee: &E2eeSession, client: &mut Browser) {
+    let mut sealed: Vec<(usize, huddle_protocol::ParticipantId)> = Vec::new();
+    for (index, message) in client.chat_log_mut().iter().enumerate() {
+        if let Some(sender) = message.sender_id
+            && crate::e2ee::chat::decode(&message.body).is_some()
+        {
+            sealed.push((index, sender));
+        }
+    }
+    for (index, sender) in sealed {
+        let body = client.chat_log_mut()[index].body.clone();
+        let opened = e2ee.decrypt_chat(sender, &body).await;
+        client.chat_log_mut()[index].body = opened;
     }
 }
 

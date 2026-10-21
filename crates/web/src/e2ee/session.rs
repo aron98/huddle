@@ -14,7 +14,7 @@ use huddle_protocol::{Participant, ParticipantId, ServerMessage};
 use std::collections::{HashMap, HashSet};
 use web_sys::CryptoKey;
 
-type Browser = RtcClient<crate::rtc::BrowserSignalingStream, crate::rtc::BrowserPeerConnection>;
+pub type Browser = RtcClient<crate::rtc::BrowserSignalingStream, crate::rtc::BrowserPeerConnection>;
 
 /// What a peer looks like once the pairwise ECDH has produced a key:
 /// the safety number is comparable out of band, and the peer may
