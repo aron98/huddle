@@ -49,6 +49,12 @@ struct Inner {
     /// When set, discovery/ID tokens advertise this issuer instead of
     /// the fake's own URL (mix-up-defense tests).
     issuer_override: Option<String>,
+    /// When set, ID tokens are shaped for this algorithm override:
+    /// "HS256" signs with the shared client secret (a provider app
+    /// configured the way Auth0's HS256 default leaves it) and "JWE"
+    /// emits an encrypted-token shape with no signature at all
+    /// (issue #88's unsupported-algorithm rejections).
+    alg_override: Option<String>,
 }
 
 #[derive(Clone)]
@@ -112,6 +118,14 @@ impl FakeIdp {
     pub fn set_issuer(&self, issuer: &str) {
         self.shared.inner.lock().unwrap().issuer_override = Some(issuer.to_owned());
     }
+
+    /// Shape the next ID tokens for an unsupported signing mode
+    /// (issue #88): `"HS256"` signs with the shared client secret;
+    /// `"JWE"` emits an encrypted-token shape. Pass `"ES256"` to go
+    /// back to the default.
+    pub fn set_signing_alg(&self, alg: &str) {
+        self.shared.inner.lock().unwrap().alg_override = Some(alg.to_owned());
+    }
 }
 
 async fn discovery(State(state): State<Shared>) -> Json<serde_json::Value> {
@@ -155,13 +169,16 @@ async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, Str
     }
 
     let now = OffsetDateTime::now_utc().unix_timestamp();
-    let issuer = state
-        .inner
-        .lock()
-        .unwrap()
-        .issuer_override
-        .clone()
-        .unwrap_or_else(|| state.base_url.clone());
+    let (issuer, alg_override) = {
+        let inner = state.inner.lock().unwrap();
+        (
+            inner
+                .issuer_override
+                .clone()
+                .unwrap_or_else(|| state.base_url.clone()),
+            inner.alg_override.clone(),
+        )
+    };
     let claims = json!({
         "iss": issuer,
         "sub": format!("user-{}", state.email),
@@ -172,10 +189,29 @@ async fn token(State(state): State<Shared>, Form(form): Form<HashMap<String, Str
         "email_verified": true,
         "nonce": nonce,
     });
-    let key = jsonwebtoken::EncodingKey::from_ec_pem(PRIVATE_KEY_PEM.as_bytes())
-        .expect("static test key parses");
-    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
-    let id_token = jsonwebtoken::encode(&header, &claims, &key).expect("sign id token");
+    let id_token = match alg_override.as_deref() {
+        // HMAC with the shared client secret, as a misconfigured
+        // provider app would sign it.
+        Some("HS256") => {
+            let key = jsonwebtoken::EncodingKey::from_secret(state.client_secret.as_bytes());
+            let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            jsonwebtoken::encode(&header, &claims, &key).expect("sign id token")
+        }
+        // An encrypted-token shape: a JWE header (note `enc`), five
+        // dot-separated parts, and no signature to verify.
+        Some("JWE") => {
+            use base64::Engine as _;
+            let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(json!({ "alg": "RSA-OAEP-256", "enc": "A256GCM" }).to_string());
+            format!("{header}....")
+        }
+        _ => {
+            let key = jsonwebtoken::EncodingKey::from_ec_pem(PRIVATE_KEY_PEM.as_bytes())
+                .expect("static test key parses");
+            let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+            jsonwebtoken::encode(&header, &claims, &key).expect("sign id token")
+        }
+    };
     Json(json!({
         "access_token": "fake-access-token",
         "token_type": "Bearer",

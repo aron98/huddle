@@ -62,6 +62,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/me", get(auth::me))
         .route("/api/auth/oidc/login", get(auth::oidc_login))
         .route("/api/auth/oidc/callback", get(auth::oidc_callback))
+        .route("/api/auth/oidc/status", get(auth::oidc_status))
         .route("/api/oauth/device/register", post(oauth::register))
         .route("/api/oauth/token", post(oauth::token))
         .route("/api/oauth/revoke", post(oauth::revoke))
@@ -1291,20 +1292,26 @@ mod tests {
         let idp = FakeIdp::start("e2e-client", "e2e-secret", "sso@example.com")
             .await
             .unwrap();
+        let config = crate::config::OidcConfig {
+            issuer_url: idp.base_url.clone(),
+            client_id: "e2e-client".into(),
+            client_secret: "e2e-secret".into(),
+        };
+        (oidc_state_with(Some(config)).await, idp)
+    }
+
+    /// App state with the given OIDC section (or none) — the fixture
+    /// behind every OIDC route test.
+    async fn oidc_state_with(oidc: Option<crate::config::OidcConfig>) -> AppState {
         let config = Arc::new(crate::config::Config {
             media_port: 0,
             public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
             base_url: "http://127.0.0.1:3134".into(),
-            oidc: Some(crate::config::OidcConfig {
-                issuer_url: idp.base_url.clone(),
-                client_id: "e2e-client".into(),
-                client_secret: "e2e-secret".into(),
-            }),
+            oidc,
             ..crate::config::Config::default()
         });
         let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
-        let state = AppState::new(config, crate::db::test_pool().await, engine).unwrap();
-        (state, idp)
+        AppState::new(config, crate::db::test_pool().await, engine).unwrap()
     }
 
     fn query_params(url: &str) -> Vec<(String, String)> {
@@ -1502,6 +1509,187 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body).into_owned();
         assert!(text.contains("sso@example.com"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn oidc_status_reports_configuration_without_secrets() {
+        // Configured: the issuer is shown, the client secret never
+        // (issue #88's deployer probe).
+        let (state, idp) = oidc_test_state().await;
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/oidc/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_configured"), "got: {text}");
+        assert!(text.contains(&idp.base_url), "got: {text}");
+        assert!(!text.contains("e2e-secret"), "got: {text}");
+
+        // Not configured: still 200, says so.
+        let app = router(oidc_state_with(None).await);
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/oidc/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_not_configured"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn oidc_login_with_unreachable_issuer_surfaces_the_coarse_class() {
+        // Bad issuer URL: discovery cannot be fetched — the login
+        // start fails with the sanitized `oidc_misconfigured` class,
+        // never the underlying transport detail (issue #88).
+        let config = crate::config::OidcConfig {
+            // Nothing listens on port 1; connection refused is instant.
+            issuer_url: "http://127.0.0.1:1".into(),
+            client_id: "e2e-client".into(),
+            client_secret: "e2e-secret".into(),
+        };
+        let app = router(oidc_state_with(Some(config)).await);
+        let response = app
+            .oneshot(
+                Request::get("/api/auth/oidc/login")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 5103))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_misconfigured"), "got: {text}");
+        assert!(text.contains("hint"), "got: {text}");
+        // The precise cause stays in the server log, not the wire.
+        assert!(!text.contains("127.0.0.1:1"), "got: {text}");
+    }
+
+    /// Begin an SSO login through the HTTP routes; returns the binding
+    /// cookie, the `state` parameter, and the authorization URL's
+    /// query params.
+    async fn begin_sso(
+        app: &Router,
+        port: u16,
+    ) -> (String, String, std::collections::HashMap<String, String>) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/oidc/login")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], port))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_owned();
+        let binding_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let params: std::collections::HashMap<String, String> =
+            query_params(&location).into_iter().collect();
+        (binding_cookie, params["state"].clone(), params)
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_failures_carry_coarse_classes() {
+        let (state, idp) = oidc_test_state().await;
+        let app = router(state);
+
+        // A token minted for someone else's authorization request: the
+        // class is oidc_token_invalid; the precise cause (the nonce
+        // mismatch) never crosses the wire (issue #88).
+        let (binding_cookie, state_param, _params) = begin_sso(&app, 5104).await;
+        idp.set_nonce("someone-elses-nonce");
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/api/auth/oidc/callback?code=x&state={state_param}"
+                ))
+                .header(header::COOKIE, &binding_cookie)
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let body = refused.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_token_invalid"), "got: {text}");
+        assert!(text.contains("unauthorized"), "got: {text}");
+        assert!(!text.contains("nonce"), "got: {text}");
+
+        // A callback whose state was never issued to this browser: the
+        // expired-sign-in class, not a bare unauthorized.
+        let stranger = app
+            .clone()
+            .oneshot(
+                Request::get("/api/auth/oidc/callback?code=x&state=not-issued-here")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stranger.status(), StatusCode::UNAUTHORIZED);
+        let body = stranger.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_state_expired"), "got: {text}");
+
+        // A fresh login that lands, then a replay of it: the state row
+        // is single-use, so the replay surfaces oidc_state_expired.
+        let (binding_cookie, state_param, params) = begin_sso(&app, 5105).await;
+        idp.set_nonce(&params["nonce"]);
+        let uri = format!("/api/auth/oidc/callback?code=x&state={state_param}");
+        let landed = app
+            .clone()
+            .oneshot(
+                Request::get(&uri)
+                    .header(header::COOKIE, &binding_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(landed.status(), StatusCode::SEE_OTHER);
+        let replay = app
+            .oneshot(
+                Request::get(&uri)
+                    .header(header::COOKIE, &binding_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
+        let body = replay.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(text.contains("oidc_state_expired"), "got: {text}");
     }
 
     // --- ownership, dashboard, ICS -----------------------------------------
