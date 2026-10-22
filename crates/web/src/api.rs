@@ -105,9 +105,30 @@ pub fn oidc_login_redirect(body: &str) -> Option<String> {
     }
 }
 
+/// True when a request-link response says the dev log mailer delivered:
+/// no real transport is configured, and the link is printed in the
+/// server log. The login page shows its "the link is in the server
+/// log" hint only then — with SMTP or Resend in place the link goes to
+/// the mailbox, and the copy must never imply it sits in any log
+/// (issue #85).
+///
+/// `false` for anything else — a real mailer, a missing field, an
+/// unparseable body — so the hint errs on the side of never claiming
+/// the link is logged.
+pub fn link_logged_in_server_log(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .map(|value| {
+            value
+                .get("delivery")
+                .and_then(|delivery| delivery.as_str())
+                .is_some_and(|delivery| delivery == "logged")
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::oidc_login_redirect;
+    use super::{link_logged_in_server_log, oidc_login_redirect};
 
     #[test]
     fn oidc_configured_refusal_yields_the_sso_entry_point() {
@@ -122,5 +143,20 @@ mod tests {
     fn other_refusal_bodies_yield_none() {
         assert_eq!(oidc_login_redirect(r#"{"code":"rate_limited"}"#), None);
         assert_eq!(oidc_login_redirect("not json"), None);
+    }
+
+    #[test]
+    fn only_a_log_mailer_delivery_claims_the_log() {
+        // The dev transport: the hint may be shown.
+        assert!(link_logged_in_server_log(
+            r#"{"status":"sent","delivery":"logged"}"#
+        ));
+        // A real mailer: the hint must not be shown.
+        assert!(!link_logged_in_server_log(
+            r#"{"status":"sent","delivery":"emailed"}"#
+        ));
+        // Absent or unknown delivery never claims the log.
+        assert!(!link_logged_in_server_log(r#"{"status":"sent"}"#));
+        assert!(!link_logged_in_server_log("not json"));
     }
 }
