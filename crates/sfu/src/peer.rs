@@ -876,6 +876,23 @@ impl Peer {
         keyframes
     }
 
+    /// The `(origin, layer)` preference this receiver currently holds
+    /// for every other peer's camera it subscribes to (one entry per
+    /// origin; screens and audio are never layer-filtered). Exposed via
+    /// `/metrics` so layer switches are observable without a browser.
+    pub(crate) fn layer_preferences(&self) -> Vec<(PeerId, VideoLayer)> {
+        let mut prefs = Vec::new();
+        for out in &self.tracks_out {
+            if out.screen || !matches!(out.kind, MediaKind::Video) {
+                continue;
+            }
+            if !prefs.iter().any(|(origin, _)| *origin == out.origin) {
+                prefs.push((out.origin, out.layer));
+            }
+        }
+        prefs
+    }
+
     /// The rid this receiver currently wants for `origin`'s track
     /// `mid_in`: `None` when the track is not simulcast (the caller then
     /// asks the origin for a whole-track keyframe).

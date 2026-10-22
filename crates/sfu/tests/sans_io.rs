@@ -986,6 +986,11 @@ fn simulcast_routes_the_subscribers_chosen_layer() {
         after_switch,
         "repeat preference was not throttled"
     );
+    assert_eq!(
+        room.peer_stats(b_id).unwrap().layer_preferences,
+        vec![(a_id, VideoLayer::High)],
+        "the switch must be visible in peer_stats (rendered via /metrics)"
+    );
 
     // b now receives the high layer instead of the low one.
     let (low_before, high_before) = (
@@ -1015,6 +1020,11 @@ fn simulcast_routes_the_subscribers_chosen_layer() {
         room.peer_stats(a_id).unwrap().keyframes_requested,
         before + 1,
         "switching to low did not request a keyframe"
+    );
+    assert_eq!(
+        room.peer_stats(b_id).unwrap().layer_preferences,
+        vec![(a_id, VideoLayer::Low)],
+        "the fallback must be visible in peer_stats (rendered via /metrics)"
     );
     a.send_simulcast_frames(cam, "low", LOW, 5);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
