@@ -219,12 +219,15 @@ struct Discovery {
     jwks_uri: String,
 }
 
-/// The ID-token claims huddle relies on. `iss`/`aud`/`exp` are checked
-/// by the JWT library; everything here is checked by us.
+/// The ID-token claims huddle relies on. `aud`/`exp` are checked by the
+/// JWT library; `iss` is validated by us, normalized for a trailing `/`
+/// (issuers such as Auth0 emit `https://tenant/` even when configured
+/// without the slash); everything here is checked by us.
 #[derive(Debug, serde::Deserialize)]
 struct IdTokenClaims {
     #[allow(dead_code)] // presence is required; value is the organizer key
     sub: String,
+    iss: String,
     email: String,
     email_verified: Option<bool>,
     nonce: Option<String>,
@@ -510,13 +513,25 @@ impl OidcIdentityProvider {
             let mut validation = jsonwebtoken::Validation::new(family);
             validation.algorithms = algorithms;
             validation.leeway = 60;
-            validation.set_issuer(&[&self.issuer_url]);
             validation.set_audience(&[&self.client_id]);
             let Ok(decoding_key) = jsonwebtoken::DecodingKey::from_jwk(&jwk) else {
                 continue;
             };
             match jsonwebtoken::decode::<IdTokenClaims>(id_token, &decoding_key, &validation) {
-                Ok(token) => return Ok(token.claims),
+                Ok(token) => {
+                    // The signature verified against this key; validate
+                    // the issuer ourselves, tolerating a trailing `/` on
+                    // either side (issuers such as Auth0 emit
+                    // `https://tenant/` as `iss` even when configured —
+                    // and discovered — without the slash).
+                    if token.claims.iss.trim_end_matches('/') != self.issuer_url {
+                        return Err(IdentityError::Provider(format!(
+                            "ID token issuer {} does not match {}",
+                            token.claims.iss, self.issuer_url
+                        )));
+                    }
+                    return Ok(token.claims);
+                }
                 Err(e) => last_err = IdentityError::Provider(format!("ID token rejected: {e}")),
             }
         }
@@ -929,5 +944,17 @@ mod tests {
             provider.begin_login(OffsetDateTime::now_utc()).await,
             Err(IdentityError::Provider(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn oidc_issuer_trailing_slash_is_tolerated() {
+        // Issuers such as Auth0 emit `iss` with a trailing slash even
+        // when the server was configured — and the IdP discovered —
+        // without one; the claim check must be normalized, not exact.
+        let (provider, idp, _pool, config) = oidc_provider(time::Duration::minutes(15)).await;
+        idp.set_issuer(&format!("{}/", config.issuer_url));
+        let now = OffsetDateTime::now_utc();
+        let (organizer, _params, _state) = sso_login(&provider, &idp, now).await;
+        assert_eq!(organizer.email, "sso@example.com");
     }
 }
