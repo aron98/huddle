@@ -97,6 +97,7 @@ Electron shell (ADR 014) that **loads a Huddle server's HTTP(S) origin** — the
 - Main-process modules are ESM `.mjs`; preloads are sandbox-compatible plain `.js` (package.json has no `"type"`). Pure logic (settings, deep-link parsing) is fs-injected and covered by `node --test`.
 - Gates (CI `desktop` job, no `npm install` needed): `cd electron && npm run check && npm test`.
 - No E2E: releases rely on the manual per-OS checklist in `electron/README.md` — keep it in sync with shell behaviour.
+- macOS builds are **ad-hoc signed** (`mac.identity: "-"` in `electron/electron-builder.yml`, issue #86 — in electron-builder 26, `identity: null` SKIPS signing, only `"-"` ad-hoc signs). Ad-hoc ≠ notarized: Gatekeeper still warns on first launch (workarounds in `electron/README.md`); Developer ID + notarization (paid Apple Developer Program) is a recorded follow-up. CI asserts the signature (`verify ad-hoc signature` step in `release-desktop.yml`).
 
 ## VM quirks (this environment)
 
