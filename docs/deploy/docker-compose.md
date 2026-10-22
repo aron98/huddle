@@ -116,11 +116,16 @@ static binary on alpine instead of the glibc/debian variant.
 
 TURN over TLS (`turns:…:5349`) needs a PEM certificate for the TURN domain —
 huddle's ACME cache only serves huddle's own domain and is not readable by coturn.
-Provision it on the host exactly as in the [VPS guide](ubuntu-vps.md#63-tls-certificate-for-coturn-optional-but-recommended)
+Out of the box the TLS listener is commented out in
+`deploy/compose/turnserver.conf` together with `cert=`/`pkey=` (coturn refuses
+to start a TLS listener without a certificate). Until you enable it, also drop
+the `turns:…:5349` URL from `HUDDLE_ICE_SERVERS` in `docker-compose.yml` so
+clients don't probe a dead TLS listener. To turn it on, provision the cert on
+the host exactly as in the [VPS guide](ubuntu-vps.md#63-tls-certificate-for-coturn-optional-but-recommended)
 (certbot `--standalone` on tcp/80 or DNS-01), copy the PEM files into
 `deploy/compose/certs/turn.example.com/`, then:
 
-1. Uncomment the `certs` volume bind and the `cert=`/`pkey=` lines in
+1. Uncomment the `tls-listening-port=5349` and `cert=`/`pkey=` lines in
    `deploy/compose/turnserver.conf`.
 2. Uncomment the `./certs:/etc/coturn/certs:ro` mount in `docker-compose.yml`.
 3. `docker compose up -d coturn` (recreate).
