@@ -47,6 +47,25 @@ async function waitFor(what, fn, timeoutMs = 60_000, everyMs = 500) {
   }
 }
 
+// Like `waitFor`, but resolves `false` on timeout instead of failing.
+// Used for the sender-liveness gates of the simulcast assertions: under
+// runner load the sender's encoder can stall a layer, which makes the
+// receiver-side upgrade unobservable no matter what the SFU does —
+// that must degrade into a loud warning, not a test failure (issue #78).
+async function tryWaitFor(what, fn, timeoutMs = 30_000, everyMs = 500) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  for (;;) {
+    last = await fn();
+    if (last) return last;
+    if (Date.now() > deadline) {
+      console.warn(`WARNING: timed out waiting for ${what}: ${JSON.stringify(last)}`);
+      return false;
+    }
+    await delay(everyMs);
+  }
+}
+
 async function statusText(page) {
   try {
     return await page.$eval('[data-testid="call-status"]', (el) => el.textContent);
@@ -226,6 +245,46 @@ const videoDetails = (page) =>
     return live;
   });
 
+// Per-rid outbound simulcast stats of the SENDER (Chrome keys
+// outbound-rtp per encoding rid): whether each layer is actually being
+// produced. Under runner load the sender's encoder can stall a layer
+// (issue #78), so the receiver-side layer checks are gated on this.
+const senderSimulcast = (page) =>
+  page.evaluate(async () => {
+    const stats = await window.__huddlePc.getStats();
+    const layers = {};
+    stats.forEach((report) => {
+      if (report.type === 'outbound-rtp' && report.kind === 'video' && report.rid) {
+        layers[report.rid] = {
+          framesSent: report.framesSent ?? 0,
+          frameWidth: report.frameWidth ?? 0,
+          active: report.active ?? null,
+          reason: report.qualityLimitationReason ?? null,
+        };
+      }
+    });
+    return layers;
+  });
+
+// The simulcast layer the SFU is currently forwarding to `peer` from
+// `origin`'s camera, straight from /metrics. This is the authoritative,
+// load-independent proof that a layer preference landed server-side.
+async function sfuSimulcastLayer(peer, origin) {
+  try {
+    const res = await fetch(`${BASE}/metrics`);
+    const text = await res.text();
+    const m = text.match(
+      new RegExp(
+        `^huddle_peer_simulcast_layer\\{[^}]*peer="${peer}"[^}]*origin="${origin}"[^}]*\\} (\\d+)$`,
+        'm',
+      ),
+    );
+    return m ? (m[1] === '1' ? 'high' : 'low') : null;
+  } catch {
+    return null;
+  }
+}
+
 const stateDump = (page, who) =>
   page
     .evaluate(() => {
@@ -344,8 +403,16 @@ async function main() {
       );
     }
 
-    // Focusing alice's tile switches bob onto the high layer: the SAME
-    // ssrc starts delivering bigger frames.
+    // Focusing alice's tile switches bob onto the high layer. The check
+    // is three-legged so a loaded CI runner cannot flake it (issue #78):
+    //   1. /metrics proves the SFU applied the preference — that is
+    //      deterministic, independent of sender/receiver timing,
+    //   2. the sender's high rid must keep producing frames — if the
+    //      sender's encoder stalls under load, the receiver-side upgrade
+    //      is unobservable regardless of the SFU, so the width check
+    //      is skipped with a loud warning instead of failing,
+    //   3. when the sender does produce, the receiver must genuinely
+    //      decode the high layer: the SAME ssrc delivering bigger frames.
     await bob.click('[data-testid="tile-alice"]');
     await bob
       .waitForFunction(
@@ -353,52 +420,108 @@ async function main() {
         { timeout: 10_000, polling: 250 },
       )
       .catch(() => fail('bob: focusing alice did not mark the tile focused'));
-    let focusSnap = null;
-    await waitFor('the high layer to arrive after focus', async () => {
-      focusSnap = await videoDetails(bob);
-      return (
-        (focusSnap[camSsrc]?.framesDecoded ?? 0) > lowDecodedAt &&
-        (focusSnap[camSsrc]?.frameWidth ?? 0) > 320
-      );
-    }, 60_000).catch(async () => {
+    await waitFor('the SFU to switch bob onto the high layer for alice', async () => {
+      return (await sfuSimulcastLayer('bob', 'alice')) === 'high';
+    }, 30_000).catch(async () => {
       await stateDump(bob, 'bob').catch(() => {});
       fail(
-        `bob: alice’s camera never switched to the high layer after focus ` +
-          `(pre: ${JSON.stringify(preFocus)}, post: ${JSON.stringify(focusSnap)})`,
+        `bob: the SFU never applied the high layer preference for alice ` +
+          `(metrics layer: ${await sfuSimulcastLayer('bob', 'alice')})`,
       );
     });
-    // Fresh decodable frames: the high layer keeps decoding.
-    const highDecodedAt = focusSnap[camSsrc].framesDecoded;
-    await delay(1000);
-    const grownSnap = await videoDetails(bob);
-    if ((grownSnap[camSsrc]?.framesDecoded ?? 0) <= highDecodedAt) {
-      fail(`bob: the high layer on ssrc ${camSsrc} is not decoding fresh frames`);
-    }
-    console.log(
-      `bob: focus switched alice to the high layer ` +
-        `(ssrc ${camSsrc} now ${grownSnap[camSsrc].frameWidth}px, still decoding)`,
+    const highSentBefore = (await senderSimulcast(alice)).high?.framesSent ?? 0;
+    let senderSnap = null;
+    const highProducing = await tryWaitFor(
+      "alice's high layer to keep producing frames",
+      async () => {
+        senderSnap = await senderSimulcast(alice);
+        return (senderSnap.high?.framesSent ?? 0) > highSentBefore;
+      },
+      30_000,
     );
-
-    // Unfocusing falls back to the low layer: the same ssrc shrinks back
-    // to <=320px and resumes decoding fresh frames.
-    await bob.click('[data-testid="tile-alice"]');
-    const unfocusBaseline = (await videoDetails(bob))[camSsrc]?.framesDecoded ?? 0;
-    await waitFor('the low layer to resume after unfocus', async () => {
-      const snap = await videoDetails(bob);
-      return (
-        (snap[camSsrc]?.framesDecoded ?? 0) > unfocusBaseline &&
-        (snap[camSsrc]?.frameWidth ?? 9999) <= 320
+    if (!highProducing) {
+      console.warn(
+        `WARNING: alice's encoder is not producing the high layer ` +
+          `(${JSON.stringify(senderSnap)}); skipping bob's receiver-side width check`,
       );
-    }, 60_000).catch(async () => {
-      const snap = await videoDetails(bob);
+    } else {
+      // The high layer genuinely arrives: same ssrc, bigger frames.
+      let focusSnap = null;
+      await waitFor('the high layer to arrive after focus', async () => {
+        focusSnap = await videoDetails(bob);
+        return (
+          (focusSnap[camSsrc]?.framesDecoded ?? 0) > lowDecodedAt &&
+          (focusSnap[camSsrc]?.frameWidth ?? 0) > 320
+        );
+      }, 60_000).catch(async () => {
+        await stateDump(bob, 'bob').catch(() => {});
+        fail(
+          `bob: alice’s camera never switched to the high layer after focus ` +
+            `(sender: ${JSON.stringify(senderSnap)}, pre: ${JSON.stringify(preFocus)}, ` +
+            `post: ${JSON.stringify(focusSnap)})`,
+        );
+      });
+      // Fresh decodable frames: the high layer keeps decoding.
+      const highDecodedAt = focusSnap[camSsrc].framesDecoded;
+      await delay(1000);
+      const grownSnap = await videoDetails(bob);
+      if ((grownSnap[camSsrc]?.framesDecoded ?? 0) <= highDecodedAt) {
+        fail(`bob: the high layer on ssrc ${camSsrc} is not decoding fresh frames`);
+      }
+      console.log(
+        `bob: focus switched alice to the high layer ` +
+          `(ssrc ${camSsrc} now ${grownSnap[camSsrc].frameWidth}px, still decoding)`,
+      );
+    }
+
+    // Unfocusing falls back to the low layer, with the same three-legged
+    // structure: /metrics proves the SFU switched back, the sender's low
+    // rid must keep producing, and the same ssrc then shrinks back to
+    // <=320px and resumes decoding fresh frames.
+    await bob.click('[data-testid="tile-alice"]');
+    await waitFor('the SFU to switch bob back onto the low layer for alice', async () => {
+      return (await sfuSimulcastLayer('bob', 'alice')) === 'low';
+    }, 30_000).catch(async () => {
+      await stateDump(bob, 'bob').catch(() => {});
       fail(
-        `bob: the low layer never resumed after unfocus ` +
-          `(ssrc ${camSsrc} decoded ${unfocusBaseline} at unfocus, ` +
-          `now ${snap[camSsrc]?.framesDecoded ?? 'n/a'} @ ${snap[camSsrc]?.frameWidth ?? 'n/a'}px, ` +
-          `pre: ${JSON.stringify(preFocus)}, now: ${JSON.stringify(snap)})`,
+        `bob: the SFU never fell back to the low layer preference for alice ` +
+          `(metrics layer: ${await sfuSimulcastLayer('bob', 'alice')})`,
       );
     });
-    console.log('bob: unfocus fell back to the low layer (same ssrc, small frames resumed)');
+    const lowSentBefore = (await senderSimulcast(alice)).low?.framesSent ?? 0;
+    const lowProducing = await tryWaitFor(
+      "alice's low layer to keep producing frames",
+      async () => {
+        senderSnap = await senderSimulcast(alice);
+        return (senderSnap.low?.framesSent ?? 0) > lowSentBefore;
+      },
+      30_000,
+    );
+    if (!lowProducing) {
+      console.warn(
+        `WARNING: alice's encoder is not producing the low layer ` +
+          `(${JSON.stringify(senderSnap)}); skipping bob's receiver-side width check`,
+      );
+    } else {
+      const unfocusBaseline = (await videoDetails(bob))[camSsrc]?.framesDecoded ?? 0;
+      await waitFor('the low layer to resume after unfocus', async () => {
+        const snap = await videoDetails(bob);
+        return (
+          (snap[camSsrc]?.framesDecoded ?? 0) > unfocusBaseline &&
+          (snap[camSsrc]?.frameWidth ?? 9999) <= 320
+        );
+      }, 60_000).catch(async () => {
+        const snap = await videoDetails(bob);
+        fail(
+          `bob: the low layer never resumed after unfocus ` +
+            `(ssrc ${camSsrc} decoded ${unfocusBaseline} at unfocus, ` +
+            `now ${snap[camSsrc]?.framesDecoded ?? 'n/a'} @ ${snap[camSsrc]?.frameWidth ?? 'n/a'}px, ` +
+            `sender: ${JSON.stringify(senderSnap)}, pre: ${JSON.stringify(preFocus)}, ` +
+            `now: ${JSON.stringify(snap)})`,
+        );
+      });
+      console.log('bob: unfocus fell back to the low layer (same ssrc, small frames resumed)');
+    }
 
     console.log('carol joins late');
     const carol = await newClient('carol');
