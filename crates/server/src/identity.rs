@@ -27,6 +27,43 @@ pub struct Organizer {
     pub email: String,
 }
 
+/// Coarse, sanitized OIDC failure classes (issue #88): the only thing
+/// about an OIDC failure a client ever learns. The precise cause is
+/// logged server-side and never crosses the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OidcErrorClass {
+    /// The issuer is unreachable or describes a different issuer than
+    /// configured — the deployment's OIDC setup is wrong: bad issuer
+    /// URL, discovery or JWKS unreachable, issuer mismatch, or ID
+    /// tokens the provider app signs in a shape we cannot honor
+    /// (HMAC instead of RS256, or encrypted JWE).
+    Misconfigured,
+    /// The authorization-code exchange or the ID token's verification
+    /// failed: the IdP rejected the code, or the token's signature,
+    /// issuer, nonce, or email claim did not check out.
+    TokenInvalid,
+    /// The login state is unknown, already used, or expired.
+    StateExpired,
+}
+
+impl OidcErrorClass {
+    /// The wire string for the class. Additive to the existing error
+    /// bodies; clients that do not know it ignore it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Misconfigured => "oidc_misconfigured",
+            Self::TokenInvalid => "oidc_token_invalid",
+            Self::StateExpired => "oidc_state_expired",
+        }
+    }
+}
+
+impl std::fmt::Display for OidcErrorClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Identity flow failures.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
@@ -38,8 +75,24 @@ pub enum IdentityError {
     Storage(#[from] sqlx::Error),
     #[error("corrupt identity data: {0}")]
     Corrupt(String),
-    #[error("identity provider unreachable or misbehaving: {0}")]
-    Provider(String),
+    /// An OIDC flow failure (issue #88): the coarse `class` is safe to
+    /// surface to the client; the precise `detail` is for the server
+    /// log only and must never reach the wire.
+    #[error("OIDC failure ({class}): {detail}")]
+    Oidc {
+        class: OidcErrorClass,
+        detail: String,
+    },
+}
+
+impl IdentityError {
+    /// An OIDC failure with its sanitized coarse class (issue #88).
+    fn oidc(class: OidcErrorClass, detail: impl Into<String>) -> Self {
+        Self::Oidc {
+            class,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// How organizers prove who they are (ADR 003). Guests never touch this.
@@ -343,20 +396,33 @@ impl OidcIdentityProvider {
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .map_err(|e| IdentityError::Provider(format!("fetching discovery document: {e}")))?
+            .map_err(|e| {
+                IdentityError::oidc(
+                    OidcErrorClass::Misconfigured,
+                    format!("fetching discovery document: {e}"),
+                )
+            })?
             .json()
             .await
-            .map_err(|e| IdentityError::Provider(format!("parsing discovery document: {e}")))?;
+            .map_err(|e| {
+                IdentityError::oidc(
+                    OidcErrorClass::Misconfigured,
+                    format!("parsing discovery document: {e}"),
+                )
+            })?;
 
         // Mix-up defense: the document must describe the issuer we were
         // configured with, or we may be talking to someone else's IdP.
         if let Some(advertised) = &doc.issuer
             && advertised.trim_end_matches('/') != self.issuer_url
         {
-            return Err(IdentityError::Provider(format!(
-                "discovery document advertises issuer {advertised}, configured issuer is {}",
-                self.issuer_url
-            )));
+            return Err(IdentityError::oidc(
+                OidcErrorClass::Misconfigured,
+                format!(
+                    "discovery document advertises issuer {advertised}, configured issuer is {}",
+                    self.issuer_url
+                ),
+            ));
         }
         *self.discovery.write().await = Some(doc.clone());
         Ok(doc)
@@ -377,7 +443,9 @@ impl OidcIdentityProvider {
                 .bind(hash_token(state.trim()))
                 .fetch_optional(&self.pool)
                 .await?
-                .ok_or(IdentityError::InvalidToken)?;
+                .ok_or_else(|| {
+                    IdentityError::oidc(OidcErrorClass::StateExpired, "unknown login state")
+                })?;
         let verifier: String = row
             .try_get("verifier")
             .map_err(|e| IdentityError::Corrupt(e.to_string()))?;
@@ -390,14 +458,20 @@ impl OidcIdentityProvider {
         let expires_at = from_text(&expires_at, "expires_at")
             .map_err(|e| IdentityError::Corrupt(e.to_string()))?;
         if expires_at <= now {
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::StateExpired,
+                "the login state has expired",
+            ));
         }
         let claimed = sqlx::query("UPDATE oidc_states SET used = 1 WHERE hash = ?1 AND used = 0")
             .bind(hash_token(state.trim()))
             .execute(&self.pool)
             .await?;
         if claimed.rows_affected() != 1 {
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::StateExpired,
+                "the login state was already used",
+            ));
         }
 
         let discovery = self.discovery().await?;
@@ -415,19 +489,37 @@ impl OidcIdentityProvider {
             .form(&form)
             .send()
             .await
-            .map_err(|e| IdentityError::Provider(format!("reaching token endpoint: {e}")))?;
+            .map_err(|e| {
+                IdentityError::oidc(
+                    OidcErrorClass::Misconfigured,
+                    format!("reaching token endpoint: {e}"),
+                )
+            })?;
         if !token_response.status().is_success() {
             // The IdP examined our request and said no: bad or used code.
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::TokenInvalid,
+                format!(
+                    "the IdP rejected the code exchange (HTTP {})",
+                    token_response.status().as_u16()
+                ),
+            ));
         }
-        let token_body: serde_json::Value = token_response
-            .json()
-            .await
-            .map_err(|e| IdentityError::Provider(format!("parsing token response: {e}")))?;
+        let token_body: serde_json::Value = token_response.json().await.map_err(|e| {
+            IdentityError::oidc(
+                OidcErrorClass::Misconfigured,
+                format!("parsing token response: {e}"),
+            )
+        })?;
         let id_token = token_body
             .get("id_token")
             .and_then(|v| v.as_str())
-            .ok_or(IdentityError::InvalidToken)?
+            .ok_or_else(|| {
+                IdentityError::oidc(
+                    OidcErrorClass::TokenInvalid,
+                    "the token response carried no id_token",
+                )
+            })?
             .to_owned();
 
         let claims = self
@@ -437,17 +529,26 @@ impl OidcIdentityProvider {
         // The nonce ties this ID token to the authorization request we
         // minted; a token from any other flow must not authenticate.
         if claims.nonce.as_deref() != Some(nonce.as_str()) {
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::TokenInvalid,
+                "the ID token's nonce does not match this login",
+            ));
         }
         // Strict by design: huddle has no other way to prove address
         // ownership, so the IdP must have.
         if claims.email_verified != Some(true) {
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::TokenInvalid,
+                "the ID token's email is not verified by the IdP",
+            ));
         }
 
         let email = claims.email.trim();
         if !valid_email(email) {
-            return Err(IdentityError::InvalidToken);
+            return Err(IdentityError::oidc(
+                OidcErrorClass::TokenInvalid,
+                "the ID token's email claim is not a valid address",
+            ));
         }
         let id = ensure_organizer(&self.pool, email, now).await?;
         Ok(Organizer {
@@ -463,28 +564,60 @@ impl OidcIdentityProvider {
         jwks_uri: &str,
         id_token: &str,
     ) -> Result<IdTokenClaims, IdentityError> {
+        // Reject token shapes we cannot honor up front, with a message
+        // naming the mismatch (issue #88) instead of the misleading
+        // InvalidSignature the JWT library would report: an HMAC ID
+        // token means the provider app is signing with the shared
+        // client secret instead of its private key, and a JWE is
+        // encrypted — there is no signature to verify at all.
+        let header = unverified_id_token_header(id_token)?;
+        if let Some(alg) = header.get("alg").and_then(|a| a.as_str())
+            && alg.starts_with("HS")
+        {
+            return Err(IdentityError::oidc(
+                OidcErrorClass::Misconfigured,
+                format!(
+                    "ID tokens must be signed with RS256 via the provider's JWKS; \
+                     {alg} is not supported"
+                ),
+            ));
+        }
+        if header.get("enc").is_some() {
+            return Err(IdentityError::oidc(
+                OidcErrorClass::Misconfigured,
+                "the ID token is an encrypted JWE; encrypted ID tokens are not \
+                 supported — a JWE has no signature to verify",
+            ));
+        }
+
         let jwks: serde_json::Value = self
             .http
             .get(jwks_uri)
             .send()
             .await
             .and_then(|r| r.error_for_status())
-            .map_err(|e| IdentityError::Provider(format!("fetching JWKS: {e}")))?
+            .map_err(|e| {
+                IdentityError::oidc(OidcErrorClass::Misconfigured, format!("fetching JWKS: {e}"))
+            })?
             .json()
             .await
-            .map_err(|e| IdentityError::Provider(format!("parsing JWKS: {e}")))?;
+            .map_err(|e| {
+                IdentityError::oidc(OidcErrorClass::Misconfigured, format!("parsing JWKS: {e}"))
+            })?;
 
-        let keys = jwks
-            .get("keys")
-            .and_then(|k| k.as_array())
-            .ok_or_else(|| IdentityError::Provider("JWKS has no keys array".into()))?;
+        let keys = jwks.get("keys").and_then(|k| k.as_array()).ok_or_else(|| {
+            IdentityError::oidc(OidcErrorClass::Misconfigured, "JWKS has no keys array")
+        })?;
 
         // Asymmetric algorithms only, and per key type: jsonwebtoken
         // requires every allowed algorithm to belong to the presented
         // key's family. Octet keys are skipped outright — accepting an
         // HMAC key here would let the IdP's public key double as an
         // HMAC secret (the classic algorithm-confusion attack).
-        let mut last_err = IdentityError::InvalidToken;
+        let mut last_err = IdentityError::oidc(
+            OidcErrorClass::TokenInvalid,
+            "the provider's JWKS carries no usable asymmetric key",
+        );
         for key in keys {
             let Ok(jwk) = serde_json::from_value::<jsonwebtoken::jwk::Jwk>(key.clone()) else {
                 continue;
@@ -525,18 +658,47 @@ impl OidcIdentityProvider {
                     // `https://tenant/` as `iss` even when configured —
                     // and discovered — without the slash).
                     if token.claims.iss.trim_end_matches('/') != self.issuer_url {
-                        return Err(IdentityError::Provider(format!(
-                            "ID token issuer {} does not match {}",
-                            token.claims.iss, self.issuer_url
-                        )));
+                        return Err(IdentityError::oidc(
+                            OidcErrorClass::Misconfigured,
+                            format!(
+                                "ID token issuer {} does not match {}",
+                                token.claims.iss, self.issuer_url
+                            ),
+                        ));
                     }
                     return Ok(token.claims);
                 }
-                Err(e) => last_err = IdentityError::Provider(format!("ID token rejected: {e}")),
+                Err(e) => {
+                    last_err = IdentityError::oidc(
+                        OidcErrorClass::TokenInvalid,
+                        format!("ID token rejected: {e}"),
+                    )
+                }
             }
         }
         Err(last_err)
     }
+}
+
+/// The ID token's header, decoded without any verification. Read only
+/// to reject token shapes up front (issue #88); nothing in it is
+/// trusted.
+fn unverified_id_token_header(id_token: &str) -> Result<serde_json::Value, IdentityError> {
+    let segment = id_token.split('.').next().unwrap_or_default();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|e| {
+            IdentityError::oidc(
+                OidcErrorClass::TokenInvalid,
+                format!("the ID token's header is not valid base64url: {e}"),
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|e| {
+        IdentityError::oidc(
+            OidcErrorClass::TokenInvalid,
+            format!("parsing the ID token's header: {e}"),
+        )
+    })
 }
 
 impl IdentityProvider for OidcIdentityProvider {
@@ -573,6 +735,16 @@ impl Identity {
     /// True when SSO is configured and magic links are replaced.
     pub fn is_oidc(&self) -> bool {
         matches!(self, Identity::Oidc(_))
+    }
+
+    /// The configured OIDC issuer URL, when SSO is configured — the
+    /// deployer-facing status probe (issue #88) shows it. Never a
+    /// secret.
+    pub fn oidc_issuer(&self) -> Option<&str> {
+        match self {
+            Identity::MagicLinks(_) => None,
+            Identity::Oidc(p) => Some(&p.issuer_url),
+        }
     }
 }
 
@@ -879,7 +1051,10 @@ mod tests {
         // Single-use: replaying the state must fail even with a fresh code.
         assert!(matches!(
             provider.verify("another-code", Some(&state), now).await,
-            Err(IdentityError::InvalidToken)
+            Err(IdentityError::Oidc {
+                class: OidcErrorClass::StateExpired,
+                ..
+            })
         ));
     }
 
@@ -893,7 +1068,10 @@ mod tests {
         let later = now + time::Duration::minutes(2);
         assert!(matches!(
             provider.verify("code", Some(&state), later).await,
-            Err(IdentityError::InvalidToken)
+            Err(IdentityError::Oidc {
+                class: OidcErrorClass::StateExpired,
+                ..
+            })
         ));
     }
 
@@ -903,12 +1081,16 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         // The IdP minted a token for someone else's authorization
-        // request: the nonce must not match ours.
+        // request: the nonce must not match ours, and the failure must
+        // carry the coarse token-invalid class (issue #88).
         let (_url, state) = provider.begin_login(now).await.unwrap();
         idp.set_nonce("not-our-nonce");
         assert!(matches!(
             provider.verify("code", Some(&state), now).await,
-            Err(IdentityError::InvalidToken)
+            Err(IdentityError::Oidc {
+                class: OidcErrorClass::TokenInvalid,
+                ..
+            })
         ));
 
         // And a callback without the state binding cannot even claim a row.
@@ -937,13 +1119,69 @@ mod tests {
     #[tokio::test]
     async fn oidc_issuer_mismatch_is_rejected() {
         // The discovery document must describe the issuer we were
-        // configured with, or we may be talking to someone else's IdP.
+        // configured with, or we may be talking to someone else's IdP —
+        // and the failure class must say "misconfigured" (issue #88).
         let (provider, idp, _pool, _config) = oidc_provider(time::Duration::minutes(15)).await;
         idp.set_issuer("http://127.0.0.1:9/someone-else");
         assert!(matches!(
             provider.begin_login(OffsetDateTime::now_utc()).await,
-            Err(IdentityError::Provider(_))
+            Err(IdentityError::Oidc {
+                class: OidcErrorClass::Misconfigured,
+                ..
+            })
         ));
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_hmac_signed_id_tokens_by_name() {
+        // A provider app configured like Auth0's HS256 default signs
+        // the ID token with the shared client secret. The failure must
+        // name the mismatch (issue #88), not report a misleading
+        // InvalidSignature from the JWT library.
+        let (provider, idp, _pool, _config) = oidc_provider(time::Duration::minutes(15)).await;
+        let now = OffsetDateTime::now_utc();
+        let (url, state) = provider.begin_login(now).await.unwrap();
+        idp.set_nonce(&query_params(&url)["nonce"]);
+        idp.set_signing_alg("HS256");
+
+        let error = provider
+            .verify("some-auth-code", Some(&state), now)
+            .await
+            .unwrap_err();
+        let IdentityError::Oidc {
+            class: OidcErrorClass::Misconfigured,
+            detail,
+        } = &error
+        else {
+            panic!("wrong error: {error:?}");
+        };
+        assert!(detail.contains("HS256"), "detail: {detail}");
+        assert!(detail.contains("RS256"), "detail: {detail}");
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_encrypted_id_tokens() {
+        // A JWE has no signature to verify; it is rejected up front with
+        // a message saying so (issue #88).
+        let (provider, idp, _pool, _config) = oidc_provider(time::Duration::minutes(15)).await;
+        let now = OffsetDateTime::now_utc();
+        let (url, state) = provider.begin_login(now).await.unwrap();
+        idp.set_nonce(&query_params(&url)["nonce"]);
+        idp.set_signing_alg("JWE");
+
+        let error = provider
+            .verify("some-auth-code", Some(&state), now)
+            .await
+            .unwrap_err();
+        let IdentityError::Oidc {
+            class: OidcErrorClass::Misconfigured,
+            detail,
+        } = &error
+        else {
+            panic!("wrong error: {error:?}");
+        };
+        assert!(detail.contains("JWE"), "detail: {detail}");
+        assert!(detail.contains("signature"), "detail: {detail}");
     }
 
     #[tokio::test]
