@@ -126,6 +126,7 @@ impl Room {
                 rtt_ms: l.rtt_ms,
                 ingress_loss_fraction: l.ingress_loss_fraction,
                 egress_loss_fraction: l.egress_loss_fraction,
+                layer_preferences: p.layer_preferences(),
             }
         })
     }

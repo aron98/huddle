@@ -26,6 +26,8 @@ pub use room::{Room, SfuOutput};
 /// Alias for the participant identity used across signaling and the SFU.
 pub use huddle_protocol::ParticipantId as PeerId;
 
+use huddle_protocol::VideoLayer;
+
 /// Per-peer counters and link stats, exposed for tests and `/metrics`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PeerStats {
@@ -57,4 +59,9 @@ pub struct PeerStats {
     pub ingress_loss_fraction: Option<f32>,
     /// Packet loss on the wire toward this peer (fraction 0.0–1.0).
     pub egress_loss_fraction: Option<f32>,
+    /// The simulcast layer this peer currently receives from each
+    /// other participant's camera: `(origin, layer)`, one entry per
+    /// origin. Exposed via `/metrics` so a layer switch is provable
+    /// without depending on sender or receiver timing.
+    pub layer_preferences: Vec<(PeerId, VideoLayer)>,
 }

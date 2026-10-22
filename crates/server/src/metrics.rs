@@ -8,6 +8,8 @@
 
 use std::fmt::Write as _;
 
+use huddle_protocol::VideoLayer;
+
 use crate::engine::{PeerReport, StatsReport};
 
 /// Content type of the Prometheus text exposition format (version 0.0.4).
@@ -112,6 +114,31 @@ pub fn render(report: &StatsReport) -> String {
         |p| p.bytes_tx,
     );
 
+    header(
+        &mut out,
+        "huddle_peer_simulcast_layer",
+        "gauge",
+        "Simulcast layer this peer currently receives from the origin's camera (0 = low, 1 = high).",
+    );
+    for room in &report.rooms {
+        for peer in &room.peers {
+            for sub in &peer.simulcast_layers {
+                let layer = match sub.layer {
+                    VideoLayer::High => 1,
+                    VideoLayer::Low => 0,
+                };
+                let _ = writeln!(
+                    out,
+                    "huddle_peer_simulcast_layer{{room=\"{}\",peer=\"{}\",id=\"{}\",origin=\"{}\"}} {layer}",
+                    escape(&room.code),
+                    escape(&peer.name),
+                    peer.id,
+                    escape(&sub.origin)
+                );
+            }
+        }
+    }
+
     out
 }
 
@@ -198,7 +225,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::engine::{PeerReport, RoomReport};
+    use crate::engine::{PeerReport, RoomReport, SimulcastLayer};
     use uuid::Uuid;
 
     fn sample_report(rtt_ms: Option<u64>, loss: Option<f32>) -> StatsReport {
@@ -218,6 +245,10 @@ mod tests {
                     rtt_ms,
                     ingress_loss_fraction: loss,
                     egress_loss_fraction: loss,
+                    simulcast_layers: vec![SimulcastLayer {
+                        origin: "bob".into(),
+                        layer: VideoLayer::Low,
+                    }],
                 }],
             }],
         }
@@ -251,6 +282,25 @@ mod tests {
         assert!(!out.contains("huddle_peer_ingress_loss_fraction{"));
         // Header still declares the family; samples appear once measured.
         assert!(out.contains("# TYPE huddle_peer_rtt_ms gauge\n"));
+    }
+
+    #[test]
+    fn renders_simulcast_layer_preferences() {
+        let out = render(&sample_report(None, None));
+        assert!(out.contains("# TYPE huddle_peer_simulcast_layer gauge\n"));
+        assert!(out.contains(
+            "huddle_peer_simulcast_layer{room=\"ABCD-EFGH-JKLM\",peer=\"alice\",id=\"00000000-0000-0000-0000-000000000000\",origin=\"bob\"} 0\n"
+        ));
+
+        // The high layer renders as 1, and a peer with no camera
+        // subscriptions emits no samples at all (headers only).
+        let mut report = sample_report(None, None);
+        report.rooms[0].peers[0].simulcast_layers[0].layer = VideoLayer::High;
+        let out = render(&report);
+        assert!(out.contains("origin=\"bob\"} 1\n"));
+        report.rooms[0].peers[0].simulcast_layers.clear();
+        let out = render(&report);
+        assert!(!out.contains("huddle_peer_simulcast_layer{"));
     }
 
     #[test]

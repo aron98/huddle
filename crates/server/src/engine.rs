@@ -74,6 +74,21 @@ pub struct PeerReport {
     pub rtt_ms: Option<u64>,
     pub ingress_loss_fraction: Option<f32>,
     pub egress_loss_fraction: Option<f32>,
+    /// Which simulcast layer this peer currently receives from each
+    /// other participant's camera. Rendered as
+    /// `huddle_peer_simulcast_layer` so layer switches are provable from
+    /// `/metrics` alone, without sender or receiver timing (issue #78).
+    pub simulcast_layers: Vec<SimulcastLayer>,
+}
+
+/// One camera subscription of a [`PeerReport`]: whose camera the peer
+/// receives, and at which simulcast layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimulcastLayer {
+    /// The origin's display name, resolved from the roster when the
+    /// snapshot was taken.
+    pub origin: String,
+    pub layer: VideoLayer,
 }
 
 /// Everything an async session can ask the engine to do. Sessions are the
@@ -599,6 +614,18 @@ impl Engine {
                 .values()
                 .map(|p| {
                     let s = inst.room.peer_stats(p.id).unwrap_or_default();
+                    // Resolve origins to roster names; a departed origin
+                    // (subscription winding down) has no sample to show.
+                    let simulcast_layers = s
+                        .layer_preferences
+                        .iter()
+                        .filter_map(|(origin, layer)| {
+                            Some(SimulcastLayer {
+                                origin: inst.participants.get(origin)?.name.clone(),
+                                layer: *layer,
+                            })
+                        })
+                        .collect();
                     PeerReport {
                         id: p.id,
                         name: p.name.clone(),
@@ -612,6 +639,7 @@ impl Engine {
                         rtt_ms: s.rtt_ms,
                         ingress_loss_fraction: s.ingress_loss_fraction,
                         egress_loss_fraction: s.egress_loss_fraction,
+                        simulcast_layers,
                     }
                 })
                 .collect();
