@@ -180,7 +180,18 @@ fn Login() -> impl IntoView {
                      (Running without SMTP? The link is printed in the server log.)"
                         .to_owned(),
                 )),
-                Ok((_, text)) => status.set(Some(format!("Could not send the link: {text}"))),
+                Ok((_, text)) => {
+                    // An OIDC-configured server refuses magic links with a
+                    // 409 carrying the SSO entry point — follow it instead
+                    // of showing the raw refusal body (issue #89).
+                    if let Some(login) = api::oidc_login_redirect(&text)
+                        && let Some(window) = web_sys::window()
+                    {
+                        let _ = window.location().assign(&login);
+                        return;
+                    }
+                    status.set(Some(format!("Could not send the link: {text}")));
+                }
                 Err(e) => status.set(Some(format!("Could not send the link: {e}"))),
             }
         });
