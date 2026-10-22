@@ -826,6 +826,12 @@ button:disabled {
   outline-offset: -3px;
 }
 
+/* A shared screen must show all of itself: letterbox instead of the
+   crop camera tiles use, with the recessed well tone for the bars. */
+.tile.screen video {
+  object-fit: contain;
+}
+
 /* The focused camera tile takes more room and wears the amber ring so
    the selection (and the high simulcast layer it triggers) is visible. */
 .tile.focused {

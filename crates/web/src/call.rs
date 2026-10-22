@@ -1103,8 +1103,18 @@ fn VideoTile(
     Effect::new(move |_| {
         if let Some(video) = video_ref.get() {
             video.set_muted(muted);
-            video.set_src_object(Some(&stream));
-            crate::play_silently(&video);
+            // Speaker flips re-invoke this component with the same JS
+            // MediaStream, and re-assigning srcObject — even with the
+            // same object — resets the media clock, blanking live tiles
+            // for a moment (worst on the big screen tile). Attach only
+            // when the element is not already showing this stream.
+            let attached = video
+                .src_object()
+                .is_some_and(|current| js_sys::Object::is(current.as_ref(), stream.as_ref()));
+            if !attached {
+                video.set_src_object(Some(&stream));
+                crate::play_silently(&video);
+            }
         }
     });
     let mut class = match (speaking, screen) {
@@ -1477,9 +1487,17 @@ fn CallView(
                                     && media::tracks_of(&s.1)
                                         .iter()
                                         .any(|t| t.kind() == "audio");
+                                // Refcount bump, NOT `MediaStream::clone`:
+                                // that snapshots the track set into a new
+                                // JS object on every re-render (speaker
+                                // flips included), which the attach effect
+                                // would treat as a new source and reset
+                                // the video element for.
+                                let js: &wasm_bindgen::JsValue = s.1.as_ref();
+                                let stream = MediaStream::from(js.clone());
                                 view! {
                                     <VideoTile
-                                        stream=s.1.clone()
+                                        stream=stream
                                         label=label
                                         muted=false
                                         testid=testid
