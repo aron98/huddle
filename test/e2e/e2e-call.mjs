@@ -622,6 +622,18 @@ async function main() {
       });
     await waitTile(bob, '[data-testid="tile-alice-screen"]', 'bob');
     await waitTile(carol, '[data-testid="tile-alice-screen"]', 'carol');
+    // The shared screen letterboxes (shows all content) while camera
+    // tiles keep their crop (#84).
+    const bobFits = await bob.evaluate(() => ({
+      screen: getComputedStyle(document.querySelector('[data-testid="tile-alice-screen"] video'))
+        .objectFit,
+      camera: getComputedStyle(document.querySelector('[data-testid="tile-alice"] video'))
+        .objectFit,
+    }));
+    if (bobFits.screen !== 'contain' || bobFits.camera !== 'cover') {
+      fail(`tile object-fit wrong (screen ${bobFits.screen}, camera ${bobFits.camera})`);
+    }
+    console.log('shared screen letterboxes; camera tiles still crop');
     await bob.waitForFunction(
       () => document.querySelector('[data-testid="roster-alice"]')?.textContent.includes('sharing'),
       { timeout: 30_000, polling: 250 },
