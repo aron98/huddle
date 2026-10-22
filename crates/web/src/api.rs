@@ -85,3 +85,42 @@ pub fn rfc3339_to_local(value: &str) -> String {
     .and_then(|formatted| formatted.as_string())
     .unwrap_or_else(|| value.to_owned())
 }
+
+/// Extracts the single-sign-on entry point from a magic-link refusal
+/// body, when the server is configured for OIDC sign-in (issue #89).
+///
+/// The server answers `POST /api/auth/request-link` with HTTP 409 and
+/// `{"login":"/api/auth/oidc/login","status":"oidc_configured"}` when
+/// SSO replaces magic links; the login page follows `login` instead of
+/// surfacing the raw refusal body to the user.
+pub fn oidc_login_redirect(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    if value.get("status").and_then(|status| status.as_str()) == Some("oidc_configured") {
+        value
+            .get("login")
+            .and_then(|login| login.as_str())
+            .map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oidc_login_redirect;
+
+    #[test]
+    fn oidc_configured_refusal_yields_the_sso_entry_point() {
+        let body = r#"{"login":"/api/auth/oidc/login","status":"oidc_configured"}"#;
+        assert_eq!(
+            oidc_login_redirect(body),
+            Some("/api/auth/oidc/login".to_owned())
+        );
+    }
+
+    #[test]
+    fn other_refusal_bodies_yield_none() {
+        assert_eq!(oidc_login_redirect(r#"{"code":"rate_limited"}"#), None);
+        assert_eq!(oidc_login_redirect("not json"), None);
+    }
+}
