@@ -389,6 +389,65 @@ impl PeerConnection for FakePeerConnection {
 }
 
 // ---------------------------------------------------------------------------
+// Login sign-in method probe (issue #99)
+// ---------------------------------------------------------------------------
+
+/// Serve `GET /api/auth/oidc/status` the way the real server does, in
+/// one of the two deployment modes: `oidc` mirrors an SSO-configured
+/// instance (status plus the public issuer — the client secret never
+/// crosses the wire), otherwise the plain magic-link answer. Returns
+/// the bound address and the shutdown sender.
+async fn start_probe_server(oidc: bool) -> (SocketAddr, oneshot::Sender<()>) {
+    let app = Router::new().route(
+        "/api/auth/oidc/status",
+        get(move || async move {
+            let body = if oidc {
+                r#"{"status":"oidc_configured","issuer":"https://idp.example.com"}"#
+            } else {
+                r#"{"status":"oidc_not_configured"}"#
+            };
+            ([("content-type", "application/json")], body)
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, shutdown_tx)
+}
+
+/// One raw `GET` over a real socket — the login page's probe as a
+/// wire-level round trip. Returns the status code and the body, no
+/// HTTP client crate needed.
+async fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: huddle.test\r\nConnection: close\r\n\r\n");
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    socket.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("HTTP status line");
+    let body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -690,4 +749,32 @@ async fn e2ee_keying_round_trips_and_epochs_track() {
         matches!(&buffered[..], [ServerMessage::E2eeKeying { payload, .. }] if payload == "second"),
         "the driver buffers keying for the e2ee module: {buffered:?}"
     );
+}
+
+// --- login sign-in method probe (issue #99) ------------------------------
+
+#[tokio::test]
+async fn login_page_probes_the_sign_in_method_before_any_form_submission() {
+    use huddle_web::auth_mode;
+
+    // An SSO-configured server: the probe answer hands the login page
+    // the SSO entry, and the browser is sent straight to the IdP — no
+    // magic-link form is typed into and refused first (issue #99).
+    let (addr, shutdown) = start_probe_server(true).await;
+    let (status, body) = http_get(addr, "/api/auth/oidc/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        auth_mode::sso_entry_from_probe(status, &body),
+        Some("/api/auth/oidc/login")
+    );
+    shutdown.send(()).unwrap();
+
+    // A magic-link server: the probe answer keeps the login form
+    // completely unchanged — the mode nobody configured an IdP for
+    // must not behave any differently.
+    let (addr, shutdown) = start_probe_server(false).await;
+    let (status, body) = http_get(addr, "/api/auth/oidc/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(auth_mode::sso_entry_from_probe(status, &body), None);
+    shutdown.send(()).unwrap();
 }
