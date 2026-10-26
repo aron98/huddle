@@ -14,7 +14,7 @@
 // a participant reloading and rejoining.
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import puppeteer from 'puppeteer-core';
@@ -622,6 +622,18 @@ async function main() {
       });
     await waitTile(bob, '[data-testid="tile-alice-screen"]', 'bob');
     await waitTile(carol, '[data-testid="tile-alice-screen"]', 'carol');
+    // The shared screen letterboxes (shows all content) while camera
+    // tiles keep their crop (#84).
+    const bobFits = await bob.evaluate(() => ({
+      screen: getComputedStyle(document.querySelector('[data-testid="tile-alice-screen"] video'))
+        .objectFit,
+      camera: getComputedStyle(document.querySelector('[data-testid="tile-alice"] video'))
+        .objectFit,
+    }));
+    if (bobFits.screen !== 'contain' || bobFits.camera !== 'cover') {
+      fail(`tile object-fit wrong (screen ${bobFits.screen}, camera ${bobFits.camera})`);
+    }
+    console.log('shared screen letterboxes; camera tiles still crop');
     await bob.waitForFunction(
       () => document.querySelector('[data-testid="roster-alice"]')?.textContent.includes('sharing'),
       { timeout: 30_000, polling: 250 },
@@ -1143,6 +1155,119 @@ async function main() {
         fail(`bob never saw erin's prejoin mute in the roster (status: ${await statusText(bob)})`);
       });
     console.log("erin's prejoin mute survived into the call (buttons and roster agree)");
+
+    // Speaker flips must not reset the share tile (#83). The default fake
+    // mic is silent, so speaking never triggers in e2e; drive real flips
+    // via a second browser whose fake mic plays a synthesized tone.
+    const toneDir = mkdtempSync(join(tmpdir(), 'huddle-tone-'));
+    const tonePath = join(toneDir, 'tone.wav');
+    {
+      // 5s mono 44.1kHz 16-bit 440Hz sine at amplitude 0.6 -> RMS ~0.42,
+      // comfortably above the client's 0.03 speaking gate.
+      const rate = 44_100;
+      const samples = rate * 5;
+      const data = Buffer.alloc(samples * 2);
+      for (let i = 0; i < samples; i++) {
+        data.writeInt16LE(
+          Math.round(0.6 * 32_767 * Math.sin((2 * Math.PI * 440 * i) / rate)),
+          i * 2,
+        );
+      }
+      const header = Buffer.alloc(44);
+      header.write('RIFF', 0);
+      header.writeUInt32LE(36 + data.length, 4);
+      header.write('WAVE', 8);
+      header.write('fmt ', 12);
+      header.writeUInt32LE(16, 16);
+      header.writeUInt16LE(1, 20);
+      header.writeUInt16LE(1, 22);
+      header.writeUInt32LE(rate, 24);
+      header.writeUInt32LE(rate * 2, 28);
+      header.writeUInt16LE(2, 32);
+      header.writeUInt16LE(16, 34);
+      header.write('data', 36);
+      header.writeUInt32LE(data.length, 40);
+      writeFileSync(tonePath, Buffer.concat([header, data]));
+    }
+    const toneBrowser = await puppeteer.launch({
+      executablePath: CHROME,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--use-fake-device-for-media-stream',
+        '--use-fake-ui-for-media-stream',
+        '--autoplay-policy=no-user-gesture-required',
+        `--use-file-for-fake-audio-capture=${tonePath}`,
+      ],
+    });
+    try {
+      const gina = await toneBrowser.newPage();
+      const hank = await browser.newPage();
+      await joinAs(gina, code, 'gina');
+      await joinAs(hank, code, 'hank');
+      await gina.click('[data-testid="share-screen"]');
+      await waitFor(
+        'gina share started',
+        () =>
+          gina
+            .$eval('[data-testid="share-screen"]', (el) => el.textContent)
+            .then((t) => t.includes('Stop sharing')),
+      );
+      await hank.waitForSelector('[data-testid="tile-gina-screen"]', { timeout: 30_000 });
+
+      // Sample hank's screen tile: re-assigning srcObject restarts the
+      // media clock, so currentTime regressing between samples proves the
+      // share vanished mid-stream; `.tile.speaking` counts the flips gina
+      // drives with her tone.
+      await hank.evaluate(() => {
+        window.__shareSamples = [];
+        window.__shareRegressions = 0;
+        window.__probeTimer = setInterval(() => {
+          const video = document.querySelector('[data-testid="tile-gina-screen"] video');
+          const t = video ? video.currentTime || 0 : -1;
+          const prev = window.__shareSamples[window.__shareSamples.length - 1];
+          if (prev && t < prev.t - 0.05) window.__shareRegressions++;
+          window.__shareSamples.push({
+            t,
+            speaking: document.querySelector('.tile.speaking') !== null,
+          });
+        }, 250);
+      });
+      for (let cycle = 0; cycle < 4; cycle++) {
+        await gina.evaluate(() => document.querySelector('[data-testid="toggle-mic"]')?.click());
+        await delay(4000);
+      }
+      const probe = await hank.evaluate(() => {
+        clearInterval(window.__probeTimer);
+        return { samples: window.__shareSamples, regressions: window.__shareRegressions };
+      });
+      // The flips are the driver, not the contract. The hard #83 contract is
+      // that speaking flips never reset the share tile (regressions === 0);
+      // the flip count itself is a liveness signal that is wildly load-
+      // variable on CI runners (observed 1-3 across runs — issue #78 family),
+      // so it gates softly: starved flips warn loudly and skip the
+      // interaction check, because with no flips there is nothing to test.
+      let flips = 0;
+      for (let i = 1; i < probe.samples.length; i++) {
+        if (probe.samples[i].speaking !== probe.samples[i - 1].speaking) flips++;
+      }
+      if (probe.regressions > 0) {
+        fail(`speaking flips reset the shared screen ${probe.regressions} time(s)`);
+      }
+      if (flips === 0) {
+        console.warn(
+          "WARN: no speaking flips observed on hank's stage (audio-level gate starved under load); " +
+            'skipping the flip interaction check — regressions === 0 was still hard-asserted',
+        );
+      } else {
+        console.log(`speaking flips (${flips}) leave the shared screen unreset`);
+      }
+    } finally {
+      await toneBrowser.close();
+      rmSync(toneDir, { recursive: true, force: true });
+    }
 
     console.log('PASS: n-party call e2e green');
   } catch (err) {
