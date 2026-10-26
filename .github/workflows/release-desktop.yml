@@ -9,6 +9,11 @@
 # installed on the runner and the workflow asserts the ad-hoc signature
 # after bundling. Windows/Linux builds stay unsigned — SmartScreen/
 # Gatekeeper first-launch warnings are disclosed in the release notes.
+#
+# The release also carries electron-updater's metadata (latest.yml /
+# latest-linux.yml + blockmaps) so the packaged desktop app can
+# self-update against GitHub Releases (issue #98; macOS is notify-only,
+# see electron/README.md — Auto-update).
 
 name: release-desktop
 
@@ -76,8 +81,18 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          # latest.yml / latest-linux.yml / *.blockmap feed the desktop
+          # app's electron-updater (issue #98): it reads the yml to find
+          # the current version + artifact URL and uses the blockmap for
+          # differential downloads. Globs that match nothing in a given
+          # matrix job (e.g. latest.yml on the macOS runner) are skipped,
+          # same as the per-OS installer globs below.
           files: |
             electron/dist/huddle-*.exe
+            electron/dist/huddle-*.exe.blockmap
             electron/dist/huddle-*.dmg
             electron/dist/huddle-*.AppImage
+            electron/dist/huddle-*.AppImage.blockmap
             electron/dist/huddle-*.deb
+            electron/dist/latest.yml
+            electron/dist/latest-linux.yml

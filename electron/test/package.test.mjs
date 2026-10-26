@@ -52,3 +52,23 @@ test("macOS builds are ad-hoc signed, not unsigned (issue #86)", () => {
   // "broken and can't be opened" (issue #86). Must stay the string "-".
   assert.match(yml, /identity:\s*"-"(\s|$)/m);
 });
+
+test("release-desktop.yml publishes the electron-updater feed files (issue #98)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github", "workflows", "release-desktop.yml"),
+    "utf8",
+  );
+  // electron-updater reads latest.yml (NSIS) / latest-linux.yml (AppImage)
+  // to discover the current version + artifact URL, and uses the .blockmap
+  // for differential downloads. Without these in the GitHub release the
+  // packaged app's update check silently finds nothing.
+  for (const needed of [
+    "electron/dist/latest.yml",
+    "electron/dist/latest-linux.yml",
+    ".exe.blockmap",
+    ".AppImage.blockmap",
+  ]) {
+    assert.ok(workflow.includes(needed), `release must attach ${needed}`);
+  }
+});
