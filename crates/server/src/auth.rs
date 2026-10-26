@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use huddle_protocol::{ApiError, ErrorCode};
 
-use crate::identity::{Identity, IdentityError, IdentityProvider, Organizer};
+use crate::identity::{Identity, IdentityError, IdentityProvider, OidcErrorClass, Organizer};
 use crate::mailer::{self, MailTransport};
 use crate::state::AppState;
 
@@ -125,6 +125,12 @@ pub struct RequestLinkBody {
 /// server-side. One exception: per-IP rate limiting answers `429` so
 /// the endpoint cannot be used to flood mailboxes (or mine the log).
 ///
+/// The body carries `delivery` — `"logged"` when the dev log transport
+/// is in use, `"emailed"` for a real one — so the login page only ever
+/// points users at the server log when the link really is printed
+/// there (issue #85). It mirrors the configured transport, never the
+/// outcome of this request, which would reveal address validity.
+///
 /// When SSO is configured this endpoint is replaced by OIDC and answers
 /// `409` pointing at the login route — magic links and SSO are two
 /// flavors of one flow, never simultaneous.
@@ -163,6 +169,8 @@ pub async fn request_link(
                 .send(mailer::Email::login_link(&body.email, &link))
                 .await
             {
+                // The error never carries the link — only the log
+                // transport prints it (issue #85).
                 tracing::warn!("magic-link delivery failed: {e}");
             }
         }
@@ -171,7 +179,16 @@ pub async fn request_link(
         }
         Err(e) => tracing::warn!("cannot start login: {e}"),
     }
-    (StatusCode::OK, Json(json!({ "status": "sent" }))).into_response()
+    let delivery = if state.mailer().is_log() {
+        "logged"
+    } else {
+        "emailed"
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "sent", "delivery": delivery })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -266,15 +283,23 @@ pub async fn oidc_login(
             response
         }
         Err(e) => {
+            // The precise cause goes to the log; the client gets the
+            // coarse class and a hint (issue #88).
             tracing::warn!("cannot start OIDC login: {e}");
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(ApiError {
-                    code: ErrorCode::Internal,
-                    message: "the identity provider is unreachable or misconfigured".into(),
-                }),
-            )
-                .into_response()
+            match oidc_class(&e) {
+                Some(class) => oidc_error(StatusCode::BAD_GATEWAY, ErrorCode::Internal, class),
+                // Storage/corrupt failures carry no OIDC class; keep the
+                // generic body — they are a server-side problem, not a
+                // deployer's OIDC setup.
+                None => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        code: ErrorCode::Internal,
+                        message: "the identity provider is unreachable or misconfigured".into(),
+                    }),
+                )
+                    .into_response(),
+            }
         }
     }
 }
@@ -299,9 +324,14 @@ pub async fn oidc_callback(
     }
     // The state must match the one this browser was issued at /login.
     // States are 256-bit random values, so a plain comparison leaks
-    // nothing.
+    // nothing. A mismatch means the login binding has lapsed (or never
+    // existed), which is the coarse class the client learns (issue #88).
     if cookie_value(&headers, OIDC_LOGIN_COOKIE).as_deref() != Some(query.state.as_str()) {
-        return unauthorized("OIDC sign-in failed or has expired");
+        return oidc_error(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            OidcErrorClass::StateExpired,
+        );
     }
     match state
         .identity()
@@ -310,9 +340,77 @@ pub async fn oidc_callback(
     {
         Ok(organizer) => land_with_session(&state, organizer),
         Err(e) => {
+            // Precise cause to the log, coarse class to the client
+            // (issue #88); failures without a class (storage/corrupt)
+            // fall back to the token-invalid shape the old generic
+            // message already implied.
             tracing::warn!("OIDC callback rejected: {e}");
-            unauthorized("OIDC sign-in failed or has expired")
+            let class = oidc_class(&e).unwrap_or(OidcErrorClass::TokenInvalid);
+            oidc_error(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, class)
         }
+    }
+}
+
+/// GET /api/auth/oidc/status — whether SSO is configured and, if so,
+/// the issuer it is configured against (issue #88). Deployers probe
+/// their setup with it; it exposes no secrets and answers `200` both
+/// ways so a probe script needs no status-code branching.
+pub async fn oidc_status(State(state): State<AppState>) -> Response {
+    match state.identity().oidc_issuer() {
+        Some(issuer) => (
+            StatusCode::OK,
+            Json(json!({ "status": "oidc_configured", "issuer": issuer })),
+        ),
+        None => (
+            StatusCode::OK,
+            Json(json!({ "status": "oidc_not_configured" })),
+        ),
+    }
+    .into_response()
+}
+
+/// The sanitized OIDC failure surface (issue #88): a coarse class the
+/// deployer can act on plus a short human hint. Never the inner
+/// detail — that stays in the server log. The wire shape is additive:
+/// the legacy `code`/`message` pair is kept as-is, so existing clients
+/// (the web client's `oidc_login_redirect` among them) see no change.
+fn oidc_error(status: StatusCode, code: ErrorCode, class: OidcErrorClass) -> Response {
+    let (message, hint) = match class {
+        OidcErrorClass::Misconfigured => (
+            "the identity provider is unreachable or misconfigured",
+            "Check the server logs and the OIDC setup guide.",
+        ),
+        OidcErrorClass::TokenInvalid => (
+            "the sign-in token could not be verified",
+            "Start the sign-in again from the login page; if it persists, \
+             check the server logs and the OIDC setup guide.",
+        ),
+        OidcErrorClass::StateExpired => (
+            "the sign-in has expired or was already used",
+            "Start the sign-in again from the login page.",
+        ),
+    };
+    (
+        status,
+        Json(json!({
+            // Same envelope as ApiError; `oidc_error` and `hint` are
+            // additive keys inside it (issue #88).
+            "error": {
+                "code": code,
+                "message": message,
+                "oidc_error": class.as_str(),
+                "hint": hint,
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// The coarse OIDC class carried by an identity failure, if any.
+fn oidc_class(error: &IdentityError) -> Option<OidcErrorClass> {
+    match error {
+        IdentityError::Oidc { class, .. } => Some(*class),
+        _ => None,
     }
 }
 
