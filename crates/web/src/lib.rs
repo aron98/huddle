@@ -175,11 +175,19 @@ fn Login() -> impl IntoView {
         let body = serde_json::json!({ "email": address }).to_string();
         spawn_local(async move {
             match api::fetch_text("POST", "/api/auth/request-link", Some(body)).await {
-                Ok((200, _)) => status.set(Some(
-                    "Check your email — a sign-in link is on its way. \
-                     (Running without SMTP? The link is printed in the server log.)"
-                        .to_owned(),
-                )),
+                Ok((200, text)) => {
+                    // The "link is in the server log" hint only appears
+                    // when the dev log mailer really delivered (issue
+                    // #85); with SMTP/Resend configured the link goes to
+                    // the mailbox and is never printed anywhere.
+                    let message = if api::link_logged_in_server_log(&text) {
+                        "Check your email — a sign-in link is on its way. \
+                         (Running without SMTP? The link is printed in the server log.)"
+                    } else {
+                        "Check your email — a sign-in link is on its way."
+                    };
+                    status.set(Some(message.to_owned()))
+                }
                 Ok((_, text)) => {
                     // An OIDC-configured server refuses magic links with a
                     // 409 carrying the SSO entry point — follow it instead
