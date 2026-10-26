@@ -14,7 +14,7 @@ See [Development](#development) for the dev loop or
 ## Documentation
 
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
-- [Deployment guides](docs/deploy/) — Ubuntu VPS, Docker Compose, Kubernetes, hardening checklist
+- [Deployment guides](docs/deploy/) — Ubuntu VPS, Docker Compose, Kubernetes, OIDC SSO setup, hardening checklist
 - [ADRs](docs/adr/) — the decisions we've made and why
 - [Post-MVP milestone](https://github.com/aron98/huddle/milestone/1) — what's
   next
@@ -113,7 +113,9 @@ auto-detection you do not need to care about this on any platform.
 
 Deployment (Docker, compose, Helm, release tarballs, coturn, firewall
 ports) is covered in [Self-hosting](#self-hosting) below, along with optional
-[Single sign-on (OIDC)](#single-sign-on-oidc) for the login flow.
+[Single sign-on (OIDC)](#single-sign-on-oidc) for the login flow — the
+step-by-step provider setup lives in
+[docs/deploy/oidc.md](docs/deploy/oidc.md).
 
 ## Observability
 
@@ -158,9 +160,10 @@ scrape_configs:
 
 Step-by-step production guides: [Ubuntu VPS](docs/deploy/ubuntu-vps.md) (static
 binary + systemd + coturn), [Docker Compose](docs/deploy/docker-compose.md),
-[Kubernetes](docs/deploy/kubernetes.md), and a cross-platform
-[hardening checklist](docs/deploy/hardening-checklist.md). This section is the
-configuration reference those guides link back to.
+[Kubernetes](docs/deploy/kubernetes.md), a cross-platform
+[hardening checklist](docs/deploy/hardening-checklist.md), and
+[OIDC provider setup for single sign-on](docs/deploy/oidc.md). This section
+is the configuration reference those guides link back to.
 
 ### Ports and firewall
 
@@ -366,6 +369,10 @@ claim with `email_verified: true` (huddle is strict about this, since organizer
 identity is the email), and the provider must support the authorization-code
 flow — huddle always sends a PKCE `S256` challenge and a `nonce`, and only
 accepts asymmetric signature algorithms (RS/ES/PS families) from its JWKS.
+
+A step-by-step provider setup guide — generic IdP checklist plus an Auth0
+walk-through with the pitfalls we hit live and a diagnostics table — lives in
+[docs/deploy/oidc.md](docs/deploy/oidc.md).
 
 ### Agent access (CLI + MCP)
 
