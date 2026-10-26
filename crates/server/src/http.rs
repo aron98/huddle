@@ -125,6 +125,28 @@ pub(crate) async fn test_state() -> AppState {
     AppState::new(config, crate::db::test_pool().await, engine).unwrap()
 }
 
+/// An [`AppState`] whose config selects a real (SMTP) transport, so
+/// tests can assert the no-logging branch of the magic-link flow
+/// (issue #85). The relay points at a closed local port: delivery
+/// fails fast, and no mail ever leaves the machine.
+#[cfg(test)]
+pub(crate) async fn smtp_test_state() -> AppState {
+    let config = Arc::new(crate::config::Config {
+        media_port: 0,
+        public_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+        smtp: Some(crate::config::SmtpConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: None,
+            password: None,
+            from: Some("huddle@example.com".into()),
+        }),
+        ..crate::config::Config::default()
+    });
+    let (engine, _media_addr) = crate::engine::spawn(&config).unwrap();
+    AppState::new(config, crate::db::test_pool().await, engine).unwrap()
+}
+
 /// How many upcoming occurrences a response carries for a series —
 /// enough to render the dashboard's next-occurrence headline and a
 /// per-occurrence cancel button row, without shipping a year of
@@ -1228,6 +1250,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// POST /api/auth/request-link once and hand back the decoded body.
+    async fn request_link(app: Router, addr: SocketAddr) -> String {
+        let response = app
+            .oneshot(
+                Request::post("/api/auth/request-link")
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(addr))
+                    .body(Body::from(r#"{"email":"someone@example.com"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    #[tokio::test]
+    async fn request_link_reports_where_the_link_went() {
+        // Dev default: the log transport is in use, so the login page
+        // may tell the user the link is in the server log.
+        let text = request_link(
+            router(test_state().await),
+            SocketAddr::from(([127, 0, 0, 1], 4801)),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["status"], "sent");
+        assert_eq!(body["delivery"], "logged");
+
+        // A real (SMTP) transport: the response never claims "logged"…
+        let (logs, _guard) = crate::testlog::capture();
+        let text = request_link(
+            router(smtp_test_state().await),
+            SocketAddr::from(([127, 0, 0, 1], 4802)),
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["status"], "sent");
+        assert_eq!(body["delivery"], "emailed");
+        assert!(!text.contains("logged"));
+        // …and the link itself never reaches the log even though this
+        // delivery fails (closed local port): the failure warning
+        // carries the error, never the token (issue #85).
+        assert!(
+            logs.text().contains("magic-link delivery failed"),
+            "expected the delivery failure to be logged; got: {}",
+            logs.text()
+        );
+        assert!(
+            !logs.text().contains("token="),
+            "the magic link leaked into the server log: {}",
+            logs.text()
+        );
     }
 
     #[test]

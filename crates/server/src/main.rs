@@ -19,6 +19,8 @@ mod recording;
 mod recurrence;
 mod session;
 mod state;
+#[cfg(test)]
+mod testlog;
 mod tls;
 mod turn;
 

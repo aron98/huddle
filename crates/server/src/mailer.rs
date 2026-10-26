@@ -14,6 +14,8 @@
 //! callers — the magic-link flow today, meeting invites and reminders
 //! tomorrow — only ever see [`Email`] and never change.
 
+use std::fmt;
+
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Tokio1Executor};
@@ -23,12 +25,25 @@ use crate::config::{Config, MailSelection, ResendConfig, SmtpConfig};
 /// One email to deliver: everything a transport needs and nothing
 /// provider-specific — the trait signature carries the message, not
 /// per-provider knobs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Email {
     /// Envelope recipient.
     pub to: String,
     pub subject: String,
+    /// Body text. For magic links this carries the sign-in URL, so
+    /// [`fmt::Debug`] redacts it (issue #85): a stray `{:?}` in a log
+    /// line must never print the link.
     pub text: String,
+}
+
+impl fmt::Debug for Email {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Email")
+            .field("to", &self.to)
+            .field("subject", &self.subject)
+            .field("text", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Email {
@@ -206,6 +221,15 @@ impl Mailer {
             MailSelection::Resend(resend) => Self::Resend(ResendMailer::new(&resend)?),
         })
     }
+
+    /// True when emails are written to the server log instead of being
+    /// delivered — the dev-only transport, and the only one allowed to
+    /// put a magic link in a log line (issue #85). Callers shape
+    /// user-facing copy from it ("check the server log"), so a real
+    /// transport never implies the link is printed anywhere.
+    pub fn is_log(&self) -> bool {
+        matches!(self, Self::Log(_))
+    }
 }
 
 impl MailTransport for Mailer {
@@ -298,6 +322,113 @@ mod tests {
             Mailer::select(&resend).unwrap(),
             Mailer::Resend(_)
         ));
+    }
+
+    #[test]
+    fn only_the_log_transport_admits_it_logs() {
+        assert!(Mailer::select(&Config::default()).unwrap().is_log());
+
+        let smtp_only = config_with_toml(
+            r#"
+            [smtp]
+            host = "smtp.example.com"
+            "#,
+        );
+        assert!(!Mailer::select(&smtp_only).unwrap().is_log());
+
+        let resend = config_with_toml(
+            r#"
+            [mail.resend]
+            api_key = "re_test_key"
+            from = "huddle@example.com"
+            "#,
+        );
+        assert!(!Mailer::select(&resend).unwrap().is_log());
+    }
+
+    #[test]
+    fn email_debug_redacts_the_body() {
+        let link = "http://localhost:3000/api/auth/verify?token=sekrit";
+        let email = Email::login_link("dev@example.com", link);
+        let rendered = format!("{email:?}");
+        assert!(
+            !rendered.contains(link),
+            "Debug leaked the link: {rendered}"
+        );
+        // The non-secret fields stay readable so Debug is still useful.
+        assert!(rendered.contains("dev@example.com"));
+        assert!(rendered.contains("Your huddle sign-in link"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn log_mailer_writes_the_link_to_the_log() {
+        // The dev transport's whole job: the link is printed, and the
+        // capture below proves the assertion machinery sees it.
+        let link = "http://localhost:3000/api/auth/verify?token=only-in-dev";
+        let (logs, _guard) = crate::testlog::capture();
+        LogMailer
+            .send(Email::login_link("dev@example.com", link))
+            .await
+            .unwrap();
+        assert!(logs.text().contains(link), "log mailer hid the link");
+    }
+
+    #[tokio::test]
+    async fn real_transports_never_write_the_link_to_the_log() {
+        let link = "http://localhost:3000/api/auth/verify?token=never-log-me";
+        let (logs, _guard) = crate::testlog::capture();
+
+        // Resend, succeeding against the in-process mock: the link is
+        // genuinely delivered — the mock saw it — yet never logged.
+        let (mock, endpoint) = start_mock_resend(200, r#"{"id":"email-123"}"#).await;
+        let resend = ResendMailer::at(
+            &ResendConfig {
+                api_key: "re_test_key".into(),
+                from: "huddle@example.com".into(),
+            },
+            &endpoint,
+        )
+        .unwrap();
+        assert_eq!(
+            resend
+                .send(Email::login_link("dev@example.com", link))
+                .await
+                .unwrap(),
+            MailResult::ResendSent
+        );
+        let delivered = {
+            let requests = mock.requests.lock().unwrap();
+            let body = requests.first().unwrap().body.clone();
+            body["text"].as_str().unwrap().contains(link)
+        };
+        assert!(
+            delivered,
+            "the mock must receive the link for this test to mean anything"
+        );
+        assert!(
+            !logs.text().contains(link),
+            "the Resend path logged the magic link: {}",
+            logs.text()
+        );
+
+        // SMTP, failing against a closed local port: the delivery
+        // error is logged, the link is not.
+        let smtp = SmtpMailer::new(SmtpConfig {
+            host: "127.0.0.1".into(),
+            port: 1,
+            username: None,
+            password: None,
+            from: Some("huddle@example.com".into()),
+        });
+        smtp.send(Email::login_link("dev@example.com", link))
+            .await
+            .unwrap_err();
+        assert!(
+            !logs.text().contains(link),
+            "the SMTP path logged the magic link: {}",
+            logs.text()
+        );
     }
 
     // --- Resend, against an in-process mock of the API -------------------

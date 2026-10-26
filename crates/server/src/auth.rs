@@ -125,6 +125,12 @@ pub struct RequestLinkBody {
 /// server-side. One exception: per-IP rate limiting answers `429` so
 /// the endpoint cannot be used to flood mailboxes (or mine the log).
 ///
+/// The body carries `delivery` — `"logged"` when the dev log transport
+/// is in use, `"emailed"` for a real one — so the login page only ever
+/// points users at the server log when the link really is printed
+/// there (issue #85). It mirrors the configured transport, never the
+/// outcome of this request, which would reveal address validity.
+///
 /// When SSO is configured this endpoint is replaced by OIDC and answers
 /// `409` pointing at the login route — magic links and SSO are two
 /// flavors of one flow, never simultaneous.
@@ -163,6 +169,8 @@ pub async fn request_link(
                 .send(mailer::Email::login_link(&body.email, &link))
                 .await
             {
+                // The error never carries the link — only the log
+                // transport prints it (issue #85).
                 tracing::warn!("magic-link delivery failed: {e}");
             }
         }
@@ -171,7 +179,16 @@ pub async fn request_link(
         }
         Err(e) => tracing::warn!("cannot start login: {e}"),
     }
-    (StatusCode::OK, Json(json!({ "status": "sent" }))).into_response()
+    let delivery = if state.mailer().is_log() {
+        "logged"
+    } else {
+        "emailed"
+    };
+    (
+        StatusCode::OK,
+        Json(json!({ "status": "sent", "delivery": delivery })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
