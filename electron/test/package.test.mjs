@@ -33,3 +33,11 @@ test("electron-builder.yml exists and builds from buildResources", () => {
   assert.match(yml, /buildResources:\s*build/);
   assert.match(yml, /icon:\s*build\/icon\.png/);
 });
+
+test("macOS builds are ad-hoc signed, not unsigned (issue #86)", () => {
+  const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
+  // electron-builder 26.15.3: identity "-" → ad-hoc signature; identity: null
+  // would SKIP signing entirely and arm64 Gatekeeper reports the app as
+  // "broken and can't be opened" (issue #86). Must stay the string "-".
+  assert.match(yml, /identity:\s*"-"(\s|$)/m);
+});

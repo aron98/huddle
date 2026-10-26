@@ -1,10 +1,14 @@
-# Desktop bundling: on a pushed v* tag, build unsigned Electron installers
+# Desktop bundling: on a pushed v* tag, build the Electron installers
 # (Windows exe, macOS dmg, Linux AppImage + deb) and attach them to the
 # GitHub release. Mirrors release.yml (the server tarball) — one matrix job
 # per OS because electron-builder produces platform-native artifacts.
 #
-# Builds are UNSIGNED (mac signing is explicitly disabled); the release
-# notes disclose the SmartScreen/Gatekeeper warnings that come with that.
+# macOS builds are AD-HOC signed (mac.identity: "-" in
+# electron/electron-builder.yml, issue #86) so Apple Silicon stops
+# reporting the app as "broken and can't be opened"; no certificate is
+# installed on the runner and the workflow asserts the ad-hoc signature
+# after bundling. Windows/Linux builds stay unsigned — SmartScreen/
+# Gatekeeper first-launch warnings are disclosed in the release notes.
 
 name: release-desktop
 
@@ -46,14 +50,29 @@ jobs:
       - name: build installers
         run: npx electron-builder --publish never
         working-directory: electron
-        env:
-          # No Apple Developer certificate in this repo — never probe for one.
-          CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
       - name: artifact filename smoke check
         run: ls -la dist
         working-directory: electron
         if: runner.os != 'Windows'
+
+      # Issue #86: arm64 macOS hard-blocks *unsigned* apps ("broken and
+      # can't be opened"). electron-builder leaves the unpacked bundle at
+      # dist/mac*/Huddle.app after the dmg build — assert it carries an
+      # ad-hoc signature (mac.identity: "-").
+      - name: verify ad-hoc signature
+        if: runner.os == 'macOS'
+        working-directory: electron
+        run: |
+          set -euo pipefail
+          app=$(find dist -maxdepth 3 -name 'Huddle.app' -type d | head -n 1)
+          test -n "$app" || { echo "no unpacked Huddle.app found under dist"; exit 1; }
+          log="$RUNNER_TEMP/codesign-dv.log"
+          codesign -dv --verbose=2 "$app" 2>&1 | tee "$log"
+          grep -q 'adhoc' "$log" || {
+            echo "::error::Huddle.app has no ad-hoc signature — arm64 Gatekeeper would report it as broken (issue #86)"
+            exit 1
+          }
 
       - uses: softprops/action-gh-release@v2
         with:
