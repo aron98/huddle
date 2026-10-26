@@ -55,9 +55,30 @@ connect page. Other scripts:
 Pushing a `v*` tag triggers [release-desktop.yml](../.github/workflows/release-desktop.yml):
 a windows/macos/ubuntu matrix runs `npm ci` + `electron-builder --publish
 never` and attaches `huddle-<version>-<os>-<arch>.{exe,dmg,AppImage,deb}` to
-the GitHub release. **Builds are unsigned** — expect Windows SmartScreen and
-macOS Gatekeeper warnings; this is disclosed in the release notes. macOS
-builds skip code-sign probing via `CSC_IDENTITY_AUTO_DISCOVERY=false`.
+the GitHub release. **macOS builds are ad-hoc signed** (`mac.identity: "-"`
+in [electron-builder.yml](electron-builder.yml)) — Apple Silicon hard-blocks
+fully unsigned apps as "broken and can't be opened" (issue #86), but runs
+ad-hoc signed ones; no Apple certificate exists on the runner, and the
+workflow asserts the produced `Huddle.app` carries an ad-hoc signature.
+**Windows/Linux builds are unsigned** — expect Windows SmartScreen and a
+macOS Gatekeeper first-launch warning; this is disclosed in the release
+notes.
+
+### macOS signing status (issue #86)
+
+Ad-hoc means the bundle is signed by no registered identity, so it is
+**not notarized**: the first launch still triggers Gatekeeper's "Apple
+cannot check it for malicious software" warning. Override it once:
+
+- right-click `Huddle.app` → **Open** → **Open** in the dialog, or
+  System Settings → Privacy & Security → "Open Anyway", or
+  strip the quarantine flag directly:
+  `xattr -rd com.apple.quarantine /Applications/Huddle.app`.
+
+Removing the warning entirely requires a **Developer ID Application**
+signature plus **notarization**, which needs the paid ($99/yr) Apple
+Developer Program — recorded as a follow-up decision, out of scope for
+this fix.
 
 ## What the shell adds over a browser tab
 
@@ -101,7 +122,9 @@ CI only syntax-checks, unit-tests pure logic, and bundles.
 **Windows** — "Share computer audio" checkbox visible in the picker; checked
 → shared tab/system audio audible to a second participant.
 **macOS** — same audio checkbox (13.3+); Dock activate reopens the window;
-no tray is created (by design).
+no tray is created (by design); dmg build launches despite the Gatekeeper
+warning via right-click → Open (ad-hoc, not notarized — see
+[macOS signing status](#macos-signing-status-issue-86) above).
 **Linux** — no audio checkbox; tray icon appears on a DE with a tray
 (close → hides to tray, Show → restores); on a tray-less DE the app must
 still start and close normally.
@@ -112,4 +135,6 @@ bundled versions above.
 **NOT verified (no hardware/OS access in this environment):** packaged
 (installer) runs on any OS, actual media flow through the shell, loopback
 audio on Windows/macOS, deep-link registration on installed builds, tray
-behaviour on real DEs, dmg/exe/deb install paths.
+behaviour on real DEs, dmg/exe/deb install paths, and the macOS ad-hoc
+signature itself (config-level only here; the `verify ad-hoc signature`
+step in release-desktop.yml checks it on the next tagged release).
