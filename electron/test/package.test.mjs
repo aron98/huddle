@@ -18,13 +18,24 @@ test("package.json parses and pins the exact expected toolchain", () => {
   );
 });
 
-test("package-lock.json is committed so CI can npm ci", () => {
+test("electron-updater is an exactly-pinned production dependency (issue #98)", () => {
+  const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+  // Runtime dep, not dev: electron-builder bundles production node_modules
+  // into the app, and setFeedURL is configured in code — the pin must stay
+  // exact for reproducible release builds.
+  assert.equal(pkg.dependencies["electron-updater"], "6.8.11");
+  assert.ok(!pkg.devDependencies["electron-updater"], "must not be a devDependency");
+});
+
+test("package-lock.json matches the pinned dependencies", () => {
   const lockPath = path.join(root, "package-lock.json");
-  assert.equal(existsSync(lockPath), true);
+  assert.equal(existsSync(lockPath), true, "lock file must be committed for CI npm ci");
   const lock = JSON.parse(readFileSync(lockPath, "utf8"));
   const rootPkg = lock.packages[""];
   assert.equal(rootPkg.devDependencies.electron, "45.0.0");
   assert.equal(rootPkg.devDependencies["electron-builder"], "26.15.3");
+  assert.equal(rootPkg.dependencies["electron-updater"], "6.8.11");
+  assert.equal(lock.packages["node_modules/electron-updater"]?.version, "6.8.11");
 });
 
 test("electron-builder.yml exists and builds from buildResources", () => {

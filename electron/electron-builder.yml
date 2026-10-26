@@ -13,8 +13,10 @@ directories:
   output: dist
   buildResources: build
 
-# Everything the runtime needs lives in src/ + build/ icons; there are no
-# production npm dependencies (the client is loaded from the server).
+# Everything the runtime needs lives in src/ + build/ icons. electron-updater
+# is the only production npm dependency (issue #98) and electron-builder
+# bundles production node_modules automatically; the client itself is still
+# loaded from the server.
 files:
   - src/**/*
   - build/icon.png
