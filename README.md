@@ -14,7 +14,7 @@ See [Development](#development) for the dev loop or
 ## Documentation
 
 - [ARCHITECTURE](docs/ARCHITECTURE.md) — system design
-- [Deployment guides](docs/deploy/) — Ubuntu VPS, Docker Compose, Kubernetes, hardening checklist
+- [Deployment guides](docs/deploy/) — Ubuntu VPS, Docker Compose, Kubernetes, OIDC SSO setup, hardening checklist
 - [ADRs](docs/adr/) — the decisions we've made and why
 - [Post-MVP milestone](https://github.com/aron98/huddle/milestone/1) — what's
   next
@@ -113,7 +113,9 @@ auto-detection you do not need to care about this on any platform.
 
 Deployment (Docker, compose, Helm, release tarballs, coturn, firewall
 ports) is covered in [Self-hosting](#self-hosting) below, along with optional
-[Single sign-on (OIDC)](#single-sign-on-oidc) for the login flow.
+[Single sign-on (OIDC)](#single-sign-on-oidc) for the login flow — the
+step-by-step provider setup lives in
+[docs/deploy/oidc.md](docs/deploy/oidc.md).
 
 ## Observability
 
@@ -158,9 +160,10 @@ scrape_configs:
 
 Step-by-step production guides: [Ubuntu VPS](docs/deploy/ubuntu-vps.md) (static
 binary + systemd + coturn), [Docker Compose](docs/deploy/docker-compose.md),
-[Kubernetes](docs/deploy/kubernetes.md), and a cross-platform
-[hardening checklist](docs/deploy/hardening-checklist.md). This section is the
-configuration reference those guides link back to.
+[Kubernetes](docs/deploy/kubernetes.md), a cross-platform
+[hardening checklist](docs/deploy/hardening-checklist.md), and
+[OIDC provider setup for single sign-on](docs/deploy/oidc.md). This section
+is the configuration reference those guides link back to.
 
 ### Ports and firewall
 
@@ -367,6 +370,10 @@ identity is the email), and the provider must support the authorization-code
 flow — huddle always sends a PKCE `S256` challenge and a `nonce`, and only
 accepts asymmetric signature algorithms (RS/ES/PS families) from its JWKS.
 
+A step-by-step provider setup guide — generic IdP checklist plus an Auth0
+walk-through with the pitfalls we hit live and a diagnostics table — lives in
+[docs/deploy/oidc.md](docs/deploy/oidc.md).
+
 ### Agent access (CLI + MCP)
 
 Scripts, shells, and AI agents get API access through the OAuth device flow
@@ -452,10 +459,11 @@ Releases: pushing a `v*` tag makes CI build a static musl binary with the web
 client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
 (+ sha256) to the GitHub release. The same tag also publishes the container
 image `ghcr.io/aron98/huddle:<version>` (+ `latest`, linux/amd64 only — see
-`Dockerfile.release`) and builds **unsigned**
-desktop installers (Windows exe, macOS dmg, Linux AppImage/deb) from
-[`electron/`](electron/) — see [ADR 014](docs/adr/014-desktop-shell-electron.md)
-and [electron/README.md](electron/README.md).
+`Dockerfile.release`) and builds the desktop installers (Windows exe,
+Linux AppImage/deb — unsigned; macOS dmg — ad-hoc signed, see
+[ADR 014](docs/adr/014-desktop-shell-electron.md) and
+[electron/README.md](electron/README.md)) from
+[`electron/`](electron/).
 
 ## Desktop
 
