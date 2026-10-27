@@ -12,7 +12,8 @@
 //   - OIDC SSO (issue #11): with a second server configured against a
 //     fake issuer, the SSO routes 404 on the magic-link server, magic
 //     links 409 on the SSO server, and a browser login lands on the
-//     same dashboard with the same session cookie.
+//     same dashboard with the same session cookie. Opening /login on
+//     the SSO server goes straight to the IdP (issue #99).
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -401,11 +402,13 @@ try {
   }
   console.log('callback requires the browser-bound state');
 
-  // A real browser login: login → issuer → callback → /meetings, with
-  // the same dashboard the magic-link flow lands on.
+  // A real browser login: opening /login probes the sign-in method,
+  // redirects straight to the issuer (issue #99), and the callback
+  // lands on /meetings, with the same dashboard the magic-link flow
+  // lands on.
   const ssoPage = await browser.newPage();
   ssoPage.on('pageerror', (error) => console.log(`[pageerror] ${error.message}`));
-  await ssoPage.goto(`${OIDC_BASE}/api/auth/oidc/login`, { waitUntil: 'networkidle0' });
+  await ssoPage.goto(`${OIDC_BASE}/login`, { waitUntil: 'networkidle0' });
   await ssoPage.waitForSelector('[data-testid="create-btn"]', { timeout: 15_000 });
   const who = await ssoPage.evaluate(async () => (await fetch('/api/auth/me')).json());
   if (who.email !== 'sso@example.com') {

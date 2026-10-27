@@ -103,8 +103,8 @@ In a `docker-compose.yml` environment list, take the values from a
    settings, pick **Client Secret (Post)** — this matches huddle's
    `client_secret_post`; see gotcha 6.
 5. **Point huddle at it.** Configure the three values (section above),
-   restart huddle, and load the site — from v1.1.3 the login page
-   auto-navigates to Auth0 ([below](#the-login-flow)); on older releases
+   restart huddle, and load the site — opening the sign-in page sends
+   you straight to Auth0 ([below](#the-login-flow)); on older releases
    open `https://meet.example.com/api/auth/oidc/login` manually.
 
 ### Gotchas — all of these bit us live
@@ -179,10 +179,17 @@ authentication methods so the token exchange matches.
 
 ## The login flow
 
-- **v1.1.3 and later:** with SSO configured, submitting the login page
+- **Current releases:** with SSO configured, the login page probes
+  `GET /api/auth/oidc/status` when it loads and, on
+  `{"status":"oidc_configured",…}`, sends the browser straight to
+  `/api/auth/oidc/login` — the user never sees the magic-link form
+  ([#99](https://github.com/aron98/huddle/issues/99)). The probe is
+  best-effort: when it cannot run, the behavior below takes over, so
+  the page always offers a way in.
+- **v1.1.3:** the login page shows the magic-link form; submitting it
   gets `409 {"status":"oidc_configured","login":"/api/auth/oidc/login"}`
-  from the server and the page follows that URL automatically — users go
-  straight to the IdP.
+  from the server and the page follows that URL automatically. This
+  path is still in place as the fallback for a failed probe.
 - **Older releases:** the login page shows the raw error instead; open
   `https://meet.example.com/api/auth/oidc/login` manually.
 - The IdP redirects back to `/api/auth/oidc/callback`, huddle verifies the

@@ -14,6 +14,7 @@
 pub mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod audio_settings;
+pub mod auth_mode;
 #[cfg(target_arch = "wasm32")]
 pub mod call;
 pub mod e2ee;
@@ -163,6 +164,22 @@ fn Landing() -> impl IntoView {
 fn Login() -> impl IntoView {
     let email = RwSignal::new(String::new());
     let status = RwSignal::<Option<String>>::new(None);
+
+    // Issue #99: with an OIDC IdP configured, this page sends the user
+    // straight to the SSO entry on mount — no magic-link form to type
+    // into and get refused first. Best-effort by design: any probe
+    // failure (older server without the status route, network error,
+    // unparseable body) leaves the form below on screen, and its own
+    // 409 handler still reaches the IdP, so the page never goes blank.
+    spawn_local(async move {
+        if let Ok((probe_status, body)) =
+            api::fetch_text("GET", "/api/auth/oidc/status", None).await
+            && let Some(entry) = auth_mode::sso_entry_from_probe(probe_status, &body)
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.location().assign(entry);
+        }
+    });
 
     let submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
