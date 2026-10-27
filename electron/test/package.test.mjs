@@ -18,13 +18,24 @@ test("package.json parses and pins the exact expected toolchain", () => {
   );
 });
 
-test("package-lock.json is committed so CI can npm ci", () => {
+test("electron-updater is an exactly-pinned production dependency (issue #98)", () => {
+  const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
+  // Runtime dep, not dev: electron-builder bundles production node_modules
+  // into the app, and setFeedURL is configured in code — the pin must stay
+  // exact for reproducible release builds.
+  assert.equal(pkg.dependencies["electron-updater"], "6.8.11");
+  assert.ok(!pkg.devDependencies["electron-updater"], "must not be a devDependency");
+});
+
+test("package-lock.json matches the pinned dependencies", () => {
   const lockPath = path.join(root, "package-lock.json");
-  assert.equal(existsSync(lockPath), true);
+  assert.equal(existsSync(lockPath), true, "lock file must be committed for CI npm ci");
   const lock = JSON.parse(readFileSync(lockPath, "utf8"));
   const rootPkg = lock.packages[""];
   assert.equal(rootPkg.devDependencies.electron, "45.0.0");
   assert.equal(rootPkg.devDependencies["electron-builder"], "26.15.3");
+  assert.equal(rootPkg.dependencies["electron-updater"], "6.8.11");
+  assert.equal(lock.packages["node_modules/electron-updater"]?.version, "6.8.11");
 });
 
 test("electron-builder.yml exists and builds from buildResources", () => {
@@ -40,4 +51,24 @@ test("macOS builds are ad-hoc signed, not unsigned (issue #86)", () => {
   // would SKIP signing entirely and arm64 Gatekeeper reports the app as
   // "broken and can't be opened" (issue #86). Must stay the string "-".
   assert.match(yml, /identity:\s*"-"(\s|$)/m);
+});
+
+test("release-desktop.yml publishes the electron-updater feed files (issue #98)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github", "workflows", "release-desktop.yml"),
+    "utf8",
+  );
+  // electron-updater reads latest.yml (NSIS) / latest-linux.yml (AppImage)
+  // to discover the current version + artifact URL, and uses the .blockmap
+  // for differential downloads. Without these in the GitHub release the
+  // packaged app's update check silently finds nothing.
+  for (const needed of [
+    "electron/dist/latest.yml",
+    "electron/dist/latest-linux.yml",
+    ".exe.blockmap",
+    ".AppImage.blockmap",
+  ]) {
+    assert.ok(workflow.includes(needed), `release must attach ${needed}`);
+  }
 });

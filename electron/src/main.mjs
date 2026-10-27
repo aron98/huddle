@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { app, BrowserWindow, ipcMain, Menu, Tray } from "electron";
 import { parseDeepLink } from "./deep-link.mjs";
 import { registerScreenShare } from "./screenshare.mjs";
+import { registerUpdater } from "./updater.mjs";
 import { loadSettings, normalizeServerUrl, saveSettings, settingsPath } from "./settings.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -53,6 +54,7 @@ async function start() {
 
   if (app.isPackaged) app.setAsDefaultProtocolClient("huddle");
   setupTray();
+  registerUpdater(); // self-update on packaged builds (no-op in dev) — issue #98
 
   while (queuedDeepLinks.length > 0) handleDeepLink(queuedDeepLinks.shift());
 }
