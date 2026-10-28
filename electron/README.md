@@ -54,34 +54,75 @@ connect page. Other scripts:
 ## Production build
 
 Pushing a `v*` tag triggers [release-desktop.yml](../.github/workflows/release-desktop.yml):
-a windows/macos/ubuntu matrix runs `npm ci` + `electron-builder --publish
-never` and attaches `huddle-<version>-<os>-<arch>.{exe,dmg,AppImage,deb}`
+a windows/ubuntu matrix plus a dedicated macOS job run `npm ci` +
+`electron-builder --publish never` and attach
+`huddle-<version>-<os>-<arch>.{exe,dmg,AppImage,deb}`
 plus the electron-updater feed files (`latest.yml`, `latest-linux.yml`,
 `.blockmap` — see [Auto-update](#auto-update-issue-98)) to the
-GitHub release. **macOS builds are ad-hoc signed** (`mac.identity: "-"`
-in [electron-builder.yml](electron-builder.yml)) — Apple Silicon hard-blocks
-fully unsigned apps as "broken and can't be opened" (issue #86), but runs
-ad-hoc signed ones; no Apple certificate exists on the runner, and the
-workflow asserts the produced `Huddle.app` carries an ad-hoc signature.
-**Windows/Linux builds are unsigned** — expect Windows SmartScreen and a
-macOS Gatekeeper first-launch warning; this is disclosed in the release
+GitHub release. **macOS builds are Developer ID-signed and notarized**
+(issue #103) — the dmg launches on the first try with no Gatekeeper
+warning, and the workflow verifies the signature, the notarization and
+the stapled ticket before upload (see
+[macOS signing](#macos-signing-issue-103)).
+**Windows/Linux builds are unsigned** — expect a Windows SmartScreen
+first-launch warning; this is disclosed in the release
 notes.
 
-### macOS signing status (issue #86)
+### macOS signing (issue #103)
 
-Ad-hoc means the bundle is signed by no registered identity, so it is
-**not notarized**: the first launch still triggers Gatekeeper's "Apple
-cannot check it for malicious software" warning. Override it once:
+macOS builds are signed with the org's **Developer ID Application**
+certificate and **notarized** with Apple. `electron-builder.yml`
+deliberately omits `mac.identity` — electron-builder auto-detects the
+sole Developer ID Application certificate in the temporary keychain
+the release workflow prepares (an explicit
+`Developer ID Application: <CN>` value is rejected by its findIdentity;
+`-` ad-hoc and `null` no-sign were the pre-notarization states) — and
+sets `notarize: true` (notarytool submission; @electron/notarize
+staples the ticket automatically). electron-builder 26.15.3 only
+*warns* if notarization credentials are missing, so the workflow
+enforces the result before upload: `codesign --verify --deep --strict`
+(seal tree intact), Gatekeeper's assessment `spctl --assess`
+(rejects non-notarized Developer ID apps on 10.15+),
+`xcrun stapler validate` (stapled ticket), and the same spctl + stapler
+re-run on the app inside the mounted dmg — the shipped artifact; the
+dmg itself is unsigned by design (`dmg.sign` defaults to false).
 
-- right-click `Huddle.app` → **Open** → **Open** in the dialog, or
-  System Settings → Privacy & Security → "Open Anyway", or
-  strip the quarantine flag directly:
+The signing + notarization secrets live as **environment secrets of
+the `macos-signing` GitHub environment** — never repo-level secrets —
+so only the macOS release job (`bundle-macos`) can read them.
+
+**One-time maintainer setup** (already done for this org; recorded
+here so it can be recreated):
+
+1. GitHub → repo **Settings → Environments → New environment** → name
+   it `macos-signing`.
+2. Add the four **environment** secrets:
+   - `MAC_CERTS_P12_BASE64` — base64 of the exported Developer ID
+     Application `.p12`;
+   - `MAC_CERTS_PASSWORD` — that `.p12`'s export password;
+   - `APPLE_ID` — the Apple ID email;
+   - `APPLE_APP_SPECIFIC_PASSWORD` — an app-specific password
+     (appleid.apple.com → Sign-In and Security → App-Specific
+     Passwords); the notarization API rejects primary passwords.
+3. Nothing else: the workflow imports the certificate into a
+   temporary keychain per run, derives `APPLE_TEAM_ID` from the
+   imported certificate (notarization requires it), and deletes the
+   keychain afterwards.
+
+Notes:
+
+- The Developer ID Application certificate must be created by the
+  team's Account Holder (developer.apple.com → Certificates).
+- electron-builder skips macOS code signing on **pull request** builds
+  (unless `CSC_FOR_PULL_REQUEST` is set) — harmless here, the release
+  workflow only runs on `v*` tags.
+- **Old pre-notarization builds only** (ad-hoc signed, released before
+  this change): first launch still triggers Gatekeeper's "Apple cannot
+  check it for malicious software" warning. Override it once for those
+  versions: right-click `Huddle.app` → **Open** → **Open**, or System
+  Settings → Privacy & Security → "Open Anyway", or strip the
+  quarantine flag directly:
   `xattr -rd com.apple.quarantine /Applications/Huddle.app`.
-
-Removing the warning entirely requires a **Developer ID Application**
-signature plus **notarization**, which needs the paid ($99/yr) Apple
-Developer Program — recorded as a follow-up decision, out of scope for
-this fix.
 
 ## Auto-update (issue #98)
 
@@ -106,14 +147,17 @@ mechanisms differ:
   recommended desktop format.
 - **macOS** — **notify-with-link only, no self-update.** electron-updater
   on macOS drives Squirrel.Mac, which requires a properly **Developer
-  ID-signed** build; ours is only ad-hoc signed (issue #86) and a
-  self-replace would break the app. Instead the shell polls the GitHub
-  API for the latest release and, when a newer version with a `dmg`
-  asset exists, shows an "update available" dialog whose **Download…**
-  button opens the release page in the browser. The dialog appears once
-  per version per session (picking Later silences periodic re-checks of
-  the same version). This fallback is removed when real Developer ID
-  signing + notarization lands.
+  ID-signed** build; ours was only ad-hoc signed when this was written
+  (issue #86), and a self-replace would have broken the app. Instead
+  the shell polls the GitHub API for the latest release and, when a
+  newer version with a `dmg` asset exists, shows an "update available"
+  dialog whose **Download…** button opens the release page in the
+  browser. The dialog appears once per version per session (picking
+  Later silences periodic re-checks of the same version). Builds are
+  Developer ID-signed + notarized now (issue #103), so the Squirrel.Mac
+  prerequisite is finally met — but switching macOS to a real
+  self-update flow is a deliberate follow-up (it needs code + release
+  testing), not something the signing change flips.
 
 The Windows/Linux feed is the `latest.yml` (NSIS) / `latest-linux.yml`
 (AppImage) metadata plus blockmaps that `release-desktop.yml` attaches
@@ -184,9 +228,10 @@ build at version A and a published `v*` release at a higher version B
 **Windows** — "Share computer audio" checkbox visible in the picker; checked
 → shared tab/system audio audible to a second participant.
 **macOS** — same audio checkbox (13.3+); Dock activate reopens the window;
-no tray is created (by design); dmg build launches despite the Gatekeeper
-warning via right-click → Open (ad-hoc, not notarized — see
-[macOS signing status](#macos-signing-status-issue-86) above).
+no tray is created (by design); the dmg build launches on the first try
+with **no Gatekeeper warning** (Developer ID-signed + notarized — see
+[macOS signing](#macos-signing-issue-103); a warning means the signing
+or notarization regressioned — do not ship).
 **Linux** — no audio checkbox; tray icon appears on a DE with a tray
 (close → hides to tray, Show → restores); on a tray-less DE the app must
 still start and close normally.
@@ -199,6 +244,7 @@ bundled versions above.
 against a real GitHub release, the macOS notify dialog), actual media flow
 through the shell, loopback audio on Windows/macOS, deep-link registration
 on installed builds, tray behaviour on real DEs, dmg/exe/deb install paths,
-and the macOS ad-hoc signature itself (config-level only here; the
-`verify ad-hoc signature` step in release-desktop.yml checks it on the next
-tagged release).
+and the macOS Developer ID signature + notarization itself — config-level
+only on this VM (no macOS, no keychain, no secrets); the
+`verify Developer ID signature, notarization and the dmg` step in
+release-desktop.yml performs the real check on the next tagged release.

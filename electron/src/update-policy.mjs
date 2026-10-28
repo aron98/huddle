@@ -23,10 +23,10 @@ export const CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000;
  *  - "updater": electron-updater against GitHub Releases. Windows NSIS
  *    and the Linux AppImage support in-place self-update.
  *  - "notify": detect new releases via the GitHub API and link the
- *    release page. macOS builds are only ad-hoc signed (issue #86), and
- *    Squirrel.Mac — which electron-updater uses there — requires a
- *    properly Developer ID-signed build, so macOS must not attempt
- *    self-update until real signing exists.
+ *    release page. macOS builds were only ad-hoc signed when this was
+ *    written; they are Developer ID-signed + notarized now (issue
+ *    #103), but the switch to Squirrel.Mac self-update is a deliberate
+ *    follow-up, so darwin keeps the notify flow until then.
  *  - "none": never update in place (unknown platforms; dev runs are
  *    filtered earlier by app.isPackaged in updater.mjs).
  *

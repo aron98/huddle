@@ -30,8 +30,9 @@ function releaseBody(overrides = {}) {
 }
 
 test("autoUpdateMode: Windows/Linux self-update, macOS notifies, unknown never", () => {
-  // macOS is ad-hoc signed (issue #86); Squirrel needs a real Developer ID
-  // signature, so darwin must take the notify-with-link path (issue #98).
+  // macOS keeps the notify-with-link path (issue #98) even though builds
+  // are Developer ID-signed + notarized now (issue #103): switching
+  // Squirrel.Mac on is a deliberate follow-up, not a signing side effect.
   assert.equal(autoUpdateMode("win32"), "updater");
   assert.equal(autoUpdateMode("linux"), "updater");
   assert.equal(autoUpdateMode("darwin"), "notify");

@@ -460,7 +460,8 @@ client baked in and attach `huddle-<version>-x86_64-unknown-linux-musl.tar.gz`
 (+ sha256) to the GitHub release. The same tag also publishes the container
 image `ghcr.io/aron98/huddle:<version>` (+ `latest`, linux/amd64 only — see
 `Dockerfile.release`) and builds the desktop installers (Windows exe,
-Linux AppImage/deb — unsigned; macOS dmg — ad-hoc signed, see
+Linux AppImage/deb — unsigned; macOS dmg — Developer ID-signed +
+notarized, see
 [ADR 014](docs/adr/014-desktop-shell-electron.md) and
 [electron/README.md](electron/README.md)) from
 [`electron/`](electron/).
