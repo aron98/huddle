@@ -59,8 +59,14 @@ a windows/ubuntu matrix plus a dedicated macOS job run `npm ci` +
 `electron-builder --publish never` and attach
 `huddle-<version>-<os>-<arch>.{exe,dmg,AppImage,deb}`
 plus the electron-updater feed files (`latest.yml`, `latest-linux.yml`,
-`.blockmap` — see [Auto-update](#auto-update-issue-98)) to the
-GitHub release. **macOS builds are Developer ID-signed and notarized**
+`latest-mac.yml`, `.blockmap` — see [Auto-update](#auto-update-issue-98))
+to the GitHub release. electron-builder only writes those feed files
+when a publish provider is configured, so `electron-builder.yml`
+declares the GitHub provider — CI still passes `--publish never`, which
+makes electron-builder generate the files locally without publishing
+anything (the workflow does the uploading), and asserts each platform's
+feed file exists before upload (a missing feed must fail the release,
+not skip silently). **macOS builds are Developer ID-signed and notarized**
 (issue #103) — the dmg launches on the first try with no Gatekeeper
 warning, and the workflow verifies the signature, the notarization and
 the stapled ticket before upload (see

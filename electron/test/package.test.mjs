@@ -45,6 +45,17 @@ test("electron-builder.yml exists and builds from buildResources", () => {
   assert.match(yml, /icon:\s*build\/icon\.png/);
 });
 
+test("electron-builder.yml declares the GitHub publish provider (issue #109)", () => {
+  const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
+  // electron-builder only writes the updater feed files (latest*.yml,
+  // AppImage blockmap) when a publish provider is configured. Declaring
+  // GitHub here makes CI builds (which pass --publish never) generate
+  // them locally for release-desktop.yml to attach.
+  assert.match(yml, /^\s*provider:\s*github$/m);
+  assert.match(yml, /^\s*owner:\s*aron98$/m);
+  assert.match(yml, /^\s*repo:\s*huddle$/m);
+});
+
 test("macOS builds are Developer ID signed and notarized (issue #103)", () => {
   const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
   // `identity` is intentionally OMITTED: electron-builder auto-detects the

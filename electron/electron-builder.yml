@@ -10,6 +10,20 @@ appId: io.github.aron98.huddle
 productName: Huddle
 copyright: Apache-2.0
 
+# Updater feed generation (issue #109): electron-builder only writes the
+# electron-updater channel files (latest.yml / latest-linux.yml /
+# latest-mac.yml) and the AppImage blockmap when a publish provider is
+# configured — with none, the v1.1.5 release shipped without them and
+# softprops/action-gh-release silently skipped the unmatched globs.
+# Declaring the GitHub provider makes electron-builder WRITE those files
+# into dist/; CI still passes --publish never (release-desktop.yml does
+# the uploading via the release action), so electron-builder itself
+# never publishes anything.
+publish:
+  provider: github
+  owner: aron98
+  repo: huddle
+
 directories:
   output: dist
   buildResources: build
