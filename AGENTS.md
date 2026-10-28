@@ -97,7 +97,7 @@ Electron shell (ADR 014) that **loads a Huddle server's HTTP(S) origin** — the
 - Main-process modules are ESM `.mjs`; preloads are sandbox-compatible plain `.js` (package.json has no `"type"`). Pure logic (settings, deep-link parsing) is fs-injected and covered by `node --test`.
 - Gates (CI `desktop` job, no `npm install` needed): `cd electron && npm run check && npm test`.
 - No E2E: releases rely on the manual per-OS checklist in `electron/README.md` — keep it in sync with shell behaviour.
-- macOS builds are **ad-hoc signed** (`mac.identity: "-"` in `electron/electron-builder.yml`, issue #86 — in electron-builder 26, `identity: null` SKIPS signing, only `"-"` ad-hoc signs). Ad-hoc ≠ notarized: Gatekeeper still warns on first launch (workarounds in `electron/README.md`); Developer ID + notarization (paid Apple Developer Program) is a recorded follow-up. CI asserts the signature (`verify ad-hoc signature` step in `release-desktop.yml`).
+- macOS builds are **Developer ID-signed + notarized** (issue #103). Secrets live ONLY as environment secrets of the `macos-signing` GitHub environment; the dedicated `bundle-macos` job opts into it (environment scoping is why macOS is not a matrix leg), imports the p12 into a temp keychain (`mac.identity` is omitted — electron-builder auto-detects the cert; explicit `Developer ID Application:` values are rejected by its findIdentity), derives `APPLE_TEAM_ID` from the cert, and fails the release unless `codesign --verify`/`spctl`/`stapler` + a dmg re-check pass. electron-builder 26.15.3 skips notarization with only a warning when credentials are missing — those CI checks are the enforcement.
 
 ## VM quirks (this environment)
 

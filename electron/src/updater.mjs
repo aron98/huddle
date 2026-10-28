@@ -12,11 +12,12 @@
 //    the user accepts the prompt), differential updates where the
 //    installer format allows. The deb package cannot self-update;
 //    the AppImage does.
-//  - macOS (packaged): notify-with-link only. The build is ad-hoc
-//    signed (issue #86) and Squirrel.Mac — electron-updater's macOS
-//    backend — requires a properly Developer ID-signed build, so the
-//    shell detects new releases via the GitHub API and hands off to
-//    the release page for manual download.
+//  - macOS (packaged): notify-with-link only. Builds are
+//    Developer ID-signed + notarized now (issue #103), so the
+//    Squirrel.Mac prerequisite is met — but switching to real
+//    self-update is a deliberate follow-up (it needs code + release
+//    testing), so until then the shell detects new releases via the
+//    GitHub API and hands off to the release page for manual download.
 //  - Dev runs (app not packaged) never check for updates.
 
 import { app, dialog, shell } from "electron";
