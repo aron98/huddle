@@ -75,6 +75,17 @@ the stapled ticket before upload (see
 first-launch warning; this is disclosed in the release
 notes.
 
+Desktop artifact versions are **derived from the tag**, not
+`package.json`: the workflow passes
+`-c.extraMetadata.version` to electron-builder (v1.1.5 → `1.1.5`), so
+the installer filenames, the embedded app version and the
+`latest*.yml` feeds all carry the release version, and the workflow
+fails the job if no built artifact carries it. `package.json`'s
+`version` (0.1.0) is a dev placeholder that never ships — do not
+hand-bump it per release (that drift is how the v1.1.5 desktop
+artifacts got stuck at `huddle-0.1.0-*`, which would have made
+electron-updater never see any update).
+
 ### macOS signing (issue #103)
 
 macOS builds are signed with the org's **Developer ID Application**

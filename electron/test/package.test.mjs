@@ -56,6 +56,26 @@ test("electron-builder.yml declares the GitHub publish provider (issue #109)", (
   assert.match(yml, /^\s*repo:\s*huddle$/m);
 });
 
+test("release-desktop.yml derives desktop artifact versions from the tag (issue #110)", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const workflow = readFileSync(
+    path.join(repoRoot, ".github", "workflows", "release-desktop.yml"),
+    "utf8",
+  );
+  // package.json's version is a dev placeholder; the packaged version
+  // comes from the v* tag via -c.extraMetadata.version (v1.1.5 → 1.1.5)
+  // so the artifacts + latest*.yml feeds carry the release version and
+  // electron-updater can actually see updates. Both build jobs use it.
+  assert.equal(
+    (workflow.match(/-c\.extraMetadata\.version="\$\{GITHUB_REF_NAME#v\}"/g) ?? []).length,
+    2,
+    "both bundle jobs must pass the tag-derived version",
+  );
+  // The workflow must fail if the built artifacts do not carry the tag
+  // version — a silent 0.1.0 embeds 0.1.0 into the feeds.
+  assert.ok(workflow.includes("huddle-${version}-"), "release must assert artifact version");
+});
+
 test("macOS builds are Developer ID signed and notarized (issue #103)", () => {
   const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
   // `identity` is intentionally OMITTED: electron-builder auto-detects the
