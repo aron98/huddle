@@ -16,6 +16,7 @@ import { parseDeepLink } from "./deep-link.mjs";
 import { registerScreenShare } from "./screenshare.mjs";
 import { registerUpdater } from "./updater.mjs";
 import { loadSettings, normalizeServerUrl, saveSettings, settingsPath } from "./settings.mjs";
+import { describeLoadError } from "./load-errors.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = process.argv.includes("--dev");
@@ -25,6 +26,7 @@ let mainWindow = null;
 let tray = null;
 let quitting = false;
 let settings = { serverUrl: null };
+let connectAttemptUrl = null; // origin a save-server-url loadURL is trying
 const queuedDeepLinks = [];
 
 // Single instance: the second launch just routes its deep link to us.
@@ -106,6 +108,13 @@ function createWindow() {
     if (!isMainFrame || !mainWindow) return;
     if (url.startsWith("file://")) return; // our own pages already render
     if (code === -3) return; // ERR_ABORTED: we navigated elsewhere ourselves
+    // A failed Connect submit is surfaced inline by the save-server-url
+    // handler itself; reloading the page here would wipe that error and
+    // replace it with Chromium's raw description. Consume the attempt once.
+    if (connectAttemptUrl && url === connectAttemptUrl) {
+      connectAttemptUrl = null;
+      return;
+    }
     console.error(`load failed (${code} ${desc}): ${url}`);
     showConnectPage(desc || `Could not reach the server (code ${code}).`);
   });
@@ -146,13 +155,25 @@ function registerIpc() {
     platform: process.platform,
   }));
   ipcMain.handle("huddle:get-server-url", () => settings.serverUrl);
-  ipcMain.handle("huddle:save-server-url", (_event, raw) => {
+  ipcMain.handle("huddle:save-server-url", async (_event, raw) => {
     const normalized = normalizeServerUrl(raw);
     if (!normalized.ok) return normalized;
     settings = { serverUrl: normalized.url };
     saveSettings(fs, settingsPath(app.getPath("userData")), settings);
-    mainWindow.loadURL(normalized.url).catch((err) => console.error(err));
-    return { ok: true };
+    // Await the load and report failures through the returned error object:
+    // the connect page is still showing and renders it inline (connect.js).
+    connectAttemptUrl = normalized.url;
+    try {
+      await mainWindow.loadURL(normalized.url);
+      connectAttemptUrl = null;
+      return { ok: true };
+    } catch (err) {
+      // Left set on failure: did-fail-load consumes it (see createWindow) so
+      // the page is not reloaded out from under the inline error returned
+      // here — whichever of the two fires first.
+      console.error(`connect failed for ${normalized.url}:`, err);
+      return { ok: false, error: describeLoadError(err) };
+    }
   });
 }
 
