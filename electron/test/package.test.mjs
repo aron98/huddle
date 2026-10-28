@@ -45,12 +45,20 @@ test("electron-builder.yml exists and builds from buildResources", () => {
   assert.match(yml, /icon:\s*build\/icon\.png/);
 });
 
-test("macOS builds are ad-hoc signed, not unsigned (issue #86)", () => {
+test("macOS builds are Developer ID signed and notarized (issue #103)", () => {
   const yml = readFileSync(path.join(root, "electron-builder.yml"), "utf8");
-  // electron-builder 26.15.3: identity "-" → ad-hoc signature; identity: null
-  // would SKIP signing entirely and arm64 Gatekeeper reports the app as
-  // "broken and can't be opened" (issue #86). Must stay the string "-".
-  assert.match(yml, /identity:\s*"-"(\s|$)/m);
+  // `identity` is intentionally OMITTED: electron-builder auto-detects the
+  // sole "Developer ID Application" cert in the keychain the release
+  // workflow creates. "-" (ad-hoc, the old issue #86 workaround) and null
+  // (skip signing) both make notarization impossible, and an explicit
+  // "Developer ID Application: <CN>" value is rejected by findIdentity.
+  assert.doesNotMatch(yml, /^\s*identity:/m, "identity must stay omitted (auto-detected)");
+  // Notarization requires the hardened runtime; the workflow's
+  // spctl/stapler verification requires the app to be notarized.
+  // (Indented on purpose under `mac:` — the \s* allows that but still
+  // excludes the prose comments, which have `#` after the whitespace.)
+  assert.match(yml, /^\s*hardenedRuntime:\s*true$/m);
+  assert.match(yml, /^\s*notarize:\s*true$/m);
 });
 
 test("release-desktop.yml publishes the electron-updater feed files (issue #98)", () => {

@@ -1,9 +1,10 @@
 # electron-builder configuration for the Huddle desktop shell.
-# Built by .github/workflows/release-desktop.yml on v* tags, one matrix
-# job per OS, artifacts attached to the GitHub release. No Apple/Windows
-# certificates in this repo: macOS builds are ad-hoc signed (see
-# mac.identity below, issue #86), Windows/Linux builds are unsigned, and
-# the release notes disclose that.
+# Built by .github/workflows/release-desktop.yml on v* tags, one job
+# per OS, artifacts attached to the GitHub release. macOS builds are
+# Developer ID-signed + notarized (issue #103 — the signing secrets live
+# as environment secrets of the `macos-signing` GitHub environment, see
+# the workflow and electron/README.md). No Windows certificate exists:
+# Windows/Linux builds are unsigned, and the release notes disclose that.
 
 appId: io.github.aron98.huddle
 productName: Huddle
@@ -36,19 +37,24 @@ nsis:
 mac:
   target: dmg
   category: public.app-category.video-conferencing
-  # Ad-hoc signing (issue #86): arm64 macOS hard-blocks *unsigned* apps —
-  # Gatekeeper reports them as "broken and can't be opened" — but runs
-  # ad-hoc signed ones. In electron-builder 26.15.3 identity "-" forces an
-  # ad-hoc signature (identity: null would SKIP signing entirely), and the
-  # default entitlements template it pairs with includes
-  # com.apple.security.cs.disable-library-validation, so the app launches.
-  # No certificate is needed on the build machine (CI asserts the
-  # signature — see release-desktop.yml). Ad-hoc is NOT notarized: first
-  # launch still shows a Gatekeeper warning (right-click → Open, or
-  # `xattr -rd com.apple.quarantine /Applications/Huddle.app`). A proper
-  # Developer ID signature + notarization needs the paid Apple Developer
-  # Program — recorded as a follow-up, out of scope here.
-  identity: "-"
+  # Developer ID signing + notarization (issue #103). `identity` is
+  # intentionally OMITTED: electron-builder auto-detects the sole
+  # "Developer ID Application" certificate in the keychain search list
+  # (release-desktop.yml imports it into a dedicated temporary keychain).
+  # An explicit value is a landmine — findIdentity rejects anything that
+  # starts with "Developer ID Application:" (the full CN as printed by
+  # `security find-identity`), `null` would skip signing, and "-" ad-hoc
+  # sign (the old issue #86 workaround, which cannot be notarized).
+  hardenedRuntime: true
+  # notarize: true submits the signed app to Apple via notarytool and
+  # staples the ticket automatically (@electron/notarize). Credentials
+  # come from env in the release workflow: APPLE_ID +
+  # APPLE_APP_SPECIFIC_PASSWORD (secrets) and APPLE_TEAM_ID (derived from
+  # the imported certificate). Caveat: electron-builder 26.15.3 SKIPS
+  # notarization with only a warning when credentials are missing — the
+  # spctl/stapler checks in release-desktop.yml are what actually fail
+  # the build if notarization did not happen.
+  notarize: true
 
 linux:
   target:
