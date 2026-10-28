@@ -1,14 +1,20 @@
 # Desktop bundling: on a pushed v* tag, build the Electron installers
 # (Windows exe, macOS dmg, Linux AppImage + deb) and attach them to the
-# GitHub release. Mirrors release.yml (the server tarball) — one matrix job
+# GitHub release. Mirrors release.yml (the server tarball) — one job
 # per OS because electron-builder produces platform-native artifacts.
 #
-# macOS builds are AD-HOC signed (mac.identity: "-" in
-# electron/electron-builder.yml, issue #86) so Apple Silicon stops
-# reporting the app as "broken and can't be opened"; no certificate is
-# installed on the runner and the workflow asserts the ad-hoc signature
-# after bundling. Windows/Linux builds stay unsigned — SmartScreen/
-# Gatekeeper first-launch warnings are disclosed in the release notes.
+# macOS builds are signed with the org's **Developer ID Application**
+# certificate and notarized (issue #103). The signing + notarization
+# secrets live ONLY as environment secrets of the `macos-signing`
+# GitHub environment, so the macOS work is a dedicated job that opts
+# into that environment; the Windows/Linux matrix job never sees them.
+# That job imports the p12 into a temporary keychain (electron-builder
+# auto-detects the identity from the keychain search list), derives
+# APPLE_TEAM_ID from the imported certificate, notarizes via notarytool
+# (electron-builder staples the ticket), and verifies the result
+# (codesign / spctl / stapler) before anything is uploaded. Windows/Linux
+# builds stay unsigned — SmartScreen first-launch warnings are disclosed
+# in the release notes.
 #
 # The release also carries electron-updater's metadata (latest.yml /
 # latest-linux.yml + blockmaps) so the packaged desktop app can
@@ -31,7 +37,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025, macos-15]
+        # macOS has its own bundle-macos job below so only that job
+        # carries the macos-signing environment (and its secrets).
+        os: [ubuntu-24.04, windows-2025]
     steps:
       - uses: actions/checkout@v5
 
@@ -61,38 +69,163 @@ jobs:
         working-directory: electron
         if: runner.os != 'Windows'
 
-      # Issue #86: arm64 macOS hard-blocks *unsigned* apps ("broken and
-      # can't be opened"). electron-builder leaves the unpacked bundle at
-      # dist/mac*/Huddle.app after the dmg build — assert it carries an
-      # ad-hoc signature (mac.identity: "-").
-      - name: verify ad-hoc signature
-        if: runner.os == 'macOS'
-        working-directory: electron
-        run: |
-          set -euo pipefail
-          app=$(find dist -maxdepth 3 -name 'Huddle.app' -type d | head -n 1)
-          test -n "$app" || { echo "no unpacked Huddle.app found under dist"; exit 1; }
-          log="$RUNNER_TEMP/codesign-dv.log"
-          codesign -dv --verbose=2 "$app" 2>&1 | tee "$log"
-          grep -q 'adhoc' "$log" || {
-            echo "::error::Huddle.app has no ad-hoc signature — arm64 Gatekeeper would report it as broken (issue #86)"
-            exit 1
-          }
-
       - uses: softprops/action-gh-release@v2
         with:
           # latest.yml / latest-linux.yml / *.blockmap feed the desktop
           # app's electron-updater (issue #98): it reads the yml to find
           # the current version + artifact URL and uses the blockmap for
           # differential downloads. Globs that match nothing in a given
-          # matrix job (e.g. latest.yml on the macOS runner) are skipped,
-          # same as the per-OS installer globs below.
+          # matrix job (e.g. latest.yml on the Linux runner) are skipped,
+          # same as the per-OS installer globs.
           files: |
             electron/dist/huddle-*.exe
             electron/dist/huddle-*.exe.blockmap
-            electron/dist/huddle-*.dmg
             electron/dist/huddle-*.AppImage
             electron/dist/huddle-*.AppImage.blockmap
             electron/dist/huddle-*.deb
             electron/dist/latest.yml
             electron/dist/latest-linux.yml
+
+  bundle-macos:
+    name: bundle (macos-15)
+    runs-on: macos-15
+    # The signing + notarization secrets live ONLY in this environment
+    # (issue #103): MAC_CERTS_P12_BASE64, MAC_CERTS_PASSWORD, APPLE_ID,
+    # APPLE_APP_SPECIFIC_PASSWORD — see electron/README.md for the
+    # one-time setup. environment: is job-level, which is exactly why
+    # this is a separate job instead of a matrix leg.
+    environment: macos-signing
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: electron/package-lock.json
+
+      - name: install dev dependencies
+        run: npm ci
+        working-directory: electron
+
+      # Prove the shipped tree before spending minutes on bundling.
+      - name: syntax check + unit tests
+        run: |
+          npm run check
+          npm test
+        working-directory: electron
+
+      # Import the Developer ID Application certificate into a dedicated
+      # temporary keychain (mirrors the recipe electron-builder itself
+      # uses for CSC_LINK). electron-builder's identity auto-detection
+      # (`security find-identity` over the search list) then finds the
+      # sole Developer ID Application cert — electron-builder.yml
+      # deliberately omits `mac.identity`. APPLE_TEAM_ID is derived from
+      # the imported certificate's CN, so it can never mismatch the
+      # signing identity (notarization's APPLE_ID flow requires it).
+      - name: import the Developer ID certificate
+        env:
+          MAC_CERTS_P12_BASE64: ${{ secrets.MAC_CERTS_P12_BASE64 }}
+          MAC_CERTS_PASSWORD: ${{ secrets.MAC_CERTS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/huddle-signing.keychain-db"
+          cert="$RUNNER_TEMP/huddle-certificate.p12"
+          pw="$RUNNER_TEMP/keychain-password"
+          # macOS ships the BSD base64 — decode is -D (GNU --decode
+          # is not accepted there).
+          printf '%s' "$MAC_CERTS_P12_BASE64" | base64 -D -o "$cert"
+          security create-keychain -p "$pw" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$pw" "$keychain"
+          # -T lets /usr/bin/codesign use the imported key; the
+          # partition list is what makes that work non-interactively
+          # (no GUI password prompt on the headless runner).
+          security import "$cert" -k "$keychain" -P "$MAC_CERTS_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$keychain" >/dev/null
+          rm -f "$cert" "$pw"
+          # Prepend to the user's keychain search list. -s REPLACES the
+          # whole list, so re-list the existing entries after ours.
+          # (The tr strips the quotes/indent find-keychains prints;
+          # runner keychain paths contain no spaces.)
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d ' "')
+          security find-identity -v -p codesigning "$keychain" | tee "$RUNNER_TEMP/find-identity.log"
+          # The line looks like:
+          #   1) SHA123 "Developer ID Application: Team Name (TEAMID)"
+          team_id=$(sed -nE 's/.*Developer ID Application.*\(([A-Z0-9]{10})\)".*/\1/p' "$RUNNER_TEMP/find-identity.log" | head -n 1)
+          test -n "$team_id" || { echo "::error::could not derive APPLE_TEAM_ID from the imported certificate"; exit 1; }
+          echo "APPLE_TEAM_ID=$team_id" >> "$GITHUB_ENV"
+
+      - name: build installers
+        run: npx electron-builder --publish never
+        working-directory: electron
+        env:
+          # Notarization credentials (APPLE_ID + app-specific password;
+          # the primary Apple ID password is rejected by the notary API).
+          # APPLE_TEAM_ID came from the import step via GITHUB_ENV — all
+          # three are required by @electron/notarize's APPLE_ID flow.
+          # electron-builder submits via notarytool and staples the
+          # ticket automatically.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+
+      - name: artifact filename smoke check
+        run: ls -la dist
+        working-directory: electron
+
+      # Real verification BEFORE anything is published (issue #103).
+      # Each check covers a distinct failure mode:
+      #   codesign --verify --deep --strict — the seal tree is intact
+      #     and every nested binary is signed with the same identity;
+      #   codesign -dv + Authority grep — catches a silent ad-hoc /
+      #     unsigned fallback (electron-builder only warns when no
+      #     identity is found — it does not fail the build itself);
+      #   spctl --assess --type execute — Gatekeeper's first-launch
+      #     assessment; on macOS 10.15+ it REJECTS Developer ID apps
+      #     that are not notarized, so this is what catches a
+      #     silently-skipped notarization (spctl output must say
+      #     "accepted" and source=Notarized Developer ID);
+      #   xcrun stapler validate — Apple's notarization ticket is
+      #     stapled to this exact bundle (offline validation);
+      #   the dmg mount re-runs spctl + stapler on the app INSIDE the
+      #     shipped dmg — the dmg itself is intentionally unsigned
+      #     (dmg.sign defaults to false), the app inside is what users
+      #     actually install.
+      - name: verify Developer ID signature, notarization and the dmg
+        working-directory: electron
+        run: |
+          set -euo pipefail
+          app=$(find dist -maxdepth 3 -name 'Huddle.app' -type d | head -n 1)
+          test -n "$app" || { echo "no unpacked Huddle.app found under dist"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=2 "$app" 2>&1 | tee "$RUNNER_TEMP/codesign-dv.log"
+          grep -q '^Authority=Developer ID Application' "$RUNNER_TEMP/codesign-dv.log" || {
+            echo "::error::Huddle.app is not Developer ID signed (ad-hoc or unsigned build?)"
+            exit 1
+          }
+          spctl --assess --type execute --verbose "$app"
+          xcrun stapler validate "$app"
+          dmg=$(find dist -maxdepth 1 -name '*.dmg' -type f | head -n 1)
+          test -n "$dmg" || { echo "no dmg found under dist"; exit 1; }
+          mnt="$RUNNER_TEMP/dmg-mount"
+          hdiutil attach -readonly -mountpoint "$mnt" "$dmg"
+          spctl --assess --type execute --verbose "$mnt/Huddle.app"
+          xcrun stapler validate "$mnt/Huddle.app"
+          hdiutil detach "$mnt"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          # macOS ships only the dmg here — the updater feed files
+          # (latest.yml etc.) are attached by the other bundle jobs.
+          files: |
+            electron/dist/huddle-*.dmg
+
+      # Best effort: delete the keychain (also removes it from the
+      # search list) and any secret-bearing scratch files, even if an
+      # earlier step failed.
+      - name: remove the signing keychain
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/huddle-certificate.p12" "$RUNNER_TEMP/keychain-password"
+          security delete-keychain "$RUNNER_TEMP/huddle-signing.keychain-db" 2>/dev/null || true

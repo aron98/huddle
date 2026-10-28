@@ -48,8 +48,10 @@ be a second origin with no server to talk to.
   picker (loopback audio only where Electron supports it: Windows, macOS
   ≥ 13.3), tray with close-to-tray on win32/linux, `huddle://` deep links.
 - Bundling is CI-only on `v*` tags (mirroring the server release pipeline);
-  macOS builds are **ad-hoc signed** (issue #86: arm64 Gatekeeper hard-blocks
-  unsigned apps; `"-"` identity, no Apple Developer Program), Windows/Linux
+  macOS builds were **ad-hoc signed** at decision time (issue #86: arm64
+  Gatekeeper hard-blocks unsigned apps; `"-"` identity, no Apple Developer
+  Program) — superseded by issue #103: Developer ID-signed + notarized
+  via the `macos-signing` GitHub environment secrets. Windows/Linux
   builds are **unsigned**, and the release notes disclose both.
 
 ## Consequences
