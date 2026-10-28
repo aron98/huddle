@@ -47,7 +47,8 @@ connect page. Other scripts:
 - `npm run check` — `node --check` over every shell `.js`/`.mjs` (no Electron
   needed; runs in plain CI)
 - `npm test` — `node --test` over the pure-logic tests (settings, deep
-  links, update policy, icon/PNG invariants, package pins)
+  links, load-error mapping, IPC-bridge wiring, update policy, icon/PNG
+  invariants, package pins)
 - `npm run icons` — regenerate `build/icon.png` / `build/trayTemplate.png`
 - `npm run dist` — local electron-builder build (CI does the real one)
 
@@ -179,8 +180,10 @@ to every `v*` release — the presence of those files is pinned by a
 - Tray icon with close-to-tray on Windows/Linux (guarded: DEs without a
   tray just lose the tray, not the app). macOS uses the Dock convention.
 - First-run connect page; the chosen server origin is persisted to
-  `settings.json` under Electron's `userData` dir. An unreachable server
-  falls back to the connect page with the error instead of a dead tab.
+  `settings.json` under Electron's `userData` dir. A Connect that cannot
+  load the server shows the mapped net error inline on the form; an
+  unreachable saved server falls back to the connect page with the error
+  instead of a dead tab.
 - Self-update from GitHub Releases on Windows/Linux; macOS notifies with
   a download link — see [Auto-update](#auto-update-issue-98).
 
@@ -203,7 +206,9 @@ CI only syntax-checks, unit-tests pure logic, and bundles.
    Esc closes the picker and the client's share state resets (share
    button re-enabled).
 5. First run with no `settings.json`: connect page appears; entering a bad
-   address shows the inline error; a good address connects and persists
+   address shows the inline error; an unreachable address (server down,
+   bad hostname) shows the mapped net error inline with the raw `ERR_*`
+   code; a good address connects and persists
    (restart goes straight to the server).
 6. Kill the server, reload: connect page returns with the error message.
 
