@@ -143,8 +143,8 @@ pub enum EngineCommand {
         id: Uuid,
         sharing: bool,
     },
-    /// Set the simulcast layer a receiver wants from another
-    /// participant's camera track.
+    /// A receiver's legacy per-origin layer preference, mapped onto the
+    /// focus hint by the SFU (ADR 015, D5).
     LayerPreference {
         code: String,
         id: Uuid,
@@ -904,10 +904,11 @@ impl Engine {
         }
     }
 
-    /// Apply a receiver's simulcast layer preference at the SFU. Layer
-    /// choice is per-receiver, so there is nothing to broadcast: the
-    /// media plane starts forwarding the chosen rid (plus a throttled
-    /// keyframe request on the switched-to layer) on the next frames.
+    /// Apply a receiver's legacy layer preference at the SFU, which maps
+    /// it onto the focus hint (ADR 015, D5): `High` focuses `origin`, a
+    /// `Low` for the focused origin clears the focus, any other `Low` is
+    /// a no-op. Old clients still send it; it is never a layer cap.
+    /// Per-receiver, so there is nothing to broadcast.
     fn set_layer_preference(&mut self, code: &str, id: Uuid, origin: Uuid, layer: VideoLayer) {
         let Some(inst) = self.meetings.get_mut(code) else {
             return;

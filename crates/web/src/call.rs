@@ -90,8 +90,9 @@ pub fn MeetingFlow(code: String) -> impl IntoView {
     // The sharer's own capture stream, shown picture-in-picture while
     // the share is live so they see exactly what everyone else sees.
     let share_preview = RwSignal::<Option<MediaStream>>::new(None);
-    // The camera tile currently focused (if any): the focused origin
-    // receives the high simulcast layer, everyone else the low one.
+    // The camera tile currently focused (if any), sent to the SFU as a
+    // hint: it wins the high simulcast layer when not every camera can
+    // have it. The SFU picks every layer itself.
     let focused = RwSignal::<Option<Uuid>>::new(None);
     // Consent UX: true while the organizer records the meeting, told to
     // us by the Welcome (late joiners) and Recording messages.
@@ -1061,8 +1062,8 @@ fn JoiningView() -> impl IntoView {
 }
 
 /// One media tile: a `<video>` bound to `stream` with a caption. Camera
-/// tiles are clickable to focus (which drives the simulcast layer
-/// policy); the local and screen tiles are not.
+/// tiles are clickable to focus (a priority hint for the SFU's simulcast
+/// layers); the local and screen tiles are not.
 #[component]
 fn VideoTile(
     stream: MediaStream,
