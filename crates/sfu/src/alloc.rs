@@ -190,8 +190,10 @@ impl LayerAllocator {
         self.granted.retain(present);
         self.reported.retain(|(o, _)| present(o));
         // Default High: a new subscription starts granted.
+        let mut newcomers = 0;
         for s in sources {
             if !self.known.contains(&s.origin) {
+                newcomers += 1;
                 self.known.push(s.origin);
                 self.granted.push(s.origin);
                 self.reported.push((s.origin, VideoLayer::High));
@@ -210,7 +212,7 @@ impl LayerAllocator {
                 self.upgrade_since = None;
                 (current, SwitchReason::Focus)
             }
-            Some(estimate) => self.target_count(now, estimate, sources.len(), reserve),
+            Some(estimate) => self.target_count(now, estimate, sources.len(), reserve, newcomers),
         };
 
         // Priority: focus, then stickiness, then subscription order.
@@ -267,13 +269,16 @@ impl LayerAllocator {
 
     /// How many High slots the receiver should hold after this round,
     /// and the reason when that differs from now. Applies the
-    /// downshift / hold / backoff rules of ADR 015, D4.
+    /// downshift / hold / backoff rules of ADR 015, D4. `newcomers` of
+    /// the current grants are new subscriptions placed on the default
+    /// High this round.
     fn target_count(
         &mut self,
         now: Instant,
         estimate: Bitrate,
         n: usize,
         reserve: Bitrate,
+        newcomers: usize,
     ) -> (usize, SwitchReason) {
         let current = self.granted.len();
         let keep = slots(estimate.as_f64() * KEEP_UTILIZATION - reserve.as_f64(), n);
@@ -283,13 +288,20 @@ impl LayerAllocator {
         );
         if current > keep {
             self.upgrade_since = None;
-            if self
-                .last_upgrade
-                .is_some_and(|t| now.saturating_duration_since(t) < BACKOFF_WINDOW)
-            {
-                self.hold = (self.hold * 2).min(HOLD_MAX);
+            // A newcomer that does not fit next to the established grants
+            // is placement, not a sign the link failed: no back-off.
+            if current - newcomers > keep {
+                // One back-off per failed upgrade: stepped drops after it
+                // must not double the hold again.
+                if self
+                    .last_upgrade
+                    .take()
+                    .is_some_and(|t| now.saturating_duration_since(t) < BACKOFF_WINDOW)
+                {
+                    self.hold = (self.hold * 2).min(HOLD_MAX);
+                }
+                self.last_downshift = Some(now);
             }
-            self.last_downshift = Some(now);
             return (keep, SwitchReason::Bwe);
         }
         // Budget freed elsewhere (an origin left): taking it back up to
@@ -539,6 +551,57 @@ mod tests {
         let log = run(&mut alloc, t0, &sources, &[(t + 1, 3_300), (t + 62, 3_300)]);
         assert!(log.is_empty(), "{log:?}");
         assert_eq!(alloc.hold, HOLD_INITIAL);
+    }
+
+    #[test]
+    fn stepped_drops_after_one_upgrade_back_off_once() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        let sources = [live(1), live(2), live(3)];
+        // One High fits at t=0; plenty from t=1 s upgrades a second at
+        // t=6 s. Then the link drops in two steps (to one High, then
+        // none) within the back-off window: one failed upgrade, so the
+        // hold doubles once, not twice.
+        let log = run(
+            &mut alloc,
+            t0,
+            &sources,
+            &[(0, 2_000), (1, 20_000), (7, 3_000), (8, 1_000)],
+        );
+        assert_eq!(
+            with_reason(&log, SwitchReason::Recovery).len(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(with_reason(&log, SwitchReason::Bwe).len(), 4, "{log:?}");
+        assert_eq!(alloc.hold, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_newcomer_that_does_not_fit_is_not_a_link_downshift() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        // An upgrade at t=6 s, then a third camera arrives at t=10 s on a
+        // link that carries only two High: the newcomer drops to Low,
+        // without backing off the hold or counting as a downshift.
+        let log = run(
+            &mut alloc,
+            t0,
+            &[live(1), live(2)],
+            &[(0, 2_000), (1, 5_000), (10, 5_000)],
+        );
+        assert_eq!(
+            with_reason(&log, SwitchReason::Recovery).len(),
+            1,
+            "{log:?}"
+        );
+        assert_eq!(
+            alloc.evaluate(at(t0, 10.1), &[live(1), live(2), live(3)], RESERVE),
+            vec![decision(3, VideoLayer::Low, SwitchReason::Bwe)]
+        );
+        assert_eq!(alloc.hold, HOLD_INITIAL);
+        assert_eq!(alloc.last_downshift, None);
+        assert!(alloc.last_upgrade.is_some(), "the upgrade still counts");
     }
 
     #[test]
