@@ -16,7 +16,7 @@ use crate::rtc::{
 use futures::channel::mpsc::UnboundedSender;
 use futures::future::FutureExt;
 use futures::stream::StreamExt;
-use huddle_protocol::{ChatMessage, MeetingDto, Participant, ServerMessage, VideoLayer};
+use huddle_protocol::{ChatMessage, MeetingDto, Participant, ServerMessage};
 use leptos::oco::Oco;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -47,8 +47,9 @@ enum UiAction {
     /// on the live sender via `replaceTrack`.
     PublishCamera,
     /// Focus a participant's camera tile (`Some`) or clear the focus
-    /// (`None`). Drives the simulcast layer policy: the focused origin
-    /// upgrades to the high layer, everyone else stays low.
+    /// (`None`). Sent to the SFU as a hint: it picks the simulcast
+    /// layers, and the focused origin wins the high layer under
+    /// constraint (ADR 015, D5).
     Focus {
         origin: Option<Uuid>,
     },
@@ -842,32 +843,7 @@ async fn run_session(
                         }
                     }
                     UiAction::Focus { origin } => {
-                        // The simulcast layer policy: the focused origin
-                        // gets the high layer, every other camera (and
-                        // any previously focused tile) drops to low.
-                        // Screens and audio ignore the message.
-                        let you = client.you().map(|p| p.id);
-                        let preferences: Vec<(Participant, VideoLayer)> = client
-                            .roster()
-                            .iter()
-                            .filter(|p| Some(p.id) != you)
-                            .map(|p| {
-                                let layer = if origin == Some(p.id) {
-                                    VideoLayer::High
-                                } else {
-                                    VideoLayer::Low
-                                };
-                                (p.clone(), layer)
-                            })
-                            .collect();
-                        let mut failure = None;
-                        for (p, layer) in preferences {
-                            if let Err(e) = client.set_layer_preference(p.id, layer).await {
-                                failure = Some(e);
-                                break;
-                            }
-                        }
-                        if let Some(e) = failure {
+                        if let Err(e) = client.set_focus(origin).await {
                             signals.connection_lost(e.to_string());
                             break;
                         }
@@ -1452,9 +1428,10 @@ fn CallView(
                                     && id.is_some_and(|id| speaking.get().contains(&id));
                                 let is_focused =
                                     !is_screen && focused.get().is_some_and(|f| Some(f) == id);
-                                // Clicking a camera tile focuses it (upgrading
-                                // that origin to the high simulcast layer);
-                                // clicking the focused tile again clears it.
+                                // Clicking a camera tile focuses it (the hint
+                                // that wins the SFU's high simulcast layer
+                                // under constraint); clicking the focused
+                                // tile again clears it.
                                 let on_click = if is_screen {
                                     None
                                 } else {

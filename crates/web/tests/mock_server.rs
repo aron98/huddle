@@ -626,6 +626,22 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
         "roster reflects the stop"
     );
 
+    // --- Focus hint ------------------------------------------------------------
+    client.set_focus(Some(ALICE_ID)).await.unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(m, ClientMessage::Focus { origin: Some(id) } if *id == ALICE_ID))
+            .await,
+        "server should see the focus hint"
+    );
+    client.set_focus(None).await.unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(m, ClientMessage::Focus { origin: None }))
+            .await,
+        "server should see the focus cleared"
+    );
+
     // --- Leave ----------------------------------------------------------------
     client.leave().await.unwrap();
     assert!(

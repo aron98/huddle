@@ -562,6 +562,18 @@ impl<S: SignalingStream, P: PeerConnection> RtcClient<S, P> {
             .map_err(RtcError::from)
     }
 
+    /// Tell the SFU which participant we have on stage (`None` clears
+    /// it). Only a hint: the SFU picks every camera's simulcast layer
+    /// itself, and focus decides who wins the high layer when not every
+    /// camera can have it.
+    pub async fn set_focus(&mut self, origin: Option<ParticipantId>) -> Result<(), RtcError> {
+        self.require_in_call()?;
+        self.signaling
+            .send(ClientMessage::Focus { origin })
+            .await
+            .map_err(RtcError::from)
+    }
+
     /// Leave gracefully. Dropping the client also works (the socket close is
     /// the signal), but this way the roster updates are prompt.
     pub async fn leave(&mut self) -> Result<(), RtcError> {
