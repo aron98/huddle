@@ -62,6 +62,7 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 - **Leptos keyed-`<For>` does not re-render same-key children** when the list is refreshed — the child closure must re-read the signal and find its item by key.
 - **Signaling pump cancel-safety**: read inside `futures::select!` (`read_server_message`), handle OUTSIDE (`handle_server_message`) — dropping the handle future mid-JS-promise loses SdpAnswers and wedges renegotiation (~50% flake before the fix).
 - e2e asserts media by **ssrc snapshots** (`inbound-rtp` framesDecoded) — track identity AND `track.id()` are unusable (provisional wrappers).
+- **Skip `ssrc: 0` in inbound-rtp snapshots**: the SFU's str0m BWE sends probe padding on SSRC 0 (libwebrtc convention), and Chrome reports it as a video inbound-rtp that never decodes a frame. Whether a probe happens before a baseline snapshot is timing-dependent, so including it made e2e-blur flaky on CI only.
 - web-sys 0.3.x: builder methods (`.sdp()`, `.ice_transport_policy()`) are deprecated `&mut Self` chains — use `set_*`.
 - **web-sys `Clone` for `MediaStream` lowers to JS `MediaStream.clone()`** — a TRACK SNAPSHOT (new live track objects), not a reference clone. Publishing `stream.clone()` into signals/holders means later track mutations miss the copy, and cloned mic tracks silently keep device captures open (pinning Chrome per-device audio-processing state). Clone the JsValue handle instead (`MediaStream::from(JsValue::as_ref().clone())`) for a refcount bump and publish the original into signals.
 

@@ -22,10 +22,20 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 /// rid before cutting over anyway (ADR 015, D6).
 const LAYER_SWITCH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A simulcast rid counts as live while its last frame is at most this
-/// old (ADR 015, D2): a sender under uplink pressure stops encoding its
-/// top layer, and receivers must not stay parked on it.
+/// Simulcast liveness window (ADR 015, D2). A rid counts as *recent*
+/// while its last frame is at most this old; a rid silent for longer is
+/// *stalled* once the other layer of the same camera has delivered
+/// [`STALL_FRAMES`] frames without it. A sender under uplink pressure
+/// stops encoding its top layer, and receivers must not stay parked on it.
 const RID_LIVENESS: Duration = Duration::from_millis(1500);
+
+/// Frames the other layer must deliver past a rid's last frame before
+/// that rid counts as stalled. Counting frames, not time, keeps the rule
+/// independent of the frame rate: a resuming sender's layers lead each
+/// other by at most a frame, while a layer that really stopped is
+/// outrun by any number of frames, even at a frame per second or two
+/// (a slow blur pipeline, screen-like content, CPU adaptation).
+const STALL_FRAMES: u32 = 3;
 
 /// A media track flowing *into* the SFU from its origin peer.
 ///
@@ -92,6 +102,12 @@ pub(crate) struct TrackInEntry {
     pub last_keyframe_request: HashMap<Option<Rid>, Instant>,
     /// Arrival time of the latest frame per rid: simulcast liveness.
     pub last_frame: HashMap<Option<Rid>, Instant>,
+    /// `(rid, other)` → frames `other` delivered since `rid`'s last
+    /// frame (or since the track's first frame, if `rid` never did).
+    pub frames_past: HashMap<(Option<Rid>, Option<Rid>), u32>,
+    /// Arrival time of the track's first frame on any rid: a rid that
+    /// never delivered counts as last seen then.
+    pub first_frame: Option<Instant>,
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
@@ -133,6 +149,10 @@ pub(crate) struct TrackOut {
     /// so the receiver never decodes delta frames against the wrong
     /// reference (ADR 015, D6).
     pub pending: Option<(VideoLayer, Instant)>,
+    /// The forwarded layer started without a keyframe (a switch that
+    /// timed out, or one away from a dead layer): the origin is asked
+    /// again every allocation round until a keyframe of it passes.
+    pub keyframe_due: bool,
     pub track_in: Weak<TrackIn>,
     pub state: TrackOutState,
 }
@@ -421,8 +441,18 @@ impl Peer {
     }
 
     /// Feed a timestamp in, advancing str0m's internal state machines.
+    ///
+    /// A failure disconnects the peer, as a failed input does: an `Rtc`
+    /// that cannot advance its timers would keep reporting an overdue
+    /// deadline, and the room removes it on its next poll instead.
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
-        let _ = self.rtc.handle_input(Input::Timeout(now));
+        if let Err(e) = self.rtc.handle_input(Input::Timeout(now)) {
+            tracing::warn!(
+                "peer {} timeout handling failed, disconnecting: {e}",
+                self.id
+            );
+            self.disconnect();
+        }
     }
 
     pub(crate) fn accepts(&self, input: &Input) -> bool {
@@ -463,6 +493,7 @@ impl Peer {
             // Default High (ADR 015): the allocator downshifts from here.
             layer: VideoLayer::High,
             pending: None,
+            keyframe_due: false,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
@@ -718,6 +749,8 @@ impl Peer {
                     track: Arc::clone(&track),
                     last_keyframe_request: HashMap::new(),
                     last_frame: HashMap::new(),
+                    frames_past: HashMap::new(),
+                    first_frame: None,
                 });
                 PollOutcome::TrackOpened(track)
             }
@@ -813,7 +846,39 @@ impl Peer {
     pub(crate) fn note_frame(&mut self, mid: Mid, rid: Option<Rid>, at: Instant) {
         if let Some(entry) = self.tracks_in.iter_mut().find(|e| e.track.mid == mid) {
             entry.last_frame.insert(rid, at);
+            entry.first_frame.get_or_insert(at);
+            entry.frames_past.retain(|(behind, _), _| *behind != rid);
+            for other in &entry.track.rids {
+                if Some(*other) != rid {
+                    *entry.frames_past.entry((Some(*other), rid)).or_insert(0) += 1;
+                }
+            }
         }
+    }
+
+    /// Whether incoming `mid`'s `rid` stalled while `other` (another rid
+    /// of the same camera) kept flowing: `rid` has been silent for more
+    /// than the liveness window, and `other` delivered [`STALL_FRAMES`]
+    /// frames since `rid`'s last one. A pause of both layers is not a
+    /// stall, and neither is the frame by which one layer leads when the
+    /// sender resumes — which an absolute per-rid age check mistakes for
+    /// the other layer being dead. Frame-rate independent: see
+    /// [`STALL_FRAMES`].
+    pub(crate) fn rid_stalled(
+        &self,
+        mid: Mid,
+        rid: Option<Rid>,
+        other: Option<Rid>,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
+            return false;
+        };
+        let Some(rid_at) = entry.last_frame.get(&rid).copied().or(entry.first_frame) else {
+            return false;
+        };
+        let outrun = entry.frames_past.get(&(rid, other)).copied().unwrap_or(0);
+        outrun >= STALL_FRAMES && now.saturating_duration_since(rid_at) > RID_LIVENESS
     }
 
     /// Whether incoming `mid`'s `rid` delivered a frame recently.
@@ -881,15 +946,14 @@ impl Peer {
             // Leaving a layer that no longer delivers frames (a stalled
             // sender, or a subscription with nothing flowing yet): there
             // is nothing to keep forwarding, so switch without the gate.
-            let leaving_live =
-                sources
-                    .iter()
-                    .find(|s| s.origin == d.origin)
-                    .is_some_and(|s| match d.layer {
-                        VideoLayer::High => s.low_live,
-                        VideoLayer::Low => s.high_live,
-                    });
-            let immediate = !leaving_live;
+            let leaving_recent = sources
+                .iter()
+                .find(|s| s.origin == d.origin)
+                .is_some_and(|s| match d.layer {
+                    VideoLayer::High => s.low_recent,
+                    VideoLayer::Low => s.high_recent,
+                });
+            let immediate = !leaving_recent;
             for (mid, rid) in self.switch_layer(d.origin, d.layer, immediate, now) {
                 keyframes.push((d.origin, mid, rid));
             }
@@ -912,13 +976,22 @@ impl Peer {
     }
 
     /// Look up the origin track behind an outgoing `Mid` (used to route
-    /// keyframe requests back to the media source).
-    pub(crate) fn track_in_for_outgoing(&self, mid_out: Mid) -> Option<(PeerId, Mid)> {
-        self.tracks_out
+    /// keyframe requests back to the media source), with the simulcast
+    /// rid this receiver needs a keyframe on: the target of a pending
+    /// switch (the gate cuts over on exactly that keyframe), else the
+    /// forwarded layer. `None` for single-layer sources.
+    ///
+    /// The receiver sees one plain stream per m-line, so its PLI/FIR
+    /// carries no rid — and str0m treats a missing rid as a wildcard
+    /// that picks an arbitrary simulcast layer of the origin's track.
+    pub(crate) fn track_in_for_outgoing(&self, mid_out: Mid) -> Option<(PeerId, Mid, Option<Rid>)> {
+        let out = self
+            .tracks_out
             .iter()
-            .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))
-            .and_then(|t| t.track_in.upgrade())
-            .map(|t| (t.origin, t.mid))
+            .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))?;
+        let track = out.track_in.upgrade()?;
+        let layer = out.pending.map_or(out.layer, |(target, _)| target);
+        Some((track.origin, track.mid, chosen_rid(&track.rids, layer)))
     }
 
     /// Whether the frame's simulcast rid matches the layer forwarded on
@@ -947,12 +1020,46 @@ impl Peer {
             if keyframe || timed_out {
                 out.layer = target;
                 out.pending = None;
+                // Cut over on delta frames: keep asking for a keyframe.
+                out.keyframe_due = !keyframe;
             }
         }
         let Some(rid) = chosen_rid(&track.rids, out.layer) else {
             return true;
         };
-        data.rid == Some(rid)
+        let wanted = data.rid == Some(rid);
+        if wanted && data.is_keyframe() {
+            out.keyframe_due = false;
+        }
+        wanted
+    }
+
+    /// The `(origin, origin mid, rid)` keyframes this receiver still
+    /// waits for: the target of every pending switch, and the forwarded
+    /// layer of every track that started without one.
+    ///
+    /// The origin's keyframe-request throttle is shared by all of its
+    /// receivers and drops requests inside its interval, so a single
+    /// request at switch time can be lost to another receiver's; the
+    /// room re-issues these every allocation round until they land.
+    pub(crate) fn keyframes_wanted(&self) -> Vec<(PeerId, Mid, Rid)> {
+        let mut wanted = Vec::new();
+        for out in &self.tracks_out {
+            if !matches!(out.state, TrackOutState::Open(_)) {
+                continue;
+            }
+            let layer = match out.pending {
+                Some((target, _)) => target,
+                None if out.keyframe_due => out.layer,
+                None => continue,
+            };
+            if let Some(track) = out.track_in.upgrade()
+                && let Some(rid) = chosen_rid(&track.rids, layer)
+            {
+                wanted.push((out.origin, track.mid, rid));
+            }
+        }
+        wanted
     }
 
     /// Forward one media frame to this peer over the outgoing `mid`.
@@ -1089,11 +1196,16 @@ impl Peer {
             if out.pending.is_some_and(|(target, _)| target == layer) {
                 continue;
             }
-            if matches!(out.state, TrackOutState::Open(_)) && !immediate {
+            let open = matches!(out.state, TrackOutState::Open(_));
+            if open && !immediate {
                 out.pending = Some((layer, now));
             } else {
                 out.layer = layer;
                 out.pending = None;
+                // An open track now forwards the new layer from its next
+                // delta frame on. (A track that is not open yet gets its
+                // keyframe from the subscription fan-out.)
+                out.keyframe_due = open;
             }
             if let Some(track) = out.track_in.upgrade()
                 && let Some(rid) = chosen_rid(&track.rids, layer)
@@ -1140,6 +1252,99 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// A peer with one incoming simulcast camera (`high`, `low`) on mid 1.
+    fn camera_peer() -> (Peer, Mid, Option<Rid>, Option<Rid>) {
+        let addr: SocketAddr = "10.0.0.1:40000".parse().unwrap();
+        let mut peer = Peer::new(PeerId::new_v4(), addr, &SimulcastConfig::default()).unwrap();
+        let mid = Mid::from("1");
+        let (high, low) = (Rid::from("high"), Rid::from("low"));
+        let track = Arc::new(TrackIn::new(
+            peer.id,
+            mid,
+            MediaKind::Video,
+            false,
+            vec![high, low],
+        ));
+        peer.tracks_in.push(TrackInEntry {
+            track,
+            last_keyframe_request: HashMap::new(),
+            last_frame: HashMap::new(),
+            frames_past: HashMap::new(),
+            first_frame: None,
+        });
+        (peer, mid, Some(high), Some(low))
+    }
+
+    fn ms(t0: Instant, ms: u64) -> Instant {
+        t0 + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_resuming_sender_is_not_a_stalled_layer() {
+        let (mut peer, mid, high, low) = camera_peer();
+        let t0 = Instant::now();
+        peer.note_frame(mid, high, t0);
+        peer.note_frame(mid, low, t0);
+        // A 3 s pause of both layers, then high's frame lands 30 ms
+        // before low's: low is old, but it was outrun by one frame only.
+        peer.note_frame(mid, high, ms(t0, 3_000));
+        assert!(!peer.rid_stalled(mid, low, high, ms(t0, 3_010)));
+        peer.note_frame(mid, low, ms(t0, 3_030));
+        assert!(!peer.rid_stalled(mid, low, high, ms(t0, 3_040)));
+        assert!(!peer.rid_stalled(mid, high, low, ms(t0, 3_040)));
+    }
+
+    #[test]
+    fn a_dead_layer_is_stalled_even_at_a_low_frame_rate() {
+        let (mut peer, mid, high, low) = camera_peer();
+        let t0 = Instant::now();
+        peer.note_frame(mid, low, t0);
+        peer.note_frame(mid, high, t0);
+        // A slow source (0.5 fps: a slow blur pipeline, screen-like
+        // content): high stops, low keeps going, every gap longer than the
+        // liveness window. The third low frame past high's last decides.
+        for (i, at) in [2_000, 4_000].into_iter().enumerate() {
+            peer.note_frame(mid, low, ms(t0, at));
+            assert!(
+                !peer.rid_stalled(mid, high, low, ms(t0, at + 10)),
+                "stalled after only {} frame(s)",
+                i + 1
+            );
+        }
+        peer.note_frame(mid, low, ms(t0, 6_000));
+        assert!(peer.rid_stalled(mid, high, low, ms(t0, 6_010)));
+        assert!(!peer.rid_stalled(mid, low, high, ms(t0, 6_010)));
+        // High resumes: no longer stalled.
+        peer.note_frame(mid, high, ms(t0, 8_000));
+        assert!(!peer.rid_stalled(mid, high, low, ms(t0, 8_010)));
+    }
+
+    #[test]
+    fn a_layer_that_never_started_is_stalled_after_the_window() {
+        let (mut peer, mid, high, low) = camera_peer();
+        let t0 = Instant::now();
+        // Only low ever delivers (#78 at stream start): 20 fps, but high
+        // is only stalled once the liveness window has passed too.
+        for i in 0..40 {
+            peer.note_frame(mid, low, ms(t0, i * 50));
+        }
+        assert!(!peer.rid_stalled(mid, high, low, ms(t0, 1_000)));
+        assert!(peer.rid_stalled(mid, high, low, ms(t0, 1_960)));
+    }
+
+    #[test]
+    fn a_common_pause_stalls_neither_layer() {
+        let (mut peer, mid, high, low) = camera_peer();
+        let t0 = Instant::now();
+        for i in 0..10 {
+            peer.note_frame(mid, high, ms(t0, i * 50));
+            peer.note_frame(mid, low, ms(t0, i * 50 + 5));
+        }
+        let later = ms(t0, 10_000);
+        assert!(!peer.rid_stalled(mid, high, low, later));
+        assert!(!peer.rid_stalled(mid, low, high, later));
+    }
 
     #[test]
     fn forward_backpressure_sheds_while_other_errors_disconnect() {
