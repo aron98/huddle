@@ -152,6 +152,15 @@ one remote high layer (1.5 Mbps, D2) plus audio from the first frame, so
 the two-person case from #111 is high immediately. The pacer then starts
 at 4 Mbps and settles at 1.1 × the estimate.
 
+The SFU negotiates transport-cc on **video only** (`set_fb_transport_cc(false)`
+on its Opus payload params). str0m sends probe padding on the first
+m-line with transport-cc, which would be the mic, and Chrome surfaces
+padding-only audio packets as empty encoded frames. The E2EE transform
+counts those as decrypt failures (found by e2e-e2ee during #113).
+libwebrtc never pads audio either. Probes therefore ride a forwarded video
+m-line, so `can_probe` only becomes true once the receiver has one, which
+is also the first moment there is anything to allocate.
+
 Each `Peer` owns a `LayerAllocator`, a new pure module `crates/sfu/src/alloc.rs`
 with no str0m `Rtc` and no clock reads. The peer feeds it inputs and
 applies its outputs:
