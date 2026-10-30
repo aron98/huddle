@@ -1458,11 +1458,12 @@ fn a_sender_resuming_after_a_pause_is_not_a_stalled_layer() {
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
 
-    // A pause past the liveness window, then the high layer's frames of
-    // the resumed stream land first (the worst-case skew, held for a
-    // few allocation rounds) before the low layer's.
+    // A pause past the liveness window, then the resumed stream's high
+    // frame lands first — both layers are encoded from the same input
+    // frame, so one layer leads by at most one frame — and the skew is
+    // held for a few allocation rounds before low's frames arrive.
     std::thread::sleep(Duration::from_millis(1_700));
-    a.send_simulcast_gop(cam, "high", HIGH, 3);
+    a.send_simulcast_gop(cam, "high", HIGH, 1);
     drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(400));
     a.send_simulcast_frames(cam, "low", LOW, 3);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
