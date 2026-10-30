@@ -452,8 +452,9 @@ impl BrowserPeerConnection {
     }
 
     /// Publish the local microphone and camera. Camera video goes out as
-    /// three simulcast layers (high quality first), so the SFU can switch
-    /// each subscriber between layers; the microphone stays single-stream.
+    /// two simulcast layers (high quality first; see
+    /// `publish_camera`), so the SFU can switch each subscriber
+    /// between layers; the microphone stays single-stream.
     pub async fn attach_stream(&self, stream: &MediaStream) {
         let tracks = stream.get_tracks();
         for i in 0..tracks.length() {
@@ -527,9 +528,9 @@ impl BrowserPeerConnection {
     /// encodings — a third layer sits at zero bytes forever (observed
     /// with 500/200/100 kbps caps: high and mid consumed the whole
     /// estimate, low never encoded a frame), which starves every
-    /// subscriber the SFU defaults onto the low layer. With two layers
-    /// the low layer is always among the active ones, so late joiners
-    /// and unfocused tiles keep a live picture.
+    /// subscriber the SFU puts on the low layer. With two layers the
+    /// low layer is always among the active ones, so receivers that
+    /// cannot afford the high layer keep a live picture.
     ///
     /// A `setParameters` rejection is non-fatal: the layers keep their
     /// creation-time scale factors and the SFU simply forwards whatever
