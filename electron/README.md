@@ -59,8 +59,14 @@ a windows/ubuntu matrix plus a dedicated macOS job run `npm ci` +
 `electron-builder --publish never` and attach
 `huddle-<version>-<os>-<arch>.{exe,dmg,AppImage,deb}`
 plus the electron-updater feed files (`latest.yml`, `latest-linux.yml`,
-`.blockmap` — see [Auto-update](#auto-update-issue-98)) to the
-GitHub release. **macOS builds are Developer ID-signed and notarized**
+`latest-mac.yml`, `.blockmap` — see [Auto-update](#auto-update-issue-98))
+to the GitHub release. electron-builder only writes those feed files
+when a publish provider is configured, so `electron-builder.yml`
+declares the GitHub provider — CI still passes `--publish never`, which
+makes electron-builder generate the files locally without publishing
+anything (the workflow does the uploading), and asserts each platform's
+feed file exists before upload (a missing feed must fail the release,
+not skip silently). **macOS builds are Developer ID-signed and notarized**
 (issue #103) — the dmg launches on the first try with no Gatekeeper
 warning, and the workflow verifies the signature, the notarization and
 the stapled ticket before upload (see
@@ -68,6 +74,17 @@ the stapled ticket before upload (see
 **Windows/Linux builds are unsigned** — expect a Windows SmartScreen
 first-launch warning; this is disclosed in the release
 notes.
+
+Desktop artifact versions are **derived from the tag**, not
+`package.json`: the workflow passes
+`-c.extraMetadata.version` to electron-builder (v1.1.5 → `1.1.5`), so
+the installer filenames, the embedded app version and the
+`latest*.yml` feeds all carry the release version, and the workflow
+fails the job if no built artifact carries it. `package.json`'s
+`version` (0.1.0) is a dev placeholder that never ships — do not
+hand-bump it per release (that drift is how the v1.1.5 desktop
+artifacts got stuck at `huddle-0.1.0-*`, which would have made
+electron-updater never see any update).
 
 ### macOS signing (issue #103)
 
