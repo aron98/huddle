@@ -158,8 +158,9 @@ impl MockState {
                 id: ALICE_ID,
                 sharing: *sharing,
             }],
-            // Layer preferences and focus hints are consumed by the SFU
-            // with no reply.
+            // Focus hints are consumed by the SFU with no reply. This
+            // client never sends a LayerPreference (the server keeps it
+            // as a legacy alias), but the match must stay exhaustive.
             ClientMessage::LayerPreference { .. }
             | ClientMessage::Focus { .. }
             // SDP answers and leaves close out flows that already got
