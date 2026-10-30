@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use huddle_protocol::{
     ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage, VideoLayer,
 };
-use huddle_sfu::{RecorderSink, Room, SfuOutput};
+use huddle_sfu::{RecorderSink, Room, SfuOutput, SimulcastConfig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -334,9 +334,9 @@ struct MeetingInstance {
 }
 
 impl MeetingInstance {
-    fn new(media_addr: SocketAddr, e2ee: bool) -> Self {
+    fn new(media_addr: SocketAddr, e2ee: bool, simulcast: SimulcastConfig) -> Self {
         Self {
-            room: Room::new(media_addr),
+            room: Room::with_simulcast(media_addr, simulcast),
             participants: HashMap::new(),
             outs: HashMap::new(),
             names: HashSet::new(),
@@ -364,6 +364,8 @@ struct Engine {
     /// at join time.
     turn: Option<TurnRestAuth>,
     max_participants: usize,
+    /// Adaptive simulcast settings for every room (ADR 015).
+    simulcast: SimulcastConfig,
 }
 
 /// Bind the media socket and start the engine + reader threads.
@@ -426,6 +428,13 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
     // Validated here rather than in main so every caller (tests
     // included) gets the same fail-fast on a broken [turn] section.
     let turn = config.turn_selection()?;
+    let simulcast = config.simulcast()?;
+    if let Some(estimate) = simulcast.estimate_override {
+        tracing::warn!(
+            "simulcast_bwe_override_kbps is set: every receiver's layers run on a pinned \
+             {estimate} estimate instead of the measured link (diagnostics/tests only)"
+        );
+    }
 
     let engine = Engine {
         rx,
@@ -435,6 +444,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
         ice_servers,
         turn,
         max_participants: config.max_participants,
+        simulcast,
     };
     thread::Builder::new()
         .name("huddle-engine".into())
@@ -689,7 +699,7 @@ impl Engine {
         let inst = self
             .meetings
             .entry(code.clone())
-            .or_insert_with(|| MeetingInstance::new(self.media_addr, meeting.e2ee));
+            .or_insert_with(|| MeetingInstance::new(self.media_addr, meeting.e2ee, self.simulcast));
         if let Err(e) = inst.room.create_peer(id) {
             tracing::error!(peer = %id, "create_peer failed: {e}");
             reject(reply, ErrorCode::Internal);
