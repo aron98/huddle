@@ -305,6 +305,10 @@ The allocator keeps, per receiver:
   like today's non-adaptive forwarding, without the low default. An
   RR-loss-based (`MediaEgressStats::loss`) downshift is deferred until a
   real non-TWCC client appears.
+  **Behaviour change:** a receiver whose transport never negotiates TWCC,
+  or that has no sending video m-line toward it (transport-cc is
+  video-only, D1), stays frozen at **High** for every camera. Before #113,
+  such a receiver got the **Low** layer unless it focused a tile.
 - **Stale estimate:** the `Twcc` event is edge-triggered. Silence means
   "unchanged", not "unknown", so there is no staleness timeout.
 

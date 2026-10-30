@@ -36,6 +36,11 @@ use crate::turn::{TurnRestAuth, is_turn_url};
 
 /// Worst-case poll cadence when no peer asked to be woken earlier.
 const MAX_SLEEP: Duration = Duration::from_millis(50);
+/// Overdue deadlines served back to back before the loop yields once:
+/// a peer whose deadline never advances must not pin a core.
+const MAX_OVERDUE_STREAK: u32 = 64;
+/// How long the loop yields after such a streak.
+const OVERDUE_YIELD: Duration = Duration::from_millis(1);
 
 /// Why a join was refused, mirrored from [`ErrorCode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +460,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
 
 impl Engine {
     fn run(mut self) {
+        let mut overdue_streak = 0;
         loop {
             while let Ok(cmd) = self.rx.try_recv() {
                 if matches!(cmd, EngineCommand::Shutdown) {
@@ -470,11 +476,20 @@ impl Engine {
             // a steady stream of commands (media packets) kept
             // `recv_timeout` from ever timing out — both starve str0m's
             // timers, which the BWE pacer depends on (ADR 015).
-            if wake.is_some_and(|t| t <= now) {
+            let overdue = wake.is_some_and(|t| t <= now);
+            if overdue && overdue_streak < MAX_OVERDUE_STREAK {
+                overdue_streak += 1;
                 self.handle_timeouts(now);
                 continue;
             }
-            let sleep = wake.map_or(MAX_SLEEP, |t| t - now).min(MAX_SLEEP);
+            let sleep = if overdue {
+                // A deadline that keeps coming back overdue: yield briefly.
+                tracing::debug!("engine deadline still overdue after {overdue_streak} serves");
+                OVERDUE_YIELD
+            } else {
+                wake.map_or(MAX_SLEEP, |t| t - now).min(MAX_SLEEP)
+            };
+            overdue_streak = 0;
 
             match self.rx.recv_timeout(sleep) {
                 Ok(cmd) => {

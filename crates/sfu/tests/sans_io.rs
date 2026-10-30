@@ -1167,6 +1167,68 @@ fn a_recovered_estimate_re_upgrades_only_after_the_hold() {
 }
 
 #[test]
+fn switching_receivers_keep_asking_for_a_keyframe_until_one_arrives() {
+    let mut room = pinned_room(OVERRIDE);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let mut c = TestClient::new(3);
+    let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    c.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, cs| {
+        cs.iter().all(|c| c.connected)
+            && r.peer_tracks(b_id) == Some((1, 3))
+            && r.peer_tracks(c_id) == Some((1, 3))
+    });
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    drain(&mut room, &mut [&mut a, &mut b, &mut c], SETTLE);
+
+    // b and c downshift half a second apart. a's keyframe-request
+    // throttle is per (mid, rid) and shared by every receiver, so c's
+    // own ask is swallowed by b's — and a never answers here. Both
+    // receivers must keep asking (about once per second) through the
+    // gate's timeout and after the keyframe-less cut-over.
+    let before = room.peer_stats(a_id).unwrap().keyframes_requested;
+    room.set_egress_estimate_override(b_id, Some(Bitrate::kbps(500)))
+        .unwrap();
+    let deltas = |room: &mut Room, a: &mut TestClient, b: &mut TestClient, c: &mut TestClient| {
+        a.send_simulcast_frames(cam, "high", HIGH, 2);
+        a.send_simulcast_frames(cam, "low", LOW, 2);
+        drain(room, &mut [a, b, c], Duration::from_millis(250));
+    };
+    deltas(&mut room, &mut a, &mut b, &mut c);
+    deltas(&mut room, &mut a, &mut b, &mut c);
+    room.set_egress_estimate_override(c_id, Some(Bitrate::kbps(500)))
+        .unwrap();
+    for _ in 0..9 {
+        deltas(&mut room, &mut a, &mut b, &mut c);
+    }
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(layer_of(&room, c_id, a_id), Some(VideoLayer::Low));
+    let asked = room.peer_stats(a_id).unwrap().keyframes_requested - before;
+    assert!(asked >= 3, "only {asked} keyframe request(s) in ~2.75 s");
+
+    // A low keyframe answers everyone: the asking stops.
+    a.send_simulcast_gop(cam, "low", LOW, 3);
+    drain(
+        &mut room,
+        &mut [&mut a, &mut b, &mut c],
+        Duration::from_millis(1100),
+    );
+    let settled = room.peer_stats(a_id).unwrap().keyframes_requested;
+    for _ in 0..6 {
+        deltas(&mut room, &mut a, &mut b, &mut c);
+    }
+    assert_eq!(
+        room.peer_stats(a_id).unwrap().keyframes_requested,
+        settled,
+        "still asking for keyframes after one arrived"
+    );
+}
+
+#[test]
 fn late_joiners_start_on_the_high_layer() {
     let mut room = pinned_room(OVERRIDE);
     let mut a = TestClient::new(1);
