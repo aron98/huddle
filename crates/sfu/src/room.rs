@@ -148,6 +148,7 @@ impl Room {
                 egress_desired: p.egress_desired(),
                 bwe_can_probe: p.bwe_can_probe(),
                 layer_upgrade_hold: p.layer_upgrade_hold(),
+                layer_switch_reasons: p.last_switch_reasons(),
             }
         })
     }

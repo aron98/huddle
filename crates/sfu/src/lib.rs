@@ -124,4 +124,9 @@ pub struct PeerStats {
     pub bwe_can_probe: Option<bool>,
     /// The current upgrade hold: the allocator's hysteresis state.
     pub layer_upgrade_hold: Duration,
+    /// The reason of the last layer decision per origin in
+    /// `layer_preferences` (the decision, which may still be waiting for
+    /// its keyframe). An origin never switched from its default High
+    /// has no entry.
+    pub layer_switch_reasons: Vec<(PeerId, SwitchReason)>,
 }

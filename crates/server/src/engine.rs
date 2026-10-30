@@ -161,6 +161,17 @@ pub struct SimulcastLayer {
     /// snapshot was taken.
     pub origin: String,
     pub layer: VideoLayer,
+    /// Why the allocator last switched this subscription; `None` while
+    /// it is still on its default High.
+    #[serde(serialize_with = "serialize_switch_reason")]
+    pub last_switch_reason: Option<SwitchReason>,
+}
+
+fn serialize_switch_reason<S: serde::Serializer>(
+    reason: &Option<SwitchReason>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&reason.map(switch_reason_label), serializer)
 }
 
 /// Everything an async session can ask the engine to do. Sessions are the
@@ -733,6 +744,11 @@ impl Engine {
                             Some(SimulcastLayer {
                                 origin: inst.participants.get(origin)?.name.clone(),
                                 layer: *layer,
+                                last_switch_reason: s
+                                    .layer_switch_reasons
+                                    .iter()
+                                    .find(|(o, _)| o == origin)
+                                    .map(|(_, r)| *r),
                             })
                         })
                         .collect();

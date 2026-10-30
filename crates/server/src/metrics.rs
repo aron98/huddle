@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 
 use huddle_protocol::VideoLayer;
+use huddle_sfu::SwitchReason;
 
 use crate::engine::{PeerReport, StatsReport};
 
@@ -190,7 +191,43 @@ pub fn render(report: &StatsReport) -> String {
         }
     }
 
+    header(
+        &mut out,
+        "huddle_peer_simulcast_last_switch_reason",
+        "gauge",
+        "Reason of the allocator's last layer switch for this peer and origin (0 = bwe, 1 = recovery, 2 = focus, 3 = unavailable); absent while the origin is still on its default high layer.",
+    );
+    for room in &report.rooms {
+        for peer in &room.peers {
+            for sub in &peer.simulcast_layers {
+                let Some(reason) = sub.last_switch_reason else {
+                    continue;
+                };
+                let _ = writeln!(
+                    out,
+                    "huddle_peer_simulcast_last_switch_reason{{room=\"{}\",peer=\"{}\",id=\"{}\",origin=\"{}\"}} {}",
+                    escape(&room.code),
+                    escape(&peer.name),
+                    peer.id,
+                    escape(&sub.origin),
+                    switch_reason_code(reason)
+                );
+            }
+        }
+    }
+
     out
+}
+
+/// The numeric encoding of `huddle_peer_simulcast_last_switch_reason`,
+/// documented in its HELP text; the order of the counter's `reason` labels.
+fn switch_reason_code(reason: SwitchReason) -> u8 {
+    match reason {
+        SwitchReason::Bwe => 0,
+        SwitchReason::Recovery => 1,
+        SwitchReason::Focus => 2,
+        SwitchReason::Unavailable => 3,
+    }
 }
 
 fn header(out: &mut String, name: &str, type_: &str, help: &str) {
@@ -292,6 +329,7 @@ mod tests {
                     simulcast_layers: vec![SimulcastLayer {
                         origin: "bob".into(),
                         layer: VideoLayer::Low,
+                        last_switch_reason: Some(SwitchReason::Bwe),
                     }],
                 }],
             }],
@@ -423,6 +461,35 @@ mod tests {
         assert!(out.contains(
             "huddle_simulcast_layer_switches_total{direction=\"down\",reason=\"unavailable\"} 0\n"
         ));
+    }
+
+    #[test]
+    fn renders_the_last_switch_reason_per_origin() {
+        let series = "huddle_peer_simulcast_last_switch_reason{room=\"ABCD-EFGH-JKLM\",peer=\"alice\",id=\"00000000-0000-0000-0000-000000000000\",origin=\"bob\"}";
+        let out = render(&sample_report(None, None));
+        assert!(out.contains("# TYPE huddle_peer_simulcast_last_switch_reason gauge\n"));
+        assert!(out.contains(
+            "# HELP huddle_peer_simulcast_last_switch_reason Reason of the allocator's last layer switch for this peer and origin (0 = bwe, 1 = recovery, 2 = focus, 3 = unavailable)"
+        ));
+        assert!(out.contains(&format!("{series} 0\n")), "{out}");
+
+        // Every reason has its documented code.
+        let mut report = sample_report(None, None);
+        for (reason, code) in [
+            (SwitchReason::Recovery, 1),
+            (SwitchReason::Focus, 2),
+            (SwitchReason::Unavailable, 3),
+        ] {
+            report.rooms[0].peers[0].simulcast_layers[0].last_switch_reason = Some(reason);
+            assert!(render(&report).contains(&format!("{series} {code}\n")));
+        }
+
+        // Never switched (still on the default High): no sample, while
+        // the layer gauge still reports the subscription.
+        report.rooms[0].peers[0].simulcast_layers[0].last_switch_reason = None;
+        let out = render(&report);
+        assert!(!out.contains("huddle_peer_simulcast_last_switch_reason{"));
+        assert!(out.contains("huddle_peer_simulcast_layer{"));
     }
 
     #[test]

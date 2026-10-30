@@ -1102,6 +1102,7 @@ fn simulcast_defaults_to_high_and_downshifts_on_a_constrained_estimate() {
     assert_eq!(stats.egress_estimate, Some(Bitrate::kbps(500)));
     assert!(stats.egress_desired.is_some_and(|d| !d.is_zero()));
     assert_eq!(stats.layer_upgrade_hold, Duration::from_secs(5));
+    assert_eq!(stats.layer_switch_reasons, vec![(a_id, SwitchReason::Bwe)]);
     assert_eq!(
         count(&b, LOW),
         0,

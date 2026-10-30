@@ -12,7 +12,7 @@ use str0m::media::{
 };
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
-use crate::alloc::{LayerAllocator, Source};
+use crate::alloc::{LayerAllocator, Source, SwitchReason};
 use crate::error::SfuError;
 use crate::{LayerSwitch, PeerId, SimulcastConfig};
 /// Minimum interval between automatic keyframe requests for the same track.
@@ -223,6 +223,9 @@ pub(crate) struct Peer {
     alloc: LayerAllocator,
     /// The desired bitrate last handed to str0m's probe controller.
     desired: Option<Bitrate>,
+    /// The reason of the last layer switch per simulcast origin; an
+    /// origin still on its default High has no entry.
+    last_switch: Vec<(PeerId, SwitchReason)>,
     /// Next [`TrackOut::seq`].
     next_out_seq: u64,
     /// Measured ingress per incoming `(mid, rid)`, from str0m's periodic
@@ -300,6 +303,7 @@ impl Peer {
             stats_prev: None,
             alloc,
             desired: None,
+            last_switch: Vec::new(),
             next_out_seq: 0,
             ingress: HashMap::new(),
         };
@@ -885,6 +889,12 @@ impl Peer {
         self.alloc.can_probe()
     }
 
+    /// The reason of the last layer switch per origin this receiver
+    /// still subscribes to (none for an origin never switched).
+    pub(crate) fn last_switch_reasons(&self) -> Vec<(PeerId, SwitchReason)> {
+        self.last_switch.clone()
+    }
+
     /// The allocator's current upgrade hold (hysteresis state).
     pub(crate) fn layer_upgrade_hold(&self) -> Duration {
         self.alloc.hold()
@@ -906,6 +916,8 @@ impl Peer {
             self.rtc.bwe().set_desired_bitrate(desired);
             self.desired = Some(desired);
         }
+        self.last_switch
+            .retain(|(o, _)| sources.iter().any(|s| s.origin == *o));
         let mut keyframes = Vec::new();
         for d in self.alloc.evaluate(now, sources, reserve) {
             // Two layers: a switch always leaves the other one.
@@ -914,6 +926,10 @@ impl Peer {
                 VideoLayer::Low => VideoLayer::High,
             };
             let estimate = self.alloc.estimate();
+            match self.last_switch.iter_mut().find(|(o, _)| *o == d.origin) {
+                Some(entry) => entry.1 = d.reason,
+                None => self.last_switch.push((d.origin, d.reason)),
+            }
             switches.push(LayerSwitch {
                 receiver: self.id,
                 origin: d.origin,
