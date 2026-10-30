@@ -51,6 +51,7 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 - Pages load with `?test=1` to expose `window.__huddlePc` for getStats probes. `?turn=relay` forces relay-only ICE.
 - Join is gated on the local stream being live — wait for `[data-testid="join-btn"]:not([disabled])`, then `evaluate(() => el.click())` (coordinate clicks race the preview's first-frame reflow).
 - Magic links are **single-use** — a script cannot both fetch and browser-follow the same link.
+- `e2e-call.mjs` boots the server with `HUDDLE_SIMULCAST_BWE_OVERRIDE_KBPS=2500` (diagnostics/test-only knob): one remote high layer + one low fit, two high do not — layer decisions are asserted from `huddle_peer_simulcast_layer`, never from BWE timing.
 - `pkill -x huddle` — NEVER `pkill -f huddle` (matches the invoking shell and kills your own session).
 
 ## Browser quirks (bitten us all, proven by debugging)
@@ -71,6 +72,8 @@ cd test/e2e && CHROME_BIN=<chrome-headless-shell> DUMP_SERVER_LOGS=0 node e2e-ca
 - RTCP (FIR/PLI) is SRTCP-encrypted on the wire — assert keyframes via the SFU-side `keyframes_requested` counter, not by sniffing bytes.
 - `Event::MediaChanged` is unreliable for reshare detection (str0m clears the pending flag internally); offer direction (`media_lines[].direction().is_sending()`) is the authoritative signal.
 - str0m includes all ICE candidates inline in SDP — no server→client trickle on the SFU side.
+- **Adaptive simulcast (ADR 015)**: every peer runs str0m BWE. `enable_bwe` also swaps in a leaky-bucket **pacer** (1.1 × estimate), so the engine must serve overdue `handle_timeout` deadlines promptly. `Event::EgressBitrateEstimate(Twcc)` is **edge-triggered** (3 s smoother, emits only on >5 % change) — silence means "unchanged". Probing above the sent rate only happens with `rtc.bwe().set_desired_bitrate`. The SFU negotiates **transport-cc on video only**: str0m pads its probes onto the first transport-cc m-line, and Chrome surfaces padding on the mic as empty encoded audio frames (E2EE decrypt failures).
+- Layer switches are **keyframe-gated** (current layer flows until the target rid's keyframe, 1 s fallback). sans-io tests must send a GOP (`send_simulcast_gop`; odd marker bytes are VP8 delta frames) to complete a switch, and must **pin the estimate** (`pinned_room` / `Room::set_egress_estimate_override`): the str0m test clients negotiate TWCC, so real in-memory estimates would race assertions.
 
 ## Server
 
