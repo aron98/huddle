@@ -146,6 +146,13 @@ pub enum ClientMessage {
         origin: ParticipantId,
         layer: VideoLayer,
     },
+    /// Hint: this receiver's focused (stage) participant, or none to
+    /// clear it. The SFU arbitrates every camera's simulcast layer itself;
+    /// focus only decides who wins the high layer when bandwidth cannot
+    /// carry it for everyone (ADR 015, D5).
+    Focus {
+        origin: Option<ParticipantId>,
+    },
     /// Opaque E2EE keying envelope, relayed to one other participant
     /// (issue #27 / ADR 010). `payload` is base64 of bytes the server
     /// must not interpret — identity announces, sender keys, and
@@ -403,6 +410,25 @@ mod tests {
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["layer"], "low");
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+    }
+
+    #[test]
+    fn focus_round_trips() {
+        let msg = ClientMessage::Focus {
+            origin: Some(Uuid::nil()),
+        };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            v,
+            json!({"type": "focus", "origin": Uuid::nil().to_string()})
+        );
+        assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
+
+        // Clearing the focus is an explicit null.
+        let msg = ClientMessage::Focus { origin: None };
+        let v = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v, json!({"type": "focus", "origin": null}));
         assert_eq!(serde_json::from_value::<ClientMessage>(v).unwrap(), msg);
     }
 

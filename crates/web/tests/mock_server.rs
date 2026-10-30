@@ -158,8 +158,10 @@ impl MockState {
                 id: ALICE_ID,
                 sharing: *sharing,
             }],
-            // Layer preferences are consumed by the SFU with no reply.
+            // Layer preferences and focus hints are consumed by the SFU
+            // with no reply.
             ClientMessage::LayerPreference { .. }
+            | ClientMessage::Focus { .. }
             // SDP answers and leaves close out flows that already got
             // their replies elsewhere.
             | ClientMessage::SdpAnswer { .. }
@@ -622,6 +624,22 @@ async fn join_publish_chat_and_renegotiation_round_trip() {
             .iter()
             .any(|p| p.id == ALICE_ID && p.sharing),
         "roster reflects the stop"
+    );
+
+    // --- Focus hint ------------------------------------------------------------
+    client.set_focus(Some(ALICE_ID)).await.unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(m, ClientMessage::Focus { origin: Some(id) } if *id == ALICE_ID))
+            .await,
+        "server should see the focus hint"
+    );
+    client.set_focus(None).await.unwrap();
+    assert!(
+        server
+            .saw(|m| matches!(m, ClientMessage::Focus { origin: None }))
+            .await,
+        "server should see the focus cleared"
     );
 
     // --- Leave ----------------------------------------------------------------
