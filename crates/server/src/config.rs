@@ -20,6 +20,8 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
+use huddle_sfu::{Bitrate, SimulcastConfig};
+
 use crate::turn::{TurnRestAuth, is_turn_url};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -98,6 +100,20 @@ pub struct Config {
     /// default) keeps static pairs exactly as before. See
     /// [`TurnConfig`].
     pub turn: Option<TurnConfig>,
+    /// Starting point (kbps) of each participant's egress bandwidth
+    /// estimate, from which the SFU picks simulcast layers per receiver
+    /// (ADR 015). `2000` (the default) carries one remote high layer
+    /// plus audio from the first frame, so a two-person call starts on
+    /// the high layer; the estimate then follows the measured link.
+    pub simulcast_initial_bwe_kbps: u64,
+    /// **Diagnostics and tests only — leave unset in production.** Pins
+    /// every receiver's bandwidth estimate (kbps) for simulcast layer
+    /// selection, disabling adaptation to the real link (the transport
+    /// still estimates and paces as usual). The e2e suite uses it to
+    /// assert layer decisions deterministically
+    /// (`HUDDLE_SIMULCAST_BWE_OVERRIDE_KBPS`). `None` (the default) uses
+    /// the measured estimate.
+    pub simulcast_bwe_override_kbps: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -433,6 +449,8 @@ impl Default for Config {
             stats_token: None,
             rate_limit_per_min: 30,
             turn: None,
+            simulcast_initial_bwe_kbps: 2_000,
+            simulcast_bwe_override_kbps: None,
         }
     }
 }
@@ -657,6 +675,18 @@ impl Config {
         Ok(TlsSelection::Static {
             cert: certs.cert.clone(),
             key: certs.key.clone(),
+        })
+    }
+
+    /// The SFU's adaptive simulcast settings (ADR 015). A zero initial
+    /// estimate would start every receiver starved, so it fails fast.
+    pub fn simulcast(&self) -> anyhow::Result<SimulcastConfig> {
+        if self.simulcast_initial_bwe_kbps == 0 {
+            anyhow::bail!("simulcast_initial_bwe_kbps must be greater than 0");
+        }
+        Ok(SimulcastConfig {
+            initial_estimate: Bitrate::kbps(self.simulcast_initial_bwe_kbps),
+            estimate_override: self.simulcast_bwe_override_kbps.map(Bitrate::kbps),
         })
     }
 
@@ -1080,6 +1110,32 @@ mod tests {
         assert_eq!(config.stats_token, None);
         assert_eq!(config.rate_limit_per_min, 30);
         assert_eq!(config.turn, None);
+        assert_eq!(config.simulcast_initial_bwe_kbps, 2_000);
+        assert_eq!(config.simulcast_bwe_override_kbps, None);
+        assert_eq!(config.simulcast().unwrap(), SimulcastConfig::default());
+    }
+
+    #[test]
+    fn simulcast_settings_load_and_validate() {
+        let config: Config = Figment::from(Serialized::defaults(Config::default()))
+            .merge(Toml::string(
+                "simulcast_initial_bwe_kbps = 1500\nsimulcast_bwe_override_kbps = 2500",
+            ))
+            .extract()
+            .unwrap();
+        assert_eq!(
+            config.simulcast().unwrap(),
+            SimulcastConfig {
+                initial_estimate: Bitrate::kbps(1_500),
+                estimate_override: Some(Bitrate::kbps(2_500)),
+            }
+        );
+
+        let zero = Config {
+            simulcast_initial_bwe_kbps: 0,
+            ..Config::default()
+        };
+        assert!(zero.simulcast().is_err());
     }
 
     #[test]

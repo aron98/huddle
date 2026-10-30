@@ -14,6 +14,7 @@
 //!   renegotiation offers to relay over the signaling channel, and timer
 //!   hints for when to poll again.
 
+mod alloc;
 pub mod error;
 mod peer;
 mod recorder;
@@ -25,8 +26,33 @@ pub use room::{Room, SfuOutput};
 
 /// Alias for the participant identity used across signaling and the SFU.
 pub use huddle_protocol::ParticipantId as PeerId;
+/// Bitrates of the simulcast layer allocation (str0m's own type).
+pub use str0m::bwe::Bitrate;
 
 use huddle_protocol::VideoLayer;
+
+/// Room-wide settings of the adaptive simulcast layer allocation
+/// (ADR 015).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimulcastConfig {
+    /// The egress estimate every peer's bandwidth estimator starts from
+    /// (str0m `enable_bwe`). 2 Mbps carries one remote high layer plus
+    /// audio, so a two-person call starts on High.
+    pub initial_estimate: Bitrate,
+    /// Pin every peer's allocation to this estimate instead of the
+    /// measured one. **Diagnostics and tests only**: it disables
+    /// adaptation to real links (str0m still estimates and paces).
+    pub estimate_override: Option<Bitrate>,
+}
+
+impl Default for SimulcastConfig {
+    fn default() -> Self {
+        Self {
+            initial_estimate: Bitrate::kbps(2_000),
+            estimate_override: None,
+        }
+    }
+}
 
 /// Per-peer counters and link stats, exposed for tests and `/metrics`.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -59,9 +85,9 @@ pub struct PeerStats {
     pub ingress_loss_fraction: Option<f32>,
     /// Packet loss on the wire toward this peer (fraction 0.0–1.0).
     pub egress_loss_fraction: Option<f32>,
-    /// The simulcast layer this peer currently receives from each
+    /// The simulcast layer this peer currently gets forwarded from each
     /// other participant's camera: `(origin, layer)`, one entry per
-    /// origin. Exposed via `/metrics` so a layer switch is provable
+    /// origin. Exposed via `/metrics` so a layer decision is provable
     /// without depending on sender or receiver timing.
     pub layer_preferences: Vec<(PeerId, VideoLayer)>,
 }

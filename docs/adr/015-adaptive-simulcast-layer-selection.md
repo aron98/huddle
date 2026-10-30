@@ -29,7 +29,7 @@ the decision loop that #113–#117 implement.
 | Piece | Where | Behaviour |
 |---|---|---|
 | Layers | `huddle_protocol::VideoLayer { Low, High }` | Two layers on the wire. |
-| Sender encodings | `crates/web/src/rtc/browser.rs` `publish_camera` | Two layers fixed at transceiver creation: rid `high` scale 1.0 at **500 kbps** max, rid `low` scale 4.0 at **100 kbps** max. They cannot change later: `setParameters` is forbidden on E2EE connections (ADR 011, D1). |
+| Sender encodings | `crates/web/src/rtc/browser.rs` `publish_camera` | Two layers fixed at transceiver creation: rid `high` scale 1.0 at **500 kbps** max (raised to 1.5 Mbps by #113, see D2), rid `low` scale 4.0 at **100 kbps** max. They cannot change later: `setParameters` is forbidden on E2EE connections (ADR 011, D1). |
 | Rid order | `TrackIn::rids` | Highest quality first. `chosen_rid` maps `High → first`, `Low → last`. |
 | Per-receiver choice | `TrackOut::layer` | One `VideoLayer` per outgoing camera track. Initialised to `Low`. |
 | Switch | `Room::set_layer_preference` → `Peer::set_layer_preference` | Sets `TrackOut::layer` and sends a throttled FIR on the new rid. `Peer::wants_layer` filters frames by rid **from the next frame on**. Nothing waits for a keyframe, so the receiver decodes inter-frames of the new layer against the wrong reference until the FIR keyframe arrives. |
@@ -147,10 +147,19 @@ job. If a peer does not negotiate TWCC, `can_probe` stays false and no
 ### D1. Enable str0m BWE on every peer; one allocator per receiver
 
 `Peer::new` adds `.enable_bwe(Some(initial))`. `initial` is
-`Config::simulcast_initial_bwe_kbps`, default **1000 kbps**. That covers
-one remote high layer plus audio from the first frame, so the two-person
-case from #111 is high immediately. The pacer then starts at 2 Mbps and
-settles at 1.1 × the estimate.
+`Config::simulcast_initial_bwe_kbps`, default **2000 kbps**. That covers
+one remote high layer (1.5 Mbps, D2) plus audio from the first frame, so
+the two-person case from #111 is high immediately. The pacer then starts
+at 4 Mbps and settles at 1.1 × the estimate.
+
+The SFU negotiates transport-cc on **video only** (`set_fb_transport_cc(false)`
+on its Opus payload params). str0m sends probe padding on the first
+m-line with transport-cc, which would be the mic, and Chrome surfaces
+padding-only audio packets as empty encoded frames. The E2EE transform
+counts those as decrypt failures (found by e2e-e2ee during #113).
+libwebrtc never pads audio either. Probes therefore ride a forwarded video
+m-line, so `can_probe` only becomes true once the receiver has one, which
+is also the first moment there is anything to allocate.
 
 Each `Peer` owns a `LayerAllocator`, a new pure module `crates/sfu/src/alloc.rs`
 with no str0m `Rtc` and no clock reads. The peer feeds it inputs and
@@ -195,9 +204,12 @@ decisions without depending on real BWE (D9).
 ### D2. Layer costs: configured budgets, with measurement used only for liveness
 
 For v1, a layer's cost is the **sender's configured budget**:
-`High = 500 kbps` and `Low = 100 kbps`, mirrored as constants in
+`High = 1500 kbps` and `Low = 100 kbps`, mirrored as constants in
 `crates/sfu/src/alloc.rs` with a comment that ties them to `publish_camera`
-in `browser.rs`. These are the caps the browser encoder works up to under
+in `browser.rs`. (#113 raised the client's high cap from the original
+500 kbps to 1.5 Mbps, by decision of the maintainer: with receivers
+defaulting to High and the SFU downshifting per receiver, the low cap
+was only limiting quality.) These are the caps the browser encoder works up to under
 motion, so allocating against them never overcommits. They are also
 deterministic, which keeps the tests simple. If the budgets in
 `browser.rs` change, the constants change in the same PR.
@@ -221,7 +233,10 @@ When it becomes live again, the allocator re-evaluates without any hold.
 Inputs at time `now` for one receiver:
 
 - `E`: the effective estimate. This is the override if set. Otherwise it is
-  the last `Twcc.estimate`, or `initial` before the first event.
+  the last `Twcc.estimate`. Before the first `Twcc` event the allocator
+  is frozen (D4) and every subscription keeps the default High; str0m
+  emits that first event, carrying `initial`, as soon as a probe-capable
+  video m-line toward the receiver exists.
 - `R`: the non-adaptive reserve. It is 40 kbps per forwarded audio track,
   plus, for each live screen share, its measured ingress rate (its
   `MediaIngressStats`) or **1500 kbps** until a measurement exists. Screens
@@ -253,8 +268,11 @@ Steps:
 
 **Initial allocation is "default High".** A new subscription is placed at
 High, and the first `tick` runs step 2 with `B_keep` across all origins.
-In a two-person call, `E = 1000 kbps` gives `B_keep = 900 − 40 = 860`,
-which is ≥ 500, so the result is High with no client signal at all.
+In a two-person call, `E = 2000 kbps` gives `B_keep = 1800 − 40 = 1760`,
+which is ≥ 1500, so the result is High with no client signal at all. In a
+three-person call the same initial estimate grants one High and one Low
+(`2·100 + 1400 = 1600 ≤ 1720`) until probing raises the estimate:
+a second High needs `B_up ≥ 3000`, i.e. `E ≥ 4.27 Mbps`.
 
 ### D4. Per-receiver state machine and anti-flap
 
@@ -403,9 +421,10 @@ belongs to huddle:
    `simulcast_routes_the_subscribers_chosen_layer` flips its default
    expectation from low to high.
 3. **e2e** (`e2e-call.mjs`). Boot with
-   `HUDDLE_SIMULCAST_BWE_OVERRIDE_KBPS=900`. One High (500) plus two audio
-   streams (80) is 580 ≤ `B_keep` (810). Two High plus two audio is
-   1080 > 810, so exactly one of two remote cameras is High. All
+   `HUDDLE_SIMULCAST_BWE_OVERRIDE_KBPS=2500`. One High (1500) plus one
+   Low (100) plus two audio streams (80) is 1680 ≤ `B_keep` (2250). Two
+   High plus two audio is 3080 > 2250, so exactly one of two remote
+   cameras is High. All
    assertions stay on `huddle_peer_simulcast_layer` (the decision), with
    frame-width checks still gated on sender liveness:
    - Two people: bob ← alice is **high with no focus** (the #111
@@ -446,7 +465,9 @@ belongs to huddle:
   `dropped_frames` (not yet exported to `/metrics`; #115 should add
   `huddle_peer_dropped_frames_total`), RTT and the e2e suites for
   regressions.
-- Configured-budget costs are conservative. Low-motion senders could
+- Configured-budget costs are conservative, more so with the 1.5 Mbps
+  high cap: a webcam rarely fills it, yet two remote High layers need an
+  estimate of about 4.3 Mbps to be granted. Low-motion senders could
   afford more High layers than the allocator grants until measured costs
   arrive.
 - Reaction time is bounded by str0m's 3 s smoother: a real collapse

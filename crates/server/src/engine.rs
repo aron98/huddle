@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use huddle_protocol::{
     ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage, VideoLayer,
 };
-use huddle_sfu::{RecorderSink, Room, SfuOutput};
+use huddle_sfu::{RecorderSink, Room, SfuOutput, SimulcastConfig};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -334,9 +334,9 @@ struct MeetingInstance {
 }
 
 impl MeetingInstance {
-    fn new(media_addr: SocketAddr, e2ee: bool) -> Self {
+    fn new(media_addr: SocketAddr, e2ee: bool, simulcast: SimulcastConfig) -> Self {
         Self {
-            room: Room::new(media_addr),
+            room: Room::with_simulcast(media_addr, simulcast),
             participants: HashMap::new(),
             outs: HashMap::new(),
             names: HashSet::new(),
@@ -364,6 +364,8 @@ struct Engine {
     /// at join time.
     turn: Option<TurnRestAuth>,
     max_participants: usize,
+    /// Adaptive simulcast settings for every room (ADR 015).
+    simulcast: SimulcastConfig,
 }
 
 /// Bind the media socket and start the engine + reader threads.
@@ -426,6 +428,13 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
     // Validated here rather than in main so every caller (tests
     // included) gets the same fail-fast on a broken [turn] section.
     let turn = config.turn_selection()?;
+    let simulcast = config.simulcast()?;
+    if let Some(estimate) = simulcast.estimate_override {
+        tracing::warn!(
+            "simulcast_bwe_override_kbps is set: every receiver's layers run on a pinned \
+             {estimate} estimate instead of the measured link (diagnostics/tests only)"
+        );
+    }
 
     let engine = Engine {
         rx,
@@ -435,6 +444,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
         ice_servers,
         turn,
         max_participants: config.max_participants,
+        simulcast,
     };
     thread::Builder::new()
         .name("huddle-engine".into())
@@ -454,10 +464,17 @@ impl Engine {
             }
 
             let wake = self.poll_outputs();
-            let sleep = wake
-                .and_then(|t| t.checked_duration_since(Instant::now()))
-                .unwrap_or(MAX_SLEEP)
-                .min(MAX_SLEEP);
+            let now = Instant::now();
+            // An overdue deadline is served right away. Otherwise a
+            // deadline already in the past slept the full MAX_SLEEP, and
+            // a steady stream of commands (media packets) kept
+            // `recv_timeout` from ever timing out — both starve str0m's
+            // timers, which the BWE pacer depends on (ADR 015).
+            if wake.is_some_and(|t| t <= now) {
+                self.handle_timeouts(now);
+                continue;
+            }
+            let sleep = wake.map_or(MAX_SLEEP, |t| t - now).min(MAX_SLEEP);
 
             match self.rx.recv_timeout(sleep) {
                 Ok(cmd) => {
@@ -466,15 +483,17 @@ impl Engine {
                     }
                     self.handle(cmd);
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    let now = Instant::now();
-                    for inst in self.meetings.values_mut() {
-                        inst.room.handle_timeout(now);
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) => self.handle_timeouts(Instant::now()),
                 // All handles dropped: nothing left to serve.
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+        }
+    }
+
+    /// Advance every room's state machines to `now`.
+    fn handle_timeouts(&mut self, now: Instant) {
+        for inst in self.meetings.values_mut() {
+            inst.room.handle_timeout(now);
         }
     }
 
@@ -680,7 +699,7 @@ impl Engine {
         let inst = self
             .meetings
             .entry(code.clone())
-            .or_insert_with(|| MeetingInstance::new(self.media_addr, meeting.e2ee));
+            .or_insert_with(|| MeetingInstance::new(self.media_addr, meeting.e2ee, self.simulcast));
         if let Err(e) = inst.room.create_peer(id) {
             tracing::error!(peer = %id, "create_peer failed: {e}");
             reject(reply, ErrorCode::Internal);
