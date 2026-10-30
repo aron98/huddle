@@ -146,6 +146,13 @@ pub enum EngineCommand {
         origin: Uuid,
         layer: VideoLayer,
     },
+    /// Set a receiver's focused participant: the priority hint for the
+    /// SFU's simulcast layer allocation (ADR 015, D5).
+    Focus {
+        code: String,
+        id: Uuid,
+        origin: Option<Uuid>,
+    },
     /// Begin recording a meeting with the given sink. Fails with
     /// [`ErrorCode::MeetingNotLive`] when nobody is in the room and
     /// [`ErrorCode::RecordingActive`] when a recording is running.
@@ -256,6 +263,10 @@ impl EngineHandle {
             origin,
             layer,
         });
+    }
+
+    pub fn focus(&self, code: String, id: Uuid, origin: Option<Uuid>) {
+        let _ = self.tx.send(EngineCommand::Focus { code, id, origin });
     }
 
     /// Install a recording sink on the meeting's live room.
@@ -597,6 +608,7 @@ impl Engine {
             } => {
                 self.set_layer_preference(&code, id, origin, layer);
             }
+            EngineCommand::Focus { code, id, origin } => self.set_focus(&code, id, origin),
             EngineCommand::StartRecording {
                 code,
                 recorder,
@@ -890,6 +902,21 @@ impl Engine {
         }
         if let Err(e) = inst.room.set_layer_preference(id, origin, layer) {
             tracing::debug!(peer = %id, "room set_layer_preference: {e}");
+        }
+    }
+
+    /// Apply a receiver's focus hint at the SFU. Like the layer
+    /// preference it is per-receiver with nothing to broadcast; the SFU
+    /// re-runs that receiver's layer allocation at once.
+    fn set_focus(&mut self, code: &str, id: Uuid, origin: Option<Uuid>) {
+        let Some(inst) = self.meetings.get_mut(code) else {
+            return;
+        };
+        if !inst.participants.contains_key(&id) {
+            return;
+        }
+        if let Err(e) = inst.room.set_focus(id, origin) {
+            tracing::debug!(peer = %id, "room set_focus: {e}");
         }
     }
 

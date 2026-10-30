@@ -158,8 +158,9 @@ async fn run_session(socket: WebSocket, state: AppState) {
                     ClientMessage::LayerPreference { origin, layer } => {
                         engine.layer_preference(code.clone(), id, origin, layer);
                     }
-                    // Not routed to the SFU yet; ignoring a hint is safe.
-                    ClientMessage::Focus { .. } => {}
+                    ClientMessage::Focus { origin } => {
+                        engine.focus(code.clone(), id, origin);
+                    }
                     // Opaque ciphertext to this server (ADR 010):
                     // size-capped, never inspected, never persisted;
                     // the engine relays it only to the addressee.
