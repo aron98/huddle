@@ -182,9 +182,30 @@ impl TestClient {
         mid
     }
 
-    /// Send `n` vp8 frames on one simulcast layer (`rid`), every payload
-    /// starting with `marker` so the receiver can tell layers apart.
+    /// Send `n` vp8 delta frames on one simulcast layer (`rid`), every
+    /// payload starting with `marker` so the receiver can tell layers
+    /// apart. Markers are odd: VP8 flags a keyframe with a clear low bit
+    /// in the first payload byte, so these never complete a
+    /// keyframe-gated layer switch.
     fn send_simulcast_frames(&mut self, mid: str0m::media::Mid, rid: &str, marker: u8, n: usize) {
+        self.write_simulcast(mid, rid, marker, n, false);
+    }
+
+    /// Like [`TestClient::send_simulcast_frames`], but the first frame is
+    /// a keyframe (marker `marker & !1`) — a GOP that lets a pending
+    /// layer switch cut over to `rid`.
+    fn send_simulcast_gop(&mut self, mid: str0m::media::Mid, rid: &str, marker: u8, n: usize) {
+        self.write_simulcast(mid, rid, marker, n, true);
+    }
+
+    fn write_simulcast(
+        &mut self,
+        mid: str0m::media::Mid,
+        rid: &str,
+        marker: u8,
+        n: usize,
+        keyframe_first: bool,
+    ) {
         let pt = self
             .rtc
             .codec_config()
@@ -194,7 +215,13 @@ impl TestClient {
             .pt();
         for i in 0..n {
             let time = MediaTime::from_millis(20 * i as u64);
-            let data = vec![marker; 120];
+            let first = if keyframe_first && i == 0 {
+                marker & !1
+            } else {
+                marker
+            };
+            let mut data = vec![marker; 120];
+            data[0] = first;
             self.rtc
                 .writer(mid)
                 .unwrap()
@@ -935,8 +962,9 @@ fn screen_share_audio_is_negotiated_forwarded_and_stateful() {
 }
 
 /// Simulcast markers: one byte per layer, first payload byte on the wire.
+/// Odd values are delta frames; `marker & !1` is the layer's keyframe.
 const HIGH: u8 = 0xC1;
-const MID: u8 = 0xC2;
+const MID: u8 = 0xC5;
 const LOW: u8 = 0xC3;
 /// Long enough for frames written now to surface and for the SFU's 1s
 /// keyframe-request throttle to age out.
@@ -986,20 +1014,45 @@ fn simulcast_routes_the_subscribers_chosen_layer() {
         after_switch,
         "repeat preference was not throttled"
     );
+    // The switch is keyframe-gated: high delta frames alone do not cut
+    // over, the low layer keeps flowing meanwhile, and peer_stats (the
+    // /metrics source) still reports the forwarded low layer.
+    let low_gated = b.media_rx_markers.get(&LOW).copied().unwrap_or(0);
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    assert!(
+        !b.media_rx_markers.contains_key(&HIGH),
+        "high delta frames leaked before the high keyframe"
+    );
+    assert!(
+        b.media_rx_markers.get(&LOW).is_some_and(|n| *n > low_gated),
+        "the low layer stopped before the switch completed"
+    );
+    assert_eq!(
+        room.peer_stats(b_id).unwrap().layer_preferences,
+        vec![(a_id, VideoLayer::Low)],
+        "a pending switch must keep reporting the forwarded layer"
+    );
+
+    // b now receives the high layer instead of the low one, from the
+    // high keyframe on.
+    let (low_before, high_before) = (
+        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
+        b.media_rx_markers.get(&HIGH).copied().unwrap_or(0),
+    );
+    a.send_simulcast_gop(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        b.media_rx_markers.contains_key(&(HIGH & !1)),
+        "the high keyframe did not open the switched-to layer"
+    );
     assert_eq!(
         room.peer_stats(b_id).unwrap().layer_preferences,
         vec![(a_id, VideoLayer::High)],
         "the switch must be visible in peer_stats (rendered via /metrics)"
     );
-
-    // b now receives the high layer instead of the low one.
-    let (low_before, high_before) = (
-        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
-        b.media_rx_markers.get(&HIGH).copied().unwrap_or(0),
-    );
-    a.send_simulcast_frames(cam, "high", HIGH, 5);
-    a.send_simulcast_frames(cam, "low", LOW, 5);
-    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert!(
         b.media_rx_markers
             .get(&HIGH)
@@ -1021,13 +1074,13 @@ fn simulcast_routes_the_subscribers_chosen_layer() {
         before + 1,
         "switching to low did not request a keyframe"
     );
+    a.send_simulcast_gop(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert_eq!(
         room.peer_stats(b_id).unwrap().layer_preferences,
         vec![(a_id, VideoLayer::Low)],
         "the fallback must be visible in peer_stats (rendered via /metrics)"
     );
-    a.send_simulcast_frames(cam, "low", LOW, 5);
-    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert!(
         b.media_rx_markers
             .get(&LOW)
@@ -1112,7 +1165,7 @@ fn screen_shares_ignore_layer_preferences() {
     // Focusing (high layer) must not touch the single-layer screen.
     room.set_layer_preference(b_id, a_id, VideoLayer::High)
         .unwrap();
-    a.send_simulcast_frames(cam, "high", HIGH, 5);
+    a.send_simulcast_gop(cam, "high", HIGH, 5);
     a.send_simulcast_frames(cam, "low", LOW, 5);
     a.send_screen_frames(screen, 5);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);

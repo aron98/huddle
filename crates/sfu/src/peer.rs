@@ -16,6 +16,10 @@ use crate::error::SfuError;
 /// Minimum interval between automatic keyframe requests for the same track.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a pending layer switch waits for a keyframe on the target
+/// rid before cutting over anyway (ADR 015, D6).
+const LAYER_SWITCH_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// A media track flowing *into* the SFU from its origin peer.
 ///
 /// The origin peer's [`Peer`] holds the strong reference; every other peer
@@ -108,9 +112,15 @@ pub(crate) struct TrackOut {
     /// Copied from the source [`TrackIn`]: decides the msid the SFU
     /// labels this m-line with (plain origin id vs `"{origin}-screen"`).
     pub screen: bool,
-    /// The simulcast layer this receiver asked for on `origin`'s camera
+    /// The simulcast layer currently forwarded from `origin`'s camera
     /// (screens stay single-layer and are never filtered).
     pub layer: VideoLayer,
+    /// A switch waiting for a keyframe on the target layer's rid, and
+    /// when it was asked for. Until that keyframe arrives (or
+    /// [`LAYER_SWITCH_TIMEOUT`] passes) the current layer keeps flowing,
+    /// so the receiver never decodes delta frames against the wrong
+    /// reference (ADR 015, D6).
+    pub pending: Option<(VideoLayer, Instant)>,
     pub track_in: Weak<TrackIn>,
     pub state: TrackOutState,
 }
@@ -400,6 +410,7 @@ impl Peer {
             kind: track_in.kind,
             screen: track_in.screen,
             layer: VideoLayer::Low,
+            pending: None,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
@@ -727,13 +738,17 @@ impl Peer {
             .map(|t| (t.origin, t.mid))
     }
 
-    /// Whether the frame's simulcast rid matches the layer this receiver
-    /// asked for on the outgoing track. Non-simulcast sources (audio,
-    /// screens, legacy cameras) always match.
-    fn wants_layer(&self, mid_out: Mid, data: &MediaData) -> bool {
+    /// Whether the frame's simulcast rid matches the layer forwarded on
+    /// the outgoing track. Non-simulcast sources (audio, screens, legacy
+    /// cameras) always match.
+    ///
+    /// A pending switch completes here: on the first keyframe of the
+    /// target rid, or on any frame once [`LAYER_SWITCH_TIMEOUT`] has
+    /// passed without one (frame arrival times keep this sans-io).
+    fn wants_layer(&mut self, mid_out: Mid, data: &MediaData) -> bool {
         let Some(out) = self
             .tracks_out
-            .iter()
+            .iter_mut()
             .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))
         else {
             return true;
@@ -741,6 +756,16 @@ impl Peer {
         let Some(track) = out.track_in.upgrade() else {
             return true;
         };
+        if let Some((target, since)) = out.pending {
+            let target_rid = chosen_rid(&track.rids, target);
+            let keyframe = data.rid.is_some() && data.rid == target_rid && data.is_keyframe();
+            let timed_out =
+                data.network_time.saturating_duration_since(since) >= LAYER_SWITCH_TIMEOUT;
+            if keyframe || timed_out {
+                out.layer = target;
+                out.pending = None;
+            }
+        }
         let Some(rid) = chosen_rid(&track.rids, out.layer) else {
             return true;
         };
@@ -856,17 +881,35 @@ impl Peer {
     /// tracks (screens and audio are never filtered). Returns the
     /// `(origin mid, rid)` pairs a keyframe should be requested on for the
     /// newly chosen layer — one per simulcast camera track of `origin`.
+    ///
+    /// On an open track the switch is keyframe-gated: the current layer
+    /// keeps flowing until the target rid delivers a keyframe (see
+    /// [`Peer::wants_layer`]). A track that is not open yet forwards
+    /// nothing, so it switches at once.
     pub(crate) fn set_layer_preference(
         &mut self,
         origin: PeerId,
         layer: VideoLayer,
+        now: Instant,
     ) -> Vec<(Mid, Rid)> {
         let mut keyframes = Vec::new();
         for out in self.tracks_out.iter_mut() {
             if out.origin != origin || out.screen || !matches!(out.kind, MediaKind::Video) {
                 continue;
             }
-            out.layer = layer;
+            if out.layer == layer {
+                // Back to the layer still flowing: drop any pending switch.
+                out.pending = None;
+                continue;
+            }
+            if out.pending.is_some_and(|(target, _)| target == layer) {
+                continue;
+            }
+            if matches!(out.state, TrackOutState::Open(_)) {
+                out.pending = Some((layer, now));
+            } else {
+                out.layer = layer;
+            }
             if let Some(track) = out.track_in.upgrade()
                 && let Some(rid) = chosen_rid(&track.rids, layer)
             {
@@ -876,10 +919,11 @@ impl Peer {
         keyframes
     }
 
-    /// The `(origin, layer)` preference this receiver currently holds
-    /// for every other peer's camera it subscribes to (one entry per
-    /// origin; screens and audio are never layer-filtered). Exposed via
-    /// `/metrics` so layer switches are observable without a browser.
+    /// The `(origin, layer)` this receiver currently gets forwarded from
+    /// every other peer's camera it subscribes to (one entry per origin;
+    /// screens and audio are never layer-filtered). A keyframe-gated
+    /// switch shows up once it has cut over. Exposed via `/metrics` so
+    /// layer switches are observable without a browser.
     pub(crate) fn layer_preferences(&self) -> Vec<(PeerId, VideoLayer)> {
         let mut prefs = Vec::new();
         for out in &self.tracks_out {

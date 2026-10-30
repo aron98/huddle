@@ -205,15 +205,18 @@ impl Room {
 
     /// Set the simulcast layer `receiver` wants from `origin`'s camera
     /// tracks, and ask the origin for a keyframe on the newly chosen
-    /// layer (throttled per layer) so the switch lands on a decodable
-    /// frame quickly. Screens and audio are unaffected.
+    /// layer (throttled per layer). The switch cuts over on that
+    /// keyframe, so it always lands on a decodable frame. Screens and
+    /// audio are unaffected.
     pub fn set_layer_preference(
         &mut self,
         receiver: PeerId,
         origin: PeerId,
         layer: VideoLayer,
     ) -> Result<(), SfuError> {
-        let keyframes = self.peer_mut(receiver)?.set_layer_preference(origin, layer);
+        let keyframes =
+            self.peer_mut(receiver)?
+                .set_layer_preference(origin, layer, Instant::now());
         for (mid_in, rid) in keyframes {
             if let Some(origin_peer) = self.peers.get_mut(&origin) {
                 origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
