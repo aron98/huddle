@@ -250,7 +250,7 @@ impl Peer {
     ) -> Result<Peer, SfuError> {
         // The server is the ICE-lite side: it never gathers, it just
         // advertises its single media address in every SDP it produces.
-        let rtc = Rtc::builder()
+        let mut config = Rtc::builder()
             .set_ice_lite(true)
             .clear_codecs()
             .enable_opus(true, false)
@@ -260,8 +260,19 @@ impl Peer {
             // TWCC-driven egress bandwidth estimation (ADR 015): drives
             // the per-receiver simulcast layers. Also turns on str0m's
             // pacer (1.1 × the estimate).
-            .enable_bwe(Some(simulcast.initial_estimate))
-            .build(Instant::now());
+            .enable_bwe(Some(simulcast.initial_estimate));
+        // transport-cc on video only. str0m sends its BWE probe padding
+        // on the first m-line that negotiated transport-cc, which would
+        // be the mic: Chrome surfaces padding-only audio packets as
+        // empty encoded frames, which the E2EE transform then counts as
+        // decrypt failures (libwebrtc itself never pads audio). Without
+        // it on Opus, probes ride a forwarded video m-line instead.
+        for params in config.codec_config().iter_mut() {
+            if params.spec().codec.is_audio() {
+                params.set_fb_transport_cc(false);
+            }
+        }
+        let rtc = config.build(Instant::now());
         let mut alloc = LayerAllocator::default();
         alloc.set_override(simulcast.estimate_override);
 

@@ -403,6 +403,32 @@ fn single_client_connects_and_streams() {
 }
 
 #[test]
+fn transport_cc_is_negotiated_on_video_only() {
+    // BWE probe padding rides the first m-line with transport-cc; on the
+    // mic, browsers surface it as empty audio frames (see Peer::new).
+    let mut room = Room::new(MEDIA_ADDR);
+    let mut a = TestClient::new(1);
+    a.join(&mut room);
+    let mut changes = a.rtc.sdp_api();
+    changes.add_media(MediaKind::Video, Direction::SendRecv, None, None, None);
+    let (offer, _pending) = changes.apply().unwrap();
+    let answer = room.answer_sdp_offer(a.id, &offer.to_sdp_string()).unwrap();
+    let pt_of = |codec: &str| {
+        answer
+            .lines()
+            .find_map(|l| {
+                let rest = l.strip_prefix("a=rtpmap:")?;
+                let (pt, name) = rest.split_once(' ')?;
+                name.starts_with(codec).then(|| pt.to_owned())
+            })
+            .unwrap_or_else(|| panic!("no {codec} in the answer:\n{answer}"))
+    };
+    let has_twcc = |pt: &str| answer.contains(&format!("a=rtcp-fb:{pt} transport-cc"));
+    assert!(!has_twcc(&pt_of("opus")), "transport-cc on opus:\n{answer}");
+    assert!(has_twcc(&pt_of("VP8")), "no transport-cc on VP8:\n{answer}");
+}
+
+#[test]
 fn two_clients_exchange_media_both_ways() {
     let mut room = Room::new(MEDIA_ADDR);
     let mut c1 = TestClient::new(1);
