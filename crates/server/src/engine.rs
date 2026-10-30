@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use huddle_protocol::{
     ErrorCode, IceServer, PROTOCOL_VERSION, Participant, ServerMessage, VideoLayer,
 };
-use huddle_sfu::{RecorderSink, Room, SfuOutput, SimulcastConfig};
+use huddle_sfu::{LayerSwitch, RecorderSink, Room, SfuOutput, SimulcastConfig, SwitchReason};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -53,6 +53,61 @@ pub struct JoinRejected {
 pub struct StatsReport {
     /// One entry per live meeting room.
     pub rooms: Vec<RoomReport>,
+    /// Server-wide simulcast layer switches since start, one entry per
+    /// `(direction, reason)` — at most 8, never per peer (ADR 015, D7).
+    pub layer_switches: Vec<LayerSwitchCount>,
+}
+
+/// One series of the server-wide layer switch counter.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LayerSwitchCount {
+    /// `up` (to the high layer) or `down`.
+    pub direction: &'static str,
+    /// [`switch_reason_label`] of the allocator's reason.
+    pub reason: &'static str,
+    pub count: u64,
+}
+
+/// Every reason the allocator attributes, in label order.
+const SWITCH_REASONS: [SwitchReason; 4] = [
+    SwitchReason::Bwe,
+    SwitchReason::Recovery,
+    SwitchReason::Focus,
+    SwitchReason::Unavailable,
+];
+
+/// The `reason` label (and log field) of a layer switch.
+pub fn switch_reason_label(reason: SwitchReason) -> &'static str {
+    match reason {
+        SwitchReason::Bwe => "bwe",
+        SwitchReason::Recovery => "recovery",
+        SwitchReason::Focus => "focus",
+        SwitchReason::Unavailable => "unavailable",
+    }
+}
+
+/// The `direction` label of a switch to `layer`.
+fn switch_direction_label(layer: VideoLayer) -> &'static str {
+    match layer {
+        VideoLayer::High => "up",
+        VideoLayer::Low => "down",
+    }
+}
+
+/// All 8 counter series, zeroed, so every series exists from the first
+/// scrape (a counter appearing mid-flight hides its first increment
+/// from `rate()`).
+pub(crate) fn zeroed_layer_switches() -> Vec<LayerSwitchCount> {
+    ["up", "down"]
+        .into_iter()
+        .flat_map(|direction| {
+            SWITCH_REASONS.map(|reason| LayerSwitchCount {
+                direction,
+                reason: switch_reason_label(reason),
+                count: 0,
+            })
+        })
+        .collect()
 }
 
 /// One live meeting room.
@@ -79,6 +134,18 @@ pub struct PeerReport {
     pub rtt_ms: Option<u64>,
     pub ingress_loss_fraction: Option<f32>,
     pub egress_loss_fraction: Option<f32>,
+    /// Media frames shed toward this peer by egress backpressure.
+    pub dropped_frames: u64,
+    /// The egress estimate this peer's layer allocation runs on
+    /// (override included), bits per second.
+    pub egress_estimate_bps: Option<u64>,
+    /// The desired bitrate handed to str0m's probe controller, bits per
+    /// second.
+    pub egress_desired_bps: Option<u64>,
+    /// str0m's `can_probe` from the last estimate.
+    pub bwe_can_probe: Option<bool>,
+    /// The allocator's current upgrade hold, seconds (hysteresis state).
+    pub layer_upgrade_hold_seconds: f64,
     /// Which simulcast layer this peer currently receives from each
     /// other participant's camera. Rendered as
     /// `huddle_peer_simulcast_layer` so layer switches are provable from
@@ -371,6 +438,8 @@ struct Engine {
     max_participants: usize,
     /// Adaptive simulcast settings for every room (ADR 015).
     simulcast: SimulcastConfig,
+    /// The server-wide layer switch counter (see [`StatsReport`]).
+    layer_switches: Vec<LayerSwitchCount>,
 }
 
 /// Bind the media socket and start the engine + reader threads.
@@ -450,6 +519,7 @@ pub fn spawn(config: &Config) -> anyhow::Result<(EngineHandle, SocketAddr)> {
         turn,
         max_participants: config.max_participants,
         simulcast,
+        layer_switches: zeroed_layer_switches(),
     };
     thread::Builder::new()
         .name("huddle-engine".into())
@@ -507,8 +577,14 @@ impl Engine {
 
     /// Advance every room's state machines to `now`.
     fn handle_timeouts(&mut self, now: Instant) {
-        for inst in self.meetings.values_mut() {
+        for (code, inst) in self.meetings.iter_mut() {
             inst.room.handle_timeout(now);
+            // Focus changes switch outside the timeout too; their
+            // decisions wait in the room and are picked up here.
+            for switch in inst.room.drain_layer_switches() {
+                count_layer_switch(&mut self.layer_switches, &switch);
+                log_layer_switch(code, inst, &switch);
+            }
         }
     }
 
@@ -673,6 +749,11 @@ impl Engine {
                         rtt_ms: s.rtt_ms,
                         ingress_loss_fraction: s.ingress_loss_fraction,
                         egress_loss_fraction: s.egress_loss_fraction,
+                        dropped_frames: s.dropped_frames,
+                        egress_estimate_bps: s.egress_estimate.map(|b| b.as_u64()),
+                        egress_desired_bps: s.egress_desired.map(|b| b.as_u64()),
+                        bwe_can_probe: s.bwe_can_probe,
+                        layer_upgrade_hold_seconds: s.layer_upgrade_hold.as_secs_f64(),
                         simulcast_layers,
                     }
                 })
@@ -684,7 +765,10 @@ impl Engine {
             });
         }
         rooms.sort_by(|a, b| a.code.cmp(&b.code));
-        StatsReport { rooms }
+        StatsReport {
+            rooms,
+            layer_switches: self.layer_switches.clone(),
+        }
     }
 
     fn join(
@@ -1092,12 +1176,77 @@ impl Engine {
     }
 }
 
+/// Bump the server-wide counter series of one layer switch.
+fn count_layer_switch(counts: &mut [LayerSwitchCount], switch: &LayerSwitch) {
+    let direction = switch_direction_label(switch.to);
+    let reason = switch_reason_label(switch.reason);
+    if let Some(series) = counts
+        .iter_mut()
+        .find(|c| c.direction == direction && c.reason == reason)
+    {
+        series.count += 1;
+    }
+}
+
+/// The per-switch structured log (ADR 015, D7): the last transition and
+/// its reason live here rather than in a per-peer labelled metric.
+fn log_layer_switch(code: &str, inst: &MeetingInstance, switch: &LayerSwitch) {
+    let name = |id: &Uuid| inst.participants.get(id).map(|p| p.name.as_str());
+    tracing::info!(
+        room = %code,
+        receiver = %switch.receiver,
+        receiver_name = name(&switch.receiver),
+        origin = %switch.origin,
+        origin_name = name(&switch.origin),
+        from = ?switch.from,
+        to = ?switch.to,
+        reason = switch_reason_label(switch.reason),
+        estimate_bps = switch.estimate.map(|b| b.as_u64()),
+        budget_bps = switch.budget.map(|b| b.as_u64()),
+        "simulcast layer switch"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use huddle_protocol::MeetingDto;
     use std::sync::Arc;
     use tokio::sync::mpsc::unbounded_channel;
+
+    #[test]
+    fn layer_switches_count_by_direction_and_reason() {
+        let mut counts = zeroed_layer_switches();
+        let switch = |to, reason| LayerSwitch {
+            receiver: Uuid::nil(),
+            origin: Uuid::nil(),
+            from: match to {
+                VideoLayer::High => VideoLayer::Low,
+                VideoLayer::Low => VideoLayer::High,
+            },
+            to,
+            reason,
+            estimate: None,
+            budget: None,
+        };
+        count_layer_switch(&mut counts, &switch(VideoLayer::Low, SwitchReason::Bwe));
+        count_layer_switch(&mut counts, &switch(VideoLayer::Low, SwitchReason::Bwe));
+        count_layer_switch(
+            &mut counts,
+            &switch(VideoLayer::High, SwitchReason::Recovery),
+        );
+        let count = |direction: &str, reason: &str| {
+            counts
+                .iter()
+                .find(|c| c.direction == direction && c.reason == reason)
+                .map(|c| c.count)
+        };
+        assert_eq!(counts.len(), 8);
+        assert_eq!(count("down", "bwe"), Some(2));
+        assert_eq!(count("up", "recovery"), Some(1));
+        assert_eq!(count("up", "bwe"), Some(0));
+        assert_eq!(count("down", "focus"), Some(0));
+    }
 
     fn test_engine(max_participants: usize) -> (EngineHandle, Arc<()>) {
         // The Arc is a cheap way to keep the handle alive until the test
