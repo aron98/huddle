@@ -285,6 +285,36 @@ async function main() {
     await waitMedia(alice, 'bob', 'alice');
     await waitMedia(bob, 'alice', 'bob');
 
+    // DIAG (ci-debug only): per-rid sender / receiver stats every 2 s.
+    const diagStats = async (page, who) => {
+      try {
+        const out = await page.evaluate(async () => {
+          const rows = [];
+          (await window.__huddlePc.getStats()).forEach((r) => {
+            if ((r.type === 'outbound-rtp' || r.type === 'inbound-rtp') && r.kind === 'video') {
+              rows.push({
+                t: r.type === 'outbound-rtp' ? 'out' : 'in', ssrc: r.ssrc, rid: r.rid, active: r.active,
+                sent: r.framesSent, enc: r.framesEncoded, kfEnc: r.keyFramesEncoded, w: r.frameWidth, fps: r.framesPerSecond,
+                q: r.qualityLimitationReason, qd: r.qualityLimitationDurations, tgt: r.targetBitrate,
+                recv: r.framesReceived, dec: r.framesDecoded, kfDec: r.keyFramesDecoded, drop: r.framesDropped,
+                pli: r.pliCount, fir: r.firCount, nack: r.nackCount, lost: r.packetsLost, freeze: r.freezeCount,
+                bytes: r.bytesSent ?? r.bytesReceived, pkts: r.packetsSent ?? r.packetsReceived,
+              });
+            }
+          });
+          return rows;
+        });
+        console.log(`[diag ${who} ${new Date().toISOString()}] ${JSON.stringify(out)}`);
+      } catch (e) {
+        console.log(`[diag ${who}] failed: ${e}`);
+      }
+    };
+    const diagTimer = setInterval(() => {
+      diagStats(alice, 'alice');
+      diagStats(bob, 'bob');
+    }, 2000);
+    diagTimer.unref();
+    process.on('exit', () => clearInterval(diagTimer));
     console.log('alice turns blur on mid-call');
     const baselineSsrcs = await videoInboundSnapshot(bob);
     const baselineLocalTrack = await localVideoTrackId(alice);
@@ -343,6 +373,14 @@ async function main() {
       console.log(`bob: same ssrcs ${nowKeys.join(', ')} still decoding after the blur swap`);
     }).catch(async (e) => {
       await stateDump(bob, 'bob').catch(() => {});
+      await diagStats(alice, 'alice-final');
+      await diagStats(bob, 'bob-final');
+      try {
+        const m = await (await fetch(`${BASE}/metrics`)).text();
+        console.log('[diag metrics]\n' + m.split('\n').filter((l) => /simulcast|keyframes|frames_total|bitrate/.test(l)).join('\n'));
+      } catch (err) {
+        console.log(`[diag metrics] failed: ${err}`);
+      }
       throw e;
     });
     const afterSdpM = await alice.evaluate(() =>

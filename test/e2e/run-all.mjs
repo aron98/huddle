@@ -30,6 +30,11 @@ const KILL_GRACE_MS = 5_000;
 const suites = readdirSync(DIR)
   .filter((f) => /^e2e-.+\.mjs$/.test(f))
   .sort();
+// DIAG (ci-debug only): CI's order up to e2e-blur, then e2e-blur twice more.
+{
+  const upTo = suites.indexOf('e2e-blur.mjs');
+  suites.splice(upTo + 1, suites.length, 'e2e-blur.mjs', 'e2e-blur.mjs');
+}
 
 if (suites.length === 0) {
   console.error('run-all: no e2e-*.mjs suites found next to run-all.mjs');
