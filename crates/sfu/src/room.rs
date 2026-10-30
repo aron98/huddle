@@ -357,12 +357,17 @@ impl Room {
                 // A single-layer camera is forwarded as-is.
                 reserve = reserve + HIGH_COST;
             } else if !sources.iter().any(|s| s.origin == track.origin) {
-                let live = |rid| origin.is_some_and(|o| o.rid_live(track.mid, rid, now));
+                let (high, low) = (track.rids.first().copied(), track.rids.last().copied());
+                let recent = |rid| origin.is_some_and(|o| o.rid_live(track.mid, rid, now));
+                let stalled =
+                    |rid, other| origin.is_some_and(|o| o.rid_stalled(track.mid, rid, other, now));
                 sources.push(Source {
                     origin: track.origin,
                     order: seq,
-                    high_live: live(track.rids.first().copied()),
-                    low_live: live(track.rids.last().copied()),
+                    high_live: !stalled(high, low),
+                    low_live: !stalled(low, high),
+                    high_recent: recent(high),
+                    low_recent: recent(low),
                 });
             }
         }
@@ -499,16 +504,19 @@ impl Room {
     }
 
     /// Relay a receiver's keyframe request (on its outgoing `mid`) back to
-    /// the origin peer's incoming track.
+    /// the origin peer's incoming track — on a simulcast source, to the
+    /// layer this receiver is (about to be) forwarded.
     fn route_keyframe_request(&mut self, receiver: PeerId, req: KeyframeRequest) {
         let Some(peer) = self.peers.get(&receiver) else {
             return;
         };
-        let Some((origin, mid_in)) = peer.track_in_for_outgoing(req.mid) else {
+        let Some((origin, mid_in, rid)) = peer.track_in_for_outgoing(req.mid) else {
             return;
         };
+        // Never relay the receiver's own (absent) rid: on a simulcast
+        // source str0m would match any layer, often not the forwarded one.
         if let Some(origin_peer) = self.peers.get_mut(&origin)
-            && let Err(e) = origin_peer.request_keyframe(mid_in, req.rid, req.kind)
+            && let Err(e) = origin_peer.request_keyframe(mid_in, rid, req.kind)
         {
             tracing::warn!("keyframe relay to peer {origin} failed: {e}");
         }
