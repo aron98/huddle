@@ -158,8 +158,10 @@ impl MockState {
                 id: ALICE_ID,
                 sharing: *sharing,
             }],
-            // Layer preferences are consumed by the SFU with no reply.
+            // Layer preferences and focus hints are consumed by the SFU
+            // with no reply.
             ClientMessage::LayerPreference { .. }
+            | ClientMessage::Focus { .. }
             // SDP answers and leaves close out flows that already got
             // their replies elsewhere.
             | ClientMessage::SdpAnswer { .. }
