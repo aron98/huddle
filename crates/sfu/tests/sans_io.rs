@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use huddle_protocol::VideoLayer;
-use huddle_sfu::{PeerId, RecordedFrame, RecorderSink, Room, SfuError, SfuOutput};
+use huddle_sfu::{
+    Bitrate, PeerId, RecordedFrame, RecorderSink, Room, SfuError, SfuOutput, SimulcastConfig,
+};
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
 use str0m::media::{Direction, MediaKind, MediaTime, Rid, Simulcast, SimulcastLayer};
@@ -970,9 +972,52 @@ const LOW: u8 = 0xC3;
 /// keyframe-request throttle to age out.
 const SETTLE: Duration = Duration::from_millis(1200);
 
+/// A second origin's markers, so per-origin layers stay distinguishable.
+const HIGH_C: u8 = 0xD1;
+const MID_C: u8 = 0xD5;
+const LOW_C: u8 = 0xD3;
+
+/// The e2e override (ADR 015, D9): a receiver of two remote cameras
+/// fits one High and one Low with their audio, never two High.
+const OVERRIDE: Bitrate = Bitrate::kbps(2_500);
+
+/// A room whose layer allocation runs on a pinned estimate. The str0m
+/// peers here negotiate TWCC, so without the pin real (in-memory)
+/// estimates would race the assertions.
+fn pinned_room(estimate: Bitrate) -> Room {
+    Room::with_simulcast(
+        MEDIA_ADDR,
+        SimulcastConfig {
+            estimate_override: Some(estimate),
+            ..SimulcastConfig::default()
+        },
+    )
+}
+
+/// The layer `receiver` is forwarded from `origin`'s camera (what
+/// `/metrics` renders).
+fn layer_of(room: &Room, receiver: PeerId, origin: PeerId) -> Option<VideoLayer> {
+    room.peer_stats(receiver)?
+        .layer_preferences
+        .iter()
+        .find(|(o, _)| *o == origin)
+        .map(|(_, l)| *l)
+}
+
+fn count(client: &TestClient, marker: u8) -> usize {
+    client.media_rx_markers.get(&marker).copied().unwrap_or(0)
+}
+
+/// One GOP (keyframe first) on every layer, as a live sender produces.
+fn send_all_layers(client: &mut TestClient, cam: str0m::media::Mid, markers: [u8; 3]) {
+    client.send_simulcast_gop(cam, "high", markers[0], 5);
+    client.send_simulcast_gop(cam, "mid", markers[1], 5);
+    client.send_simulcast_gop(cam, "low", markers[2], 5);
+}
+
 #[test]
-fn simulcast_routes_the_subscribers_chosen_layer() {
-    let mut room = Room::new(MEDIA_ADDR);
+fn simulcast_defaults_to_high_and_downshifts_on_a_constrained_estimate() {
+    let mut room = pinned_room(OVERRIDE);
     let mut a = TestClient::new(1);
     let mut b = TestClient::new(2);
     let (a_id, b_id) = (a.id, b.id);
@@ -985,116 +1030,75 @@ fn simulcast_routes_the_subscribers_chosen_layer() {
         cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
     });
 
-    // All three layers flow; a subscriber on the default (low) layer
-    // only sees the low rid.
-    a.send_simulcast_frames(cam, "high", HIGH, 5);
-    a.send_simulcast_frames(cam, "mid", MID, 5);
-    a.send_simulcast_frames(cam, "low", LOW, 5);
+    // Default High: with no client signal at all, b receives only the
+    // high rid (the #111 regression: unfocused tiles were thumbnails).
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
-    assert!(b.media_rx_markers.get(&LOW).is_some_and(|n| *n > 0));
-    assert!(!b.media_rx_markers.contains_key(&HIGH), "high layer leaked");
-    assert!(!b.media_rx_markers.contains_key(&MID), "mid layer leaked");
+    assert!(count(&b, HIGH) > 0, "high layer did not flow by default");
+    for leaked in [LOW, LOW & !1, MID, MID & !1] {
+        assert_eq!(count(&b, leaked), 0, "layer {leaked:#x} leaked");
+    }
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
 
-    // A layer switch asks the origin for a keyframe on the newly chosen
-    // rid, throttled per layer: the request lands once, an immediate
-    // repeat is a no-op.
-    let before = room.peer_stats(a_id).unwrap().keyframes_requested;
-    room.set_layer_preference(b_id, a_id, VideoLayer::High)
+    // b's link collapses: 500 kbps cannot carry the high layer. The next
+    // allocation round downshifts, asking a for a low keyframe. Until
+    // it arrives the high layer keeps flowing and low deltas are held
+    // back, and peer_stats still reports the forwarded high layer.
+    let keyframes_before = room.peer_stats(a_id).unwrap().keyframes_requested;
+    room.set_egress_estimate_override(b_id, Some(Bitrate::kbps(500)))
         .unwrap();
-    let after_switch = room.peer_stats(a_id).unwrap().keyframes_requested;
-    assert_eq!(
-        after_switch,
-        before + 1,
-        "no keyframe on the switched-to layer"
-    );
-    room.set_layer_preference(b_id, a_id, VideoLayer::High)
-        .unwrap();
-    assert_eq!(
-        room.peer_stats(a_id).unwrap().keyframes_requested,
-        after_switch,
-        "repeat preference was not throttled"
-    );
-    // The switch is keyframe-gated: high delta frames alone do not cut
-    // over, the low layer keeps flowing meanwhile, and peer_stats (the
-    // /metrics source) still reports the forwarded low layer.
-    let low_gated = b.media_rx_markers.get(&LOW).copied().unwrap_or(0);
+    let high_gated = count(&b, HIGH);
     a.send_simulcast_frames(cam, "high", HIGH, 5);
     a.send_simulcast_frames(cam, "low", LOW, 5);
     drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
     assert!(
-        !b.media_rx_markers.contains_key(&HIGH),
-        "high delta frames leaked before the high keyframe"
-    );
-    assert!(
-        b.media_rx_markers.get(&LOW).is_some_and(|n| *n > low_gated),
-        "the low layer stopped before the switch completed"
+        room.peer_stats(a_id).unwrap().keyframes_requested > keyframes_before,
+        "the downshift asked for no keyframe on the low layer"
     );
     assert_eq!(
-        room.peer_stats(b_id).unwrap().layer_preferences,
-        vec![(a_id, VideoLayer::Low)],
-        "a pending switch must keep reporting the forwarded layer"
+        count(&b, LOW),
+        0,
+        "low deltas leaked before the low keyframe"
     );
+    assert!(
+        count(&b, HIGH) > high_gated,
+        "the high layer stopped before the switch completed"
+    );
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
 
-    // b now receives the high layer instead of the low one, from the
-    // high keyframe on.
-    let (low_before, high_before) = (
-        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
-        b.media_rx_markers.get(&HIGH).copied().unwrap_or(0),
-    );
-    a.send_simulcast_gop(cam, "high", HIGH, 5);
+    // The low keyframe completes the switch; high frames stop flowing.
+    a.send_simulcast_gop(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    let high_after = count(&b, HIGH);
+    a.send_simulcast_frames(cam, "high", HIGH, 5);
     a.send_simulcast_frames(cam, "low", LOW, 5);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert!(
-        b.media_rx_markers.contains_key(&(HIGH & !1)),
-        "the high keyframe did not open the switched-to layer"
-    );
-    assert_eq!(
-        room.peer_stats(b_id).unwrap().layer_preferences,
-        vec![(a_id, VideoLayer::High)],
-        "the switch must be visible in peer_stats (rendered via /metrics)"
+        count(&b, LOW & !1) > 0,
+        "the low keyframe did not open the layer"
     );
     assert!(
-        b.media_rx_markers
-            .get(&HIGH)
-            .is_some_and(|n| *n > high_before),
-        "high layer did not flow after the switch"
+        count(&b, LOW) > 4,
+        "low layer did not flow after the switch"
     );
     assert_eq!(
-        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
-        low_before,
-        "low layer still flowed after switching away"
+        count(&b, HIGH),
+        high_after,
+        "high still flowed after the switch"
     );
-
-    // Switching back to low fires on the low rid's own throttle bucket.
-    let before = room.peer_stats(a_id).unwrap().keyframes_requested;
-    room.set_layer_preference(b_id, a_id, VideoLayer::Low)
-        .unwrap();
     assert_eq!(
-        room.peer_stats(a_id).unwrap().keyframes_requested,
-        before + 1,
-        "switching to low did not request a keyframe"
-    );
-    a.send_simulcast_gop(cam, "low", LOW, 5);
-    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
-    assert_eq!(
-        room.peer_stats(b_id).unwrap().layer_preferences,
-        vec![(a_id, VideoLayer::Low)],
-        "the fallback must be visible in peer_stats (rendered via /metrics)"
-    );
-    assert!(
-        b.media_rx_markers
-            .get(&LOW)
-            .is_some_and(|n| *n > low_before + 1),
-        "low layer did not flow after switching back"
+        layer_of(&room, b_id, a_id),
+        Some(VideoLayer::Low),
+        "the downshift must be visible in peer_stats (rendered via /metrics)"
     );
 }
 
 #[test]
-fn late_joiners_start_on_the_low_layer() {
-    let mut room = Room::new(MEDIA_ADDR);
+fn late_joiners_start_on_the_high_layer() {
+    let mut room = pinned_room(OVERRIDE);
     let mut a = TestClient::new(1);
     let mut b = TestClient::new(2);
-    let (_a_id, b_id) = (a.id, b.id);
+    let b_id = b.id;
     a.join(&mut room);
     b.join(&mut room);
     let cam = a.publish_simulcast_camera(&mut room);
@@ -1115,20 +1119,120 @@ fn late_joiners_start_on_the_low_layer() {
     a.send_simulcast_frames(cam, "mid", MID, 5);
     a.send_simulcast_frames(cam, "low", LOW, 5);
     drain(&mut room, &mut [&mut a, &mut b, &mut c], SETTLE);
-    assert!(c.media_rx_markers.get(&LOW).is_some_and(|n| *n > 0));
     assert!(
-        !c.media_rx_markers.contains_key(&HIGH),
-        "late joiner received the high layer"
+        count(&c, HIGH) > 0,
+        "late joiner did not get the high layer"
     );
-    assert!(
-        !c.media_rx_markers.contains_key(&MID),
-        "late joiner received the mid layer"
-    );
+    assert_eq!(count(&c, LOW), 0, "late joiner received the low layer");
+    assert_eq!(count(&c, MID), 0, "late joiner received the mid layer");
 }
 
 #[test]
-fn screen_shares_ignore_layer_preferences() {
-    let mut room = Room::new(MEDIA_ADDR);
+fn layer_preference_is_a_focus_hint_under_constraint() {
+    let mut room = pinned_room(OVERRIDE);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let mut c = TestClient::new(3);
+    let (a_id, b_id, c_id) = (a.id, b.id, c.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    c.join(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |_, cs| {
+        cs.iter().all(|c| c.connected)
+    });
+    let cam_a = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, _| {
+        r.peer_tracks(b_id) == Some((1, 3))
+    });
+    let cam_c = c.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b, &mut c], |r, _| {
+        r.peer_tracks(b_id) == Some((1, 4))
+    });
+
+    // Only one High fits b's budget: the earlier subscription (a) keeps
+    // it, c is downshifted. Each round sends a GOP per layer, as a live
+    // sender answering the SFU's keyframe requests does.
+    let round = |room: &mut Room, a: &mut TestClient, b: &mut TestClient, c: &mut TestClient| {
+        send_all_layers(a, cam_a, [HIGH, MID, LOW]);
+        send_all_layers(c, cam_c, [HIGH_C, MID_C, LOW_C]);
+        drain(room, &mut [a, b, c], SETTLE);
+    };
+    // The first allocation round sees both new subscriptions before any
+    // frame: nothing flows yet, so c's downshift needs no keyframe.
+    drain(
+        &mut room,
+        &mut [&mut a, &mut b, &mut c],
+        Duration::from_millis(300),
+    );
+    round(&mut room, &mut a, &mut b, &mut c);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
+    assert_eq!(layer_of(&room, b_id, c_id), Some(VideoLayer::Low));
+    assert!(count(&b, HIGH) > 0 && count(&b, LOW_C) > 0);
+
+    // The legacy High preference focuses c: it wins the High slot from
+    // a at once (a budget-neutral swap), keyframe-gated on both sides.
+    room.set_layer_preference(b_id, c_id, VideoLayer::High)
+        .unwrap();
+    round(&mut room, &mut a, &mut b, &mut c);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(layer_of(&room, b_id, c_id), Some(VideoLayer::High));
+    let high_c = count(&b, HIGH_C);
+    assert!(high_c > 0, "the focused origin's high layer did not flow");
+
+    // A legacy Low for the unfocused origin is a no-op, not a cap; a
+    // Low for the focused one only unfocuses, and stickiness keeps the
+    // slot where it is.
+    room.set_layer_preference(b_id, a_id, VideoLayer::Low)
+        .unwrap();
+    room.set_layer_preference(b_id, c_id, VideoLayer::Low)
+        .unwrap();
+    round(&mut room, &mut a, &mut b, &mut c);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(layer_of(&room, b_id, c_id), Some(VideoLayer::High));
+    assert!(count(&b, HIGH_C) > high_c);
+}
+
+#[test]
+fn a_stalled_high_layer_falls_back_to_the_live_one() {
+    let mut room = pinned_room(OVERRIDE);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+
+    // The sender only produces its low layer (Chrome drops the top
+    // encoding under uplink pressure, issue #78). b is on the default
+    // High, but must not sit on a dead layer: the next round falls back
+    // to low without waiting for a keyframe.
+    a.send_simulcast_gop(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(count(&b, LOW) > 0, "the live low layer was not forwarded");
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+
+    // The high layer comes back: b returns to it on its next keyframe.
+    a.send_simulcast_gop(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    a.send_simulcast_gop(cam, "high", HIGH, 5);
+    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert!(
+        count(&b, HIGH) > 0,
+        "the resumed high layer was not forwarded"
+    );
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
+}
+
+#[test]
+fn screen_shares_are_never_layer_filtered() {
+    let mut room = pinned_room(Bitrate::kbps(10_000));
     let mut a = TestClient::new(1);
     let mut b = TestClient::new(2);
     let (a_id, b_id) = (a.id, b.id);
@@ -1151,38 +1255,29 @@ fn screen_shares_ignore_layer_preferences() {
         cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 3))
     });
 
-    // Screen frames flow regardless of the camera's layer preference.
+    // Plenty of bandwidth: camera on High, the screen flows.
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    a.send_screen_frames(screen, 5);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    let screen_before = count(&b, 0x22);
+    assert!(screen_before > 0, "screen frames did not flow");
+    assert!(count(&b, HIGH) > 0);
+
+    // Starved: the camera drops to low, the screen keeps flowing.
+    room.set_egress_estimate_override(b_id, Some(Bitrate::kbps(300)))
+        .unwrap();
     a.send_simulcast_frames(cam, "high", HIGH, 5);
     a.send_simulcast_frames(cam, "low", LOW, 5);
     a.send_screen_frames(screen, 5);
-    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
-    let (screen_before, low_before) = (
-        b.media_rx_markers.get(&0x22).copied().unwrap_or(0),
-        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
-    );
-    assert!(screen_before > 0, "screen frames did not flow");
-
-    // Focusing (high layer) must not touch the single-layer screen.
-    room.set_layer_preference(b_id, a_id, VideoLayer::High)
-        .unwrap();
-    a.send_simulcast_gop(cam, "high", HIGH, 5);
-    a.send_simulcast_frames(cam, "low", LOW, 5);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    a.send_simulcast_gop(cam, "low", LOW, 5);
     a.send_screen_frames(screen, 5);
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert!(count(&b, LOW & !1) > 0, "the camera did not drop to low");
     assert!(
-        b.media_rx_markers.get(&HIGH).is_some_and(|n| *n > 0),
-        "high layer did not flow after the preference"
-    );
-    assert!(
-        b.media_rx_markers
-            .get(&0x22)
-            .is_some_and(|n| *n > screen_before),
-        "screen frames were affected by the layer preference"
-    );
-    assert_eq!(
-        b.media_rx_markers.get(&LOW).copied().unwrap_or(0),
-        low_before,
-        "low layer still flowed after switching away"
+        count(&b, 0x22) > screen_before,
+        "screen frames were affected by the camera's layer"
     );
 }
 

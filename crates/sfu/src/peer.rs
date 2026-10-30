@@ -5,20 +5,27 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use huddle_protocol::VideoLayer;
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpOffer, SdpPendingOffer};
 use str0m::media::{
     Direction, KeyframeRequest, KeyframeRequestKind, MediaData, MediaKind, Mid, Rid,
 };
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
-use crate::PeerId;
+use crate::alloc::{LayerAllocator, Source};
 use crate::error::SfuError;
+use crate::{PeerId, SimulcastConfig};
 /// Minimum interval between automatic keyframe requests for the same track.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a pending layer switch waits for a keyframe on the target
 /// rid before cutting over anyway (ADR 015, D6).
 const LAYER_SWITCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A simulcast rid counts as live while its last frame is at most this
+/// old (ADR 015, D2): a sender under uplink pressure stops encoding its
+/// top layer, and receivers must not stay parked on it.
+const RID_LIVENESS: Duration = Duration::from_millis(1500);
 
 /// A media track flowing *into* the SFU from its origin peer.
 ///
@@ -56,7 +63,7 @@ impl TrackIn {
     }
 
     /// Whether this track currently delivers media.
-    fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
     }
 
@@ -83,6 +90,8 @@ pub(crate) fn chosen_rid(rids: &[Rid], layer: VideoLayer) -> Option<Rid> {
 pub(crate) struct TrackInEntry {
     pub track: Arc<TrackIn>,
     pub last_keyframe_request: HashMap<Option<Rid>, Instant>,
+    /// Arrival time of the latest frame per rid: simulcast liveness.
+    pub last_frame: HashMap<Option<Rid>, Instant>,
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
@@ -112,6 +121,9 @@ pub(crate) struct TrackOut {
     /// Copied from the source [`TrackIn`]: decides the msid the SFU
     /// labels this m-line with (plain origin id vs `"{origin}-screen"`).
     pub screen: bool,
+    /// Creation order on this receiver: the layer allocator's last
+    /// tiebreaker (earlier subscriptions keep High first).
+    pub seq: u64,
     /// The simulcast layer currently forwarded from `origin`'s camera
     /// (screens stay single-layer and are never filtered).
     pub layer: VideoLayer,
@@ -202,6 +214,17 @@ pub(crate) struct Peer {
     pub keyframes_requested: u64,
     /// Link stats from the latest str0m snapshot (~1s once connected).
     stats: Option<LinkStats>,
+    /// Turns this receiver's egress bandwidth estimate into simulcast
+    /// layers (ADR 015).
+    alloc: LayerAllocator,
+    /// The desired bitrate last handed to str0m's probe controller.
+    desired: Option<Bitrate>,
+    /// Next [`TrackOut::seq`].
+    next_out_seq: u64,
+    /// Measured ingress per incoming `(mid, rid)`, from str0m's periodic
+    /// `MediaIngressStats`: `(bytes, at, bitrate_bps)`. Screen shares
+    /// are reserved at this rate in receivers' allocations.
+    ingress: HashMap<(Mid, Option<Rid>), (u64, Instant, u64)>,
     /// `(bytes_rx, bytes_tx, timestamp)` of the previous snapshot,
     /// kept to turn byte counters into per-window bitrates.
     stats_prev: Option<(u64, u64, Instant)>,
@@ -220,7 +243,11 @@ pub(crate) struct LinkStats {
 }
 
 impl Peer {
-    pub(crate) fn new(id: PeerId, media_addr: SocketAddr) -> Result<Peer, SfuError> {
+    pub(crate) fn new(
+        id: PeerId,
+        media_addr: SocketAddr,
+        simulcast: &SimulcastConfig,
+    ) -> Result<Peer, SfuError> {
         // The server is the ICE-lite side: it never gathers, it just
         // advertises its single media address in every SDP it produces.
         let rtc = Rtc::builder()
@@ -230,7 +257,13 @@ impl Peer {
             .enable_vp8(true)
             // Periodic stats events (bytes, loss, RTT) feed /metrics.
             .set_stats_interval(Some(Duration::from_secs(1)))
+            // TWCC-driven egress bandwidth estimation (ADR 015): drives
+            // the per-receiver simulcast layers. Also turns on str0m's
+            // pacer (1.1 × the estimate).
+            .enable_bwe(Some(simulcast.initial_estimate))
             .build(Instant::now());
+        let mut alloc = LayerAllocator::default();
+        alloc.set_override(simulcast.estimate_override);
 
         let mut peer = Peer {
             id,
@@ -250,6 +283,10 @@ impl Peer {
             keyframes_requested: 0,
             stats: None,
             stats_prev: None,
+            alloc,
+            desired: None,
+            next_out_seq: 0,
+            ingress: HashMap::new(),
         };
 
         let candidate = Candidate::host(media_addr, "udp")
@@ -404,12 +441,16 @@ impl Peer {
         if track_in.screen && !track_in.active() {
             return;
         }
+        let seq = self.next_out_seq;
+        self.next_out_seq += 1;
         self.tracks_out.push(TrackOut {
             origin: track_in.origin,
             mid_in: track_in.mid,
             kind: track_in.kind,
             screen: track_in.screen,
-            layer: VideoLayer::Low,
+            seq,
+            // Default High (ADR 015): the allocator downshifts from here.
+            layer: VideoLayer::High,
             pending: None,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
@@ -665,6 +706,7 @@ impl Peer {
                 self.tracks_in.push(TrackInEntry {
                     track: Arc::clone(&track),
                     last_keyframe_request: HashMap::new(),
+                    last_frame: HashMap::new(),
                 });
                 PollOutcome::TrackOpened(track)
             }
@@ -679,6 +721,19 @@ impl Peer {
             Event::KeyframeRequest(req) => PollOutcome::KeyframeRequested(req),
             Event::PeerStats(s) => {
                 self.record_peer_stats(s);
+                PollOutcome::Ignored
+            }
+            Event::MediaIngressStats(s) => {
+                self.record_ingress(s.mid, s.rid, s.bytes, s.timestamp);
+                PollOutcome::Ignored
+            }
+            // REMB is ignored: browsers send TWCC feedback whenever
+            // transport-cc is negotiated, and REMB caps one m-line only.
+            Event::EgressBitrateEstimate(BweKind::Twcc {
+                estimate,
+                can_probe,
+            }) => {
+                self.alloc.on_estimate(estimate, can_probe);
                 PollOutcome::Ignored
             }
             _ => PollOutcome::Ignored,
@@ -712,6 +767,123 @@ impl Peer {
             egress_loss_fraction: s.egress_loss_fraction,
         });
         self.stats_prev = Some((s.bytes_rx, s.bytes_tx, s.timestamp));
+    }
+
+    /// Turn one `MediaIngressStats` byte counter into a bitrate.
+    fn record_ingress(&mut self, mid: Mid, rid: Option<Rid>, bytes: u64, at: Instant) {
+        let bps = match self.ingress.get(&(mid, rid)) {
+            Some(&(prev, prev_at, _)) => {
+                let elapsed = at.saturating_duration_since(prev_at).as_secs_f64();
+                if elapsed > 0.0 {
+                    (bytes.saturating_sub(prev) as f64 * 8.0 / elapsed) as u64
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        self.ingress.insert((mid, rid), (bytes, at, bps));
+    }
+
+    /// Measured ingress bitrate of incoming `mid` (all rids), once two
+    /// stats snapshots have landed.
+    pub(crate) fn ingress_bps(&self, mid: Mid) -> Option<u64> {
+        let mut rates = self
+            .ingress
+            .iter()
+            .filter(|((m, _), (_, _, bps))| *m == mid && *bps > 0)
+            .map(|(_, (_, _, bps))| *bps)
+            .peekable();
+        rates.peek()?;
+        Some(rates.sum())
+    }
+
+    /// Record a frame's arrival on incoming `mid`/`rid` (liveness).
+    pub(crate) fn note_frame(&mut self, mid: Mid, rid: Option<Rid>, at: Instant) {
+        if let Some(entry) = self.tracks_in.iter_mut().find(|e| e.track.mid == mid) {
+            entry.last_frame.insert(rid, at);
+        }
+    }
+
+    /// Whether incoming `mid`'s `rid` delivered a frame recently.
+    pub(crate) fn rid_live(&self, mid: Mid, rid: Option<Rid>, now: Instant) -> bool {
+        self.tracks_in
+            .iter()
+            .find(|e| e.track.mid == mid)
+            .and_then(|e| e.last_frame.get(&rid))
+            .is_some_and(|t| now.saturating_duration_since(*t) <= RID_LIVENESS)
+    }
+
+    /// This receiver's live subscriptions (not winding down), with
+    /// their creation order: the layer allocator's inputs.
+    pub(crate) fn subscriptions(&self) -> Vec<(u64, Arc<TrackIn>)> {
+        self.tracks_out
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.state,
+                    TrackOutState::ToStop(_) | TrackOutState::NegotiatingStop(_)
+                )
+            })
+            .filter_map(|t| t.track_in.upgrade().map(|track| (t.seq, track)))
+            .collect()
+    }
+
+    /// Set this receiver's focused origin (a priority hint, ADR 015 D5).
+    pub(crate) fn set_focus(&mut self, focus: Option<PeerId>) {
+        self.alloc.set_focus(focus);
+    }
+
+    pub(crate) fn focus(&self) -> Option<PeerId> {
+        self.alloc.focus()
+    }
+
+    /// Pin (or release) the egress estimate the allocation runs on.
+    pub(crate) fn set_estimate_override(&mut self, estimate: Option<Bitrate>) {
+        self.alloc.set_override(estimate);
+    }
+
+    /// Run one layer-allocation round for this receiver and apply its
+    /// decisions. Returns the `(origin, mid, rid)` keyframe requests the
+    /// room must relay to the origins of switched layers.
+    pub(crate) fn reallocate(
+        &mut self,
+        now: Instant,
+        sources: &[Source],
+        reserve: Bitrate,
+    ) -> Vec<(PeerId, Mid, Rid)> {
+        let desired = LayerAllocator::desired_bitrate(sources.len(), reserve);
+        if !desired.is_zero() && self.desired != Some(desired) {
+            self.rtc.bwe().set_desired_bitrate(desired);
+            self.desired = Some(desired);
+        }
+        let mut keyframes = Vec::new();
+        for d in self.alloc.evaluate(now, sources, reserve) {
+            tracing::debug!(
+                receiver = %self.id,
+                origin = %d.origin,
+                layer = ?d.layer,
+                reason = ?d.reason,
+                estimate = ?self.alloc.effective_estimate(),
+                "simulcast layer switch"
+            );
+            // Leaving a layer that no longer delivers frames (a stalled
+            // sender, or a subscription with nothing flowing yet): there
+            // is nothing to keep forwarding, so switch without the gate.
+            let leaving_live =
+                sources
+                    .iter()
+                    .find(|s| s.origin == d.origin)
+                    .is_some_and(|s| match d.layer {
+                        VideoLayer::High => s.low_live,
+                        VideoLayer::Low => s.high_live,
+                    });
+            let immediate = !leaving_live;
+            for (mid, rid) in self.switch_layer(d.origin, d.layer, immediate, now) {
+                keyframes.push((d.origin, mid, rid));
+            }
+        }
+        keyframes
     }
 
     /// The latest link stats snapshot, if one has arrived yet.
@@ -877,19 +1049,20 @@ impl Peer {
         Ok(())
     }
 
-    /// Set this receiver's preferred simulcast layer for `origin`'s camera
+    /// Switch the simulcast layer forwarded from `origin`'s camera
     /// tracks (screens and audio are never filtered). Returns the
     /// `(origin mid, rid)` pairs a keyframe should be requested on for the
     /// newly chosen layer — one per simulcast camera track of `origin`.
     ///
-    /// On an open track the switch is keyframe-gated: the current layer
-    /// keeps flowing until the target rid delivers a keyframe (see
-    /// [`Peer::wants_layer`]). A track that is not open yet forwards
-    /// nothing, so it switches at once.
-    pub(crate) fn set_layer_preference(
+    /// On an open track the switch is keyframe-gated unless `immediate`:
+    /// the current layer keeps flowing until the target rid delivers a
+    /// keyframe (see [`Peer::wants_layer`]). A track that is not open
+    /// yet forwards nothing, so it switches at once.
+    fn switch_layer(
         &mut self,
         origin: PeerId,
         layer: VideoLayer,
+        immediate: bool,
         now: Instant,
     ) -> Vec<(Mid, Rid)> {
         let mut keyframes = Vec::new();
@@ -905,10 +1078,11 @@ impl Peer {
             if out.pending.is_some_and(|(target, _)| target == layer) {
                 continue;
             }
-            if matches!(out.state, TrackOutState::Open(_)) {
+            if matches!(out.state, TrackOutState::Open(_)) && !immediate {
                 out.pending = Some((layer, now));
             } else {
                 out.layer = layer;
+                out.pending = None;
             }
             if let Some(track) = out.track_in.upgrade()
                 && let Some(rid) = chosen_rid(&track.rids, layer)
@@ -959,7 +1133,7 @@ mod tests {
     #[test]
     fn forward_backpressure_sheds_while_other_errors_disconnect() {
         let addr: SocketAddr = "10.0.0.1:40000".parse().unwrap();
-        let mut peer = Peer::new(PeerId::new_v4(), addr).unwrap();
+        let mut peer = Peer::new(PeerId::new_v4(), addr, &SimulcastConfig::default()).unwrap();
 
         // Egress backpressure: str0m already dropped the frame, the
         // peer must survive and the shed must be counted.

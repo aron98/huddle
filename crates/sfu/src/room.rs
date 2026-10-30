@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use huddle_protocol::VideoLayer;
 use str0m::Input;
-use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaData, Mid};
+use str0m::media::{KeyframeRequest, KeyframeRequestKind, MediaData, MediaKind, Mid};
 
-use crate::PeerId;
-use crate::PeerStats;
+use crate::alloc::{AUDIO_RESERVE, HIGH_COST, SCREEN_RESERVE, Source};
 use crate::error::SfuError;
 use crate::peer::{Peer, PollOutcome, TrackIn};
 use crate::recorder::{RecordedFrame, RecorderSink};
+use crate::{Bitrate, PeerId, PeerStats, SimulcastConfig};
 
 use std::sync::Arc;
+
+/// Cadence of the per-receiver layer allocation rounds.
+const REALLOCATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// An output event from polling the room, with all data owned.
 #[derive(Debug)]
@@ -44,18 +47,29 @@ pub struct Room {
     /// `Arc` so dropping it (stop recording / empty meeting) is the
     /// recorder's shutdown signal; `None` taps nothing.
     recorder: Option<Arc<dyn RecorderSink>>,
+    simulcast: SimulcastConfig,
+    /// When the next layer-allocation round is due.
+    next_reallocate: Option<Instant>,
 }
 
 impl Room {
     /// Create an empty room whose peers advertise `media_addr` as their
-    /// ICE candidate. Also installs str0m's process-default crypto
-    /// provider (idempotent).
+    /// ICE candidate, with the default simulcast settings. Also installs
+    /// str0m's process-default crypto provider (idempotent).
     pub fn new(media_addr: SocketAddr) -> Room {
+        Room::with_simulcast(media_addr, SimulcastConfig::default())
+    }
+
+    /// Like [`Room::new`], with explicit simulcast settings for every
+    /// peer the room creates.
+    pub fn with_simulcast(media_addr: SocketAddr, simulcast: SimulcastConfig) -> Room {
         str0m::crypto::from_feature_flags().install_process_default();
         Room {
             media_addr,
             peers: HashMap::new(),
             recorder: None,
+            simulcast,
+            next_reallocate: None,
         }
     }
 
@@ -78,7 +92,7 @@ impl Room {
         if self.peers.contains_key(&id) {
             return Err(SfuError::PeerExists);
         }
-        let mut peer = Peer::new(id, self.media_addr)?;
+        let mut peer = Peer::new(id, self.media_addr, &self.simulcast)?;
         for existing in self.peers.values() {
             for track in existing.tracks_in() {
                 peer.open_track(track);
@@ -203,25 +217,45 @@ impl Room {
         self.peer_mut(id)?.add_remote_candidate(candidate)
     }
 
-    /// Set the simulcast layer `receiver` wants from `origin`'s camera
-    /// tracks, and ask the origin for a keyframe on the newly chosen
-    /// layer (throttled per layer). The switch cuts over on that
-    /// keyframe, so it always lands on a decodable frame. Screens and
-    /// audio are unaffected.
+    /// The legacy per-origin layer preference (`LayerPreference`),
+    /// mapped onto the focus hint (ADR 015, D5): `High` focuses `origin`,
+    /// `Low` clears the focus if `origin` holds it and is otherwise a
+    /// no-op. The SFU arbitrates the actual layers — a `Low` is never a
+    /// cap, so old clients that send it for every unfocused tile still
+    /// get the default High while bandwidth allows.
     pub fn set_layer_preference(
         &mut self,
         receiver: PeerId,
         origin: PeerId,
         layer: VideoLayer,
     ) -> Result<(), SfuError> {
-        let keyframes =
-            self.peer_mut(receiver)?
-                .set_layer_preference(origin, layer, Instant::now());
-        for (mid_in, rid) in keyframes {
-            if let Some(origin_peer) = self.peers.get_mut(&origin) {
-                origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
-            }
+        let focus = self.peer_mut(receiver)?.focus();
+        match layer {
+            VideoLayer::High => self.set_focus(receiver, Some(origin)),
+            VideoLayer::Low if focus == Some(origin) => self.set_focus(receiver, None),
+            VideoLayer::Low => Ok(()),
         }
+    }
+
+    /// Set `receiver`'s focused (staged) participant. Focus wins the
+    /// High layer when not every camera can have it; it never forces a
+    /// layer the receiver's bandwidth cannot carry. Takes effect at once.
+    pub fn set_focus(&mut self, receiver: PeerId, focus: Option<PeerId>) -> Result<(), SfuError> {
+        self.peer_mut(receiver)?.set_focus(focus);
+        self.reallocate(receiver, Instant::now());
+        Ok(())
+    }
+
+    /// Pin `peer`'s egress estimate for layer allocation (`None`
+    /// returns it to str0m's measurement). The sans-io seam that makes
+    /// layer decisions deterministic in tests; see also
+    /// [`SimulcastConfig::estimate_override`].
+    pub fn set_egress_estimate_override(
+        &mut self,
+        peer: PeerId,
+        estimate: Option<Bitrate>,
+    ) -> Result<(), SfuError> {
+        self.peer_mut(peer)?.set_estimate_override(estimate);
         Ok(())
     }
 
@@ -276,10 +310,61 @@ impl Room {
         }
     }
 
-    /// Advance every peer's internal state machines to `now`.
+    /// Advance every peer's internal state machines to `now`, and run
+    /// the simulcast layer allocation when its round is due.
     pub fn handle_timeout(&mut self, now: Instant) {
         for peer in self.peers.values_mut() {
             peer.handle_timeout(now);
+        }
+        if self.next_reallocate.is_none_or(|t| now >= t) {
+            self.next_reallocate = Some(now + REALLOCATE_INTERVAL);
+            for id in self.peer_ids() {
+                self.reallocate(id, now);
+            }
+        }
+    }
+
+    /// One layer-allocation round for `receiver` (ADR 015): gather its
+    /// simulcast cameras (with per-rid liveness from their origins) and
+    /// its non-adaptive reserve, let its allocator decide, and ask the
+    /// origins of switched layers for keyframes.
+    fn reallocate(&mut self, receiver: PeerId, now: Instant) {
+        let Some(peer) = self.peers.get(&receiver) else {
+            return;
+        };
+        let mut sources: Vec<Source> = Vec::new();
+        let mut reserve = Bitrate::ZERO;
+        for (seq, track) in peer.subscriptions() {
+            let origin = self.peers.get(&track.origin);
+            if track.kind == MediaKind::Audio {
+                reserve = reserve + AUDIO_RESERVE;
+            } else if track.screen {
+                if track.active() {
+                    reserve = reserve
+                        + origin
+                            .and_then(|o| o.ingress_bps(track.mid))
+                            .map_or(SCREEN_RESERVE, Bitrate::bps);
+                }
+            } else if track.rids.is_empty() {
+                // A single-layer camera is forwarded as-is.
+                reserve = reserve + HIGH_COST;
+            } else if !sources.iter().any(|s| s.origin == track.origin) {
+                let live = |rid| origin.is_some_and(|o| o.rid_live(track.mid, rid, now));
+                sources.push(Source {
+                    origin: track.origin,
+                    order: seq,
+                    high_live: live(track.rids.first().copied()),
+                    low_live: live(track.rids.last().copied()),
+                });
+            }
+        }
+        let Some(peer) = self.peers.get_mut(&receiver) else {
+            return;
+        };
+        for (origin, mid_in, rid) in peer.reallocate(now, &sources, reserve) {
+            if let Some(origin_peer) = self.peers.get_mut(&origin) {
+                origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
+            }
         }
     }
 
@@ -359,6 +444,7 @@ impl Room {
     fn route_media(&mut self, origin: PeerId, data: &MediaData) {
         if let Some(peer) = self.peers.get_mut(&origin) {
             peer.rx_frames += 1;
+            peer.note_frame(data.mid, data.rid, data.network_time);
             if !data.contiguous {
                 peer.request_keyframe_all_layers_throttled(data.mid, KeyframeRequestKind::Fir);
             }
