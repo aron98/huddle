@@ -12,7 +12,9 @@
 //!   via [`Room::handle_input`],
 //! * [`Room::poll_output`] yields [`SfuOutput`]s — transmits to send,
 //!   renegotiation offers to relay over the signaling channel, and timer
-//!   hints for when to poll again.
+//!   hints for when to poll again,
+//! * [`Room::drain_layer_switches`] hands out the simulcast layer
+//!   decisions made since the last drain, for logs and metrics.
 
 mod alloc;
 pub mod error;
@@ -20,6 +22,7 @@ mod peer;
 mod recorder;
 mod room;
 
+pub use alloc::SwitchReason;
 pub use error::SfuError;
 pub use recorder::{RecordedFrame, RecorderSink};
 pub use room::{Room, SfuOutput};
@@ -28,6 +31,8 @@ pub use room::{Room, SfuOutput};
 pub use huddle_protocol::ParticipantId as PeerId;
 /// Bitrates of the simulcast layer allocation (str0m's own type).
 pub use str0m::bwe::Bitrate;
+
+use std::time::Duration;
 
 use huddle_protocol::VideoLayer;
 
@@ -52,6 +57,24 @@ impl Default for SimulcastConfig {
             estimate_override: None,
         }
     }
+}
+
+/// One simulcast layer decision for a receiver (ADR 015, D7): what the
+/// allocator switched, why, and the inputs it decided on. Drained via
+/// [`Room::drain_layer_switches`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerSwitch {
+    pub receiver: PeerId,
+    pub origin: PeerId,
+    pub from: VideoLayer,
+    pub to: VideoLayer,
+    pub reason: SwitchReason,
+    /// The receiver's estimate as the allocator saw it (override
+    /// included); `None` while no estimate has arrived yet.
+    pub estimate: Option<Bitrate>,
+    /// The camera budget that estimate left after the non-adaptive
+    /// reserve (audio, screens, single-layer cameras).
+    pub budget: Option<Bitrate>,
 }
 
 /// Per-peer counters and link stats, exposed for tests and `/metrics`.
@@ -90,4 +113,15 @@ pub struct PeerStats {
     /// origin. Exposed via `/metrics` so a layer decision is provable
     /// without depending on sender or receiver timing.
     pub layer_preferences: Vec<(PeerId, VideoLayer)>,
+    /// The egress estimate this peer's layer allocation runs on,
+    /// override included (ADR 015, D7). `None` until str0m's first
+    /// estimate arrives.
+    pub egress_estimate: Option<Bitrate>,
+    /// The desired bitrate last handed to str0m's probe controller.
+    pub egress_desired: Option<Bitrate>,
+    /// str0m's `can_probe` from the last estimate; a stuck `false` means
+    /// the allocation is frozen (no TWCC negotiated).
+    pub bwe_can_probe: Option<bool>,
+    /// The current upgrade hold: the allocator's hysteresis state.
+    pub layer_upgrade_hold: Duration,
 }
