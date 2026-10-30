@@ -228,6 +228,19 @@ layer"). Defaulting to High would otherwise freeze tiles. A non-live
 target layer falls back to the other live layer (`SwitchReason::Unavailable`).
 When it becomes live again, the allocator re-evaluates without any hold.
 
+*Amended after #120:* liveness is **relative**, not absolute. A rid
+counts as *stalled* only when the other layer of the same camera is
+recent and has kept delivering without it for more than 1.5 s, counted
+from the rid's last frame or the start of the other layer's current
+streak, whichever is later. With the absolute rule, the few
+milliseconds by which a resuming sender's layers arrive apart, after any
+common pause such as stream start or a camera swap, flipped receivers
+to whichever layer arrived first and back. Having any frame in the last
+1.5 s (*recent*) still decides whether a switch can skip the keyframe
+gate. Separately, a receiver's PLI/FIR carries no rid, so the SFU relays
+it to the layer that receiver is forwarded (or the target of its pending
+switch). str0m would match any layer for a missing rid.
+
 ### D3. Budget and per-receiver allocation across origins
 
 Inputs at time `now` for one receiver:
