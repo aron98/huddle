@@ -454,10 +454,17 @@ impl Engine {
             }
 
             let wake = self.poll_outputs();
-            let sleep = wake
-                .and_then(|t| t.checked_duration_since(Instant::now()))
-                .unwrap_or(MAX_SLEEP)
-                .min(MAX_SLEEP);
+            let now = Instant::now();
+            // An overdue deadline is served right away. Otherwise a
+            // deadline already in the past slept the full MAX_SLEEP, and
+            // a steady stream of commands (media packets) kept
+            // `recv_timeout` from ever timing out — both starve str0m's
+            // timers, which the BWE pacer depends on (ADR 015).
+            if wake.is_some_and(|t| t <= now) {
+                self.handle_timeouts(now);
+                continue;
+            }
+            let sleep = wake.map_or(MAX_SLEEP, |t| t - now).min(MAX_SLEEP);
 
             match self.rx.recv_timeout(sleep) {
                 Ok(cmd) => {
@@ -466,15 +473,17 @@ impl Engine {
                     }
                     self.handle(cmd);
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    let now = Instant::now();
-                    for inst in self.meetings.values_mut() {
-                        inst.room.handle_timeout(now);
-                    }
-                }
+                Err(RecvTimeoutError::Timeout) => self.handle_timeouts(Instant::now()),
                 // All handles dropped: nothing left to serve.
                 Err(RecvTimeoutError::Disconnected) => return,
             }
+        }
+    }
+
+    /// Advance every room's state machines to `now`.
+    fn handle_timeouts(&mut self, now: Instant) {
+        for inst in self.meetings.values_mut() {
+            inst.room.handle_timeout(now);
         }
     }
 
