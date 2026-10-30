@@ -1120,6 +1120,53 @@ fn simulcast_defaults_to_high_and_downshifts_on_a_constrained_estimate() {
 }
 
 #[test]
+fn a_recovered_estimate_re_upgrades_only_after_the_hold() {
+    let mut room = pinned_room(Bitrate::kbps(500));
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+
+    // Starved from the start: the first round downshifts before any
+    // frame flows.
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(count(&b, HIGH), 0);
+
+    // The link recovers. The upgrade budget must hold for the 5 s
+    // anti-flap hold before b goes back to High, on a high keyframe.
+    room.set_egress_estimate_override(b_id, Some(OVERRIDE))
+        .unwrap();
+    let recovered_at = Instant::now();
+    let upgraded_after = loop {
+        send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+        drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(500));
+        if layer_of(&room, b_id, a_id) == Some(VideoLayer::High) {
+            break recovered_at.elapsed();
+        }
+        assert!(
+            recovered_at.elapsed() < Duration::from_secs(10),
+            "b never re-upgraded after the estimate recovered"
+        );
+    };
+    assert!(
+        upgraded_after >= Duration::from_secs(5),
+        "re-upgraded after {upgraded_after:?}, before the 5 s hold"
+    );
+    assert!(
+        count(&b, HIGH) > 0,
+        "the high layer did not flow after recovery"
+    );
+}
+
+#[test]
 fn late_joiners_start_on_the_high_layer() {
     let mut room = pinned_room(OVERRIDE);
     let mut a = TestClient::new(1);
