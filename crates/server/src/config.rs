@@ -679,10 +679,14 @@ impl Config {
     }
 
     /// The SFU's adaptive simulcast settings (ADR 015). A zero initial
-    /// estimate would start every receiver starved, so it fails fast.
+    /// estimate or override would starve every receiver, so either
+    /// fails fast.
     pub fn simulcast(&self) -> anyhow::Result<SimulcastConfig> {
         if self.simulcast_initial_bwe_kbps == 0 {
             anyhow::bail!("simulcast_initial_bwe_kbps must be greater than 0");
+        }
+        if self.simulcast_bwe_override_kbps == Some(0) {
+            anyhow::bail!("simulcast_bwe_override_kbps must be greater than 0 (or unset)");
         }
         Ok(SimulcastConfig {
             initial_estimate: Bitrate::kbps(self.simulcast_initial_bwe_kbps),
@@ -1136,6 +1140,11 @@ mod tests {
             ..Config::default()
         };
         assert!(zero.simulcast().is_err());
+        let zero_override = Config {
+            simulcast_bwe_override_kbps: Some(0),
+            ..Config::default()
+        };
+        assert!(zero_override.simulcast().is_err());
     }
 
     #[test]
