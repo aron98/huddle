@@ -361,7 +361,11 @@ impl Room {
         let Some(peer) = self.peers.get_mut(&receiver) else {
             return;
         };
-        for (origin, mid_in, rid) in peer.reallocate(now, &sources, reserve) {
+        let mut keyframes = peer.reallocate(now, &sources, reserve);
+        // Every round, not just at the switch: the origin's throttle is
+        // shared across receivers and may have dropped an earlier ask.
+        keyframes.extend(peer.keyframes_wanted());
+        for (origin, mid_in, rid) in keyframes {
             if let Some(origin_peer) = self.peers.get_mut(&origin) {
                 origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
             }

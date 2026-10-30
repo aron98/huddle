@@ -133,6 +133,10 @@ pub(crate) struct TrackOut {
     /// so the receiver never decodes delta frames against the wrong
     /// reference (ADR 015, D6).
     pub pending: Option<(VideoLayer, Instant)>,
+    /// The forwarded layer started without a keyframe (a switch that
+    /// timed out, or one away from a dead layer): the origin is asked
+    /// again every allocation round until a keyframe of it passes.
+    pub keyframe_due: bool,
     pub track_in: Weak<TrackIn>,
     pub state: TrackOutState,
 }
@@ -463,6 +467,7 @@ impl Peer {
             // Default High (ADR 015): the allocator downshifts from here.
             layer: VideoLayer::High,
             pending: None,
+            keyframe_due: false,
             track_in: Arc::downgrade(track_in),
             state: TrackOutState::ToOpen,
         });
@@ -947,12 +952,46 @@ impl Peer {
             if keyframe || timed_out {
                 out.layer = target;
                 out.pending = None;
+                // Cut over on delta frames: keep asking for a keyframe.
+                out.keyframe_due = !keyframe;
             }
         }
         let Some(rid) = chosen_rid(&track.rids, out.layer) else {
             return true;
         };
-        data.rid == Some(rid)
+        let wanted = data.rid == Some(rid);
+        if wanted && data.is_keyframe() {
+            out.keyframe_due = false;
+        }
+        wanted
+    }
+
+    /// The `(origin, origin mid, rid)` keyframes this receiver still
+    /// waits for: the target of every pending switch, and the forwarded
+    /// layer of every track that started without one.
+    ///
+    /// The origin's keyframe-request throttle is shared by all of its
+    /// receivers and drops requests inside its interval, so a single
+    /// request at switch time can be lost to another receiver's; the
+    /// room re-issues these every allocation round until they land.
+    pub(crate) fn keyframes_wanted(&self) -> Vec<(PeerId, Mid, Rid)> {
+        let mut wanted = Vec::new();
+        for out in &self.tracks_out {
+            if !matches!(out.state, TrackOutState::Open(_)) {
+                continue;
+            }
+            let layer = match out.pending {
+                Some((target, _)) => target,
+                None if out.keyframe_due => out.layer,
+                None => continue,
+            };
+            if let Some(track) = out.track_in.upgrade()
+                && let Some(rid) = chosen_rid(&track.rids, layer)
+            {
+                wanted.push((out.origin, track.mid, rid));
+            }
+        }
+        wanted
     }
 
     /// Forward one media frame to this peer over the outgoing `mid`.
@@ -1089,11 +1128,16 @@ impl Peer {
             if out.pending.is_some_and(|(target, _)| target == layer) {
                 continue;
             }
-            if matches!(out.state, TrackOutState::Open(_)) && !immediate {
+            let open = matches!(out.state, TrackOutState::Open(_));
+            if open && !immediate {
                 out.pending = Some((layer, now));
             } else {
                 out.layer = layer;
                 out.pending = None;
+                // An open track now forwards the new layer from its next
+                // delta frame on. (A track that is not open yet gets its
+                // keyframe from the subscription fan-out.)
+                out.keyframe_due = open;
             }
             if let Some(track) = out.track_in.upgrade()
                 && let Some(rid) = chosen_rid(&track.rids, layer)
