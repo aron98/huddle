@@ -522,7 +522,7 @@ impl BrowserPeerConnection {
     /// transforms attached afterwards (ADR 011, D1). Screen shares
     /// never go through here — they stay single-layer.
     ///
-    /// Two layers, tightly budgeted: Chrome allocates simulcast
+    /// Two layers only: Chrome allocates simulcast
     /// bandwidth top-down and reliably activates only the first two
     /// encodings — a third layer sits at zero bytes forever (observed
     /// with 500/200/100 kbps caps: high and mid consumed the whole
@@ -537,10 +537,13 @@ impl BrowserPeerConnection {
     async fn publish_camera(&self, track: &MediaStreamTrack, stream: &MediaStream) {
         let encodings = js_sys::Array::new();
         // Budgets are part of the creation-time encodings (see the doc
-        // comment above): 500 kbps for the full layer, 100 for the
-        // quarter-scale thumbnail. The tight high-layer cap leaves room
-        // for the low layer inside Chrome's top-down allocation.
-        for (rid, scale, max_bitrate) in [("high", 1.0_f32, 500_000_u32), ("low", 4.0, 100_000)] {
+        // comment above): 1.5 Mbps for the full layer, 100 kbps for the
+        // quarter-scale thumbnail. Every receiver defaults to the high
+        // layer and the SFU downshifts per receiver on its bandwidth
+        // estimate (ADR 015), so the high cap buys real quality; the SFU
+        // mirrors both caps as its layer costs (`crates/sfu/src/alloc.rs`)
+        // and must change together with them.
+        for (rid, scale, max_bitrate) in [("high", 1.0_f32, 1_500_000_u32), ("low", 4.0, 100_000)] {
             let encoding = RtcRtpEncodingParameters::new();
             encoding.set_rid(rid);
             encoding.set_active(true);
