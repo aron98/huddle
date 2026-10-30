@@ -461,8 +461,8 @@ async function main() {
     };
     await assertHighDecodes('by default');
 
-    // Focus is a hint now (ADR 015, D5): the client's legacy
-    // LayerPreference High focuses, Low only unfocuses — never a cap. With
+    // Focus is a hint now (ADR 015, D5): the client sends a Focus
+    // message, never a per-peer layer — and unfocusing is not a cap. With
     // bandwidth for everyone, bob stays on the high layer throughout.
     const assertStaysHigh = async (when) => {
       const until = Date.now() + 3000;
@@ -490,7 +490,7 @@ async function main() {
         { timeout: 10_000, polling: 250 },
       )
       .catch(() => fail('bob: unfocusing alice did not clear the focus'));
-    await assertStaysHigh('after unfocusing her (a legacy Low is not a cap)');
+    await assertStaysHigh('after unfocusing her (unfocus is not a cap)');
     await assertHighDecodes('after unfocus');
 
     console.log('carol joins late');
@@ -535,6 +535,61 @@ async function main() {
       );
     });
     console.log('bob: one remote high layer fits the pinned estimate (alice high, carol low)');
+
+    // The focus tiebreak (ADR 015 D5, issues #114/#116): only one high
+    // layer fits, so bob focusing carol must move the high slot to her —
+    // a budget-neutral swap that skips the upgrade hold — and alice drops
+    // to low. Asserted from the SFU's forwarded layer in /metrics, never
+    // from frame timing. Per-rid liveness (D2) keeps a stalled high rid on
+    // low, so a carol encoder that is not producing the high layer under
+    // runner load degrades into a warning, like the #78 gates above.
+    const pages = { alice, carol };
+    const assertFocusWins = async (focused, other) => {
+      const highSentBefore = (await senderSimulcast(pages[focused])).high?.framesSent ?? 0;
+      await bob.click(`[data-testid="tile-${focused}"]`);
+      await bob
+        .waitForFunction(
+          (sel) => document.querySelector(sel)?.classList.contains('focused'),
+          { timeout: 10_000, polling: 250 },
+          `[data-testid="tile-${focused}"]`,
+        )
+        .catch(() => fail(`bob: focusing ${focused} did not mark the tile focused`));
+      const won = await tryWaitFor(
+        `the SFU to give bob ${focused} on high and ${other} on low`,
+        async () =>
+          (await sfuSimulcastLayer('bob', focused)) === 'high' &&
+          (await sfuSimulcastLayer('bob', other)) === 'low',
+        15_000,
+      );
+      if (won) {
+        console.log(`bob: focus wins the high slot under constraint (${focused} high, ${other} low)`);
+        return;
+      }
+      const senderSnap = await senderSimulcast(pages[focused]);
+      const layers =
+        `metrics: ${focused} ${await sfuSimulcastLayer('bob', focused)}, ` +
+        `${other} ${await sfuSimulcastLayer('bob', other)}`;
+      if ((senderSnap.high?.framesSent ?? 0) <= highSentBefore) {
+        console.warn(
+          `WARNING: ${focused}'s encoder is not producing the high layer ` +
+            `(${JSON.stringify(senderSnap)}); skipping the focus tiebreak (${layers})`,
+        );
+        return;
+      }
+      await stateDump(bob, 'bob').catch(() => {});
+      fail(`bob: focusing ${focused} did not win the high layer under constraint (${layers})`);
+    };
+    await assertFocusWins('carol', 'alice');
+    // And back: the slot follows the focus, again without the hold.
+    await assertFocusWins('alice', 'carol');
+    // Clear the focus; stickiness keeps alice on high (D3).
+    await bob.click('[data-testid="tile-alice"]');
+    await bob
+      .waitForFunction(
+        () => !document.querySelector('[data-testid="tile-alice"]')?.classList.contains('focused'),
+        { timeout: 10_000, polling: 250 },
+      )
+      .catch(() => fail('bob: unfocusing alice did not clear the focus'));
 
     console.log('dave joins, is seen, then leaves');
     const dave = await newClient('dave');
