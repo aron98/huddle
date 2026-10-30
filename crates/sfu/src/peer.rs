@@ -425,8 +425,18 @@ impl Peer {
     }
 
     /// Feed a timestamp in, advancing str0m's internal state machines.
+    ///
+    /// A failure disconnects the peer, as a failed input does: an `Rtc`
+    /// that cannot advance its timers would keep reporting an overdue
+    /// deadline, and the room removes it on its next poll instead.
     pub(crate) fn handle_timeout(&mut self, now: Instant) {
-        let _ = self.rtc.handle_input(Input::Timeout(now));
+        if let Err(e) = self.rtc.handle_input(Input::Timeout(now)) {
+            tracing::warn!(
+                "peer {} timeout handling failed, disconnecting: {e}",
+                self.id
+            );
+            self.disconnect();
+        }
     }
 
     pub(crate) fn accepts(&self, input: &Input) -> bool {
