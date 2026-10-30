@@ -14,6 +14,9 @@
 //!   renegotiation offers to relay over the signaling channel, and timer
 //!   hints for when to poll again.
 
+// Wired into `Peer` by the next commit; until then only its tests use it.
+#[allow(dead_code)]
+mod alloc;
 pub mod error;
 mod peer;
 mod recorder;
