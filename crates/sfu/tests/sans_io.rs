@@ -1408,11 +1408,14 @@ fn a_stalled_high_layer_falls_back_to_the_live_one() {
 
     // The sender only produces its low layer (Chrome drops the top
     // encoding under uplink pressure, issue #78). b is on the default
-    // High, but must not sit on a dead layer: the next round falls back
-    // to low without waiting for a keyframe.
+    // High, but must not sit on a dead layer: once low has kept flowing
+    // past the 1.5 s liveness window, b falls back to it without waiting
+    // for a keyframe.
     a.send_simulcast_gop(cam, "low", LOW, 5);
-    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
-    a.send_simulcast_frames(cam, "low", LOW, 5);
+    for _ in 0..7 {
+        drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+        a.send_simulcast_frames(cam, "low", LOW, 2);
+    }
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert!(count(&b, LOW) > 0, "the live low layer was not forwarded");
     assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
@@ -1429,6 +1432,47 @@ fn a_stalled_high_layer_falls_back_to_the_live_one() {
         "the resumed high layer was not forwarded"
     );
     assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
+}
+
+#[test]
+fn a_sender_resuming_after_a_pause_is_not_a_stalled_layer() {
+    // Both layers pause together (a camera swap, a frozen encoder); on
+    // resume their frames reach the SFU a few milliseconds apart. That
+    // skew must not trip the stalled-layer fallback: it used to flip the
+    // receiver to whichever layer arrived first (immediately) and back
+    // (keyframe-gated, after that keyframe had already gone by), leaving
+    // it on the wrong layer until the gate timed out.
+    let mut room = pinned_room(Bitrate::kbps(500));
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+    // Starved: b is on low.
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+
+    // A pause past the liveness window, then the high layer's frames of
+    // the resumed stream land first (the worst-case skew, held for a
+    // few allocation rounds) before the low layer's.
+    std::thread::sleep(Duration::from_millis(1_700));
+    a.send_simulcast_gop(cam, "high", HIGH, 3);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(400));
+    a.send_simulcast_frames(cam, "low", LOW, 3);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(count(&b, HIGH), 0, "flipped to the high layer on resume");
+    assert_eq!(
+        count(&b, HIGH & !1),
+        0,
+        "flipped to the high layer on resume"
+    );
 }
 
 #[test]

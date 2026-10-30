@@ -22,9 +22,11 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 /// rid before cutting over anyway (ADR 015, D6).
 const LAYER_SWITCH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A simulcast rid counts as live while its last frame is at most this
-/// old (ADR 015, D2): a sender under uplink pressure stops encoding its
-/// top layer, and receivers must not stay parked on it.
+/// Simulcast liveness window (ADR 015, D2). A rid counts as *recent*
+/// while its last frame is at most this old, and as *stalled* once the
+/// other layer of the same camera has kept flowing for longer than this
+/// past it: a sender under uplink pressure stops encoding its top layer,
+/// and receivers must not stay parked on it.
 const RID_LIVENESS: Duration = Duration::from_millis(1500);
 
 /// A media track flowing *into* the SFU from its origin peer.
@@ -92,6 +94,12 @@ pub(crate) struct TrackInEntry {
     pub last_keyframe_request: HashMap<Option<Rid>, Instant>,
     /// Arrival time of the latest frame per rid: simulcast liveness.
     pub last_frame: HashMap<Option<Rid>, Instant>,
+    /// When each rid's current streak of frames began: its first frame
+    /// after a gap longer than [`RID_LIVENESS`].
+    pub run_start: HashMap<Option<Rid>, Instant>,
+    /// Arrival time of the track's first frame on any rid: a rid that
+    /// never delivered counts as last seen then.
+    pub first_frame: Option<Instant>,
 }
 
 /// State machine of an outgoing track (a `TrackIn` of *another* peer that
@@ -733,6 +741,8 @@ impl Peer {
                     track: Arc::clone(&track),
                     last_keyframe_request: HashMap::new(),
                     last_frame: HashMap::new(),
+                    run_start: HashMap::new(),
+                    first_frame: None,
                 });
                 PollOutcome::TrackOpened(track)
             }
@@ -827,8 +837,46 @@ impl Peer {
     /// Record a frame's arrival on incoming `mid`/`rid` (liveness).
     pub(crate) fn note_frame(&mut self, mid: Mid, rid: Option<Rid>, at: Instant) {
         if let Some(entry) = self.tracks_in.iter_mut().find(|e| e.track.mid == mid) {
-            entry.last_frame.insert(rid, at);
+            let resumed = entry
+                .last_frame
+                .insert(rid, at)
+                .is_none_or(|prev| at.saturating_duration_since(prev) > RID_LIVENESS);
+            if resumed {
+                entry.run_start.insert(rid, at);
+            }
+            entry.first_frame.get_or_insert(at);
         }
+    }
+
+    /// Whether incoming `mid`'s `rid` stalled while `other` (another rid
+    /// of the same camera) kept flowing: `other` is recent, and for more
+    /// than the liveness window it has delivered without `rid` — counted
+    /// from `rid`'s last frame or the start of `other`'s current streak,
+    /// whichever is later. A pause of both layers is not a stall, and
+    /// neither are the few milliseconds by which their frames arrive
+    /// apart when the sender resumes, which an absolute per-rid check
+    /// mistakes for one layer being dead.
+    pub(crate) fn rid_stalled(
+        &self,
+        mid: Mid,
+        rid: Option<Rid>,
+        other: Option<Rid>,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self.tracks_in.iter().find(|e| e.track.mid == mid) else {
+            return false;
+        };
+        let Some(&other_at) = entry.last_frame.get(&other) else {
+            return false;
+        };
+        if now.saturating_duration_since(other_at) > RID_LIVENESS {
+            return false;
+        }
+        let Some(rid_at) = entry.last_frame.get(&rid).copied().or(entry.first_frame) else {
+            return false;
+        };
+        let other_since = entry.run_start.get(&other).copied().unwrap_or(other_at);
+        now.saturating_duration_since(rid_at.max(other_since)) > RID_LIVENESS
     }
 
     /// Whether incoming `mid`'s `rid` delivered a frame recently.
@@ -896,15 +944,14 @@ impl Peer {
             // Leaving a layer that no longer delivers frames (a stalled
             // sender, or a subscription with nothing flowing yet): there
             // is nothing to keep forwarding, so switch without the gate.
-            let leaving_live =
-                sources
-                    .iter()
-                    .find(|s| s.origin == d.origin)
-                    .is_some_and(|s| match d.layer {
-                        VideoLayer::High => s.low_live,
-                        VideoLayer::Low => s.high_live,
-                    });
-            let immediate = !leaving_live;
+            let leaving_recent = sources
+                .iter()
+                .find(|s| s.origin == d.origin)
+                .is_some_and(|s| match d.layer {
+                    VideoLayer::High => s.low_recent,
+                    VideoLayer::Low => s.high_recent,
+                });
+            let immediate = !leaving_recent;
             for (mid, rid) in self.switch_layer(d.origin, d.layer, immediate, now) {
                 keyframes.push((d.origin, mid, rid));
             }

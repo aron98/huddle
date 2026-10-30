@@ -72,9 +72,15 @@ pub(crate) struct Source {
     pub origin: PeerId,
     /// Subscription order (lower = earlier): the last tiebreaker.
     pub order: u64,
-    /// Whether the high / low rid delivered a frame recently.
+    /// Whether the high / low rid is usable: not stalled while the other
+    /// layer of the same camera keeps flowing (the liveness fallback).
     pub high_live: bool,
     pub low_live: bool,
+    /// Whether the high / low rid delivered a frame within the liveness
+    /// window. Switching away from a layer without one needs no keyframe
+    /// gate — there is nothing left to forward from it.
+    pub high_recent: bool,
+    pub low_recent: bool,
 }
 
 /// A layer change for one origin, to be applied by the peer.
@@ -363,6 +369,8 @@ mod tests {
             order: n as u64,
             high_live: true,
             low_live: true,
+            high_recent: true,
+            low_recent: true,
         }
     }
 

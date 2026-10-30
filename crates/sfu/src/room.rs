@@ -349,12 +349,17 @@ impl Room {
                 // A single-layer camera is forwarded as-is.
                 reserve = reserve + HIGH_COST;
             } else if !sources.iter().any(|s| s.origin == track.origin) {
-                let live = |rid| origin.is_some_and(|o| o.rid_live(track.mid, rid, now));
+                let (high, low) = (track.rids.first().copied(), track.rids.last().copied());
+                let recent = |rid| origin.is_some_and(|o| o.rid_live(track.mid, rid, now));
+                let stalled =
+                    |rid, other| origin.is_some_and(|o| o.rid_stalled(track.mid, rid, other, now));
                 sources.push(Source {
                     origin: track.origin,
                     order: seq,
-                    high_live: live(track.rids.first().copied()),
-                    low_live: live(track.rids.last().copied()),
+                    high_live: !stalled(high, low),
+                    low_live: !stalled(low, high),
+                    high_recent: recent(high),
+                    low_recent: recent(low),
                 });
             }
         }
