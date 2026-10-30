@@ -483,16 +483,19 @@ impl Room {
     }
 
     /// Relay a receiver's keyframe request (on its outgoing `mid`) back to
-    /// the origin peer's incoming track.
+    /// the origin peer's incoming track — on a simulcast source, to the
+    /// layer this receiver is (about to be) forwarded.
     fn route_keyframe_request(&mut self, receiver: PeerId, req: KeyframeRequest) {
         let Some(peer) = self.peers.get(&receiver) else {
             return;
         };
-        let Some((origin, mid_in)) = peer.track_in_for_outgoing(req.mid) else {
+        let Some((origin, mid_in, rid)) = peer.track_in_for_outgoing(req.mid) else {
             return;
         };
+        // Never relay the receiver's own (absent) rid: on a simulcast
+        // source str0m would match any layer, often not the forwarded one.
         if let Some(origin_peer) = self.peers.get_mut(&origin)
-            && let Err(e) = origin_peer.request_keyframe(mid_in, req.rid, req.kind)
+            && let Err(e) = origin_peer.request_keyframe(mid_in, rid, req.kind)
         {
             tracing::warn!("keyframe relay to peer {origin} failed: {e}");
         }

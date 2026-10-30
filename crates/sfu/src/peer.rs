@@ -927,13 +927,22 @@ impl Peer {
     }
 
     /// Look up the origin track behind an outgoing `Mid` (used to route
-    /// keyframe requests back to the media source).
-    pub(crate) fn track_in_for_outgoing(&self, mid_out: Mid) -> Option<(PeerId, Mid)> {
-        self.tracks_out
+    /// keyframe requests back to the media source), with the simulcast
+    /// rid this receiver needs a keyframe on: the target of a pending
+    /// switch (the gate cuts over on exactly that keyframe), else the
+    /// forwarded layer. `None` for single-layer sources.
+    ///
+    /// The receiver sees one plain stream per m-line, so its PLI/FIR
+    /// carries no rid — and str0m treats a missing rid as a wildcard
+    /// that picks an arbitrary simulcast layer of the origin's track.
+    pub(crate) fn track_in_for_outgoing(&self, mid_out: Mid) -> Option<(PeerId, Mid, Option<Rid>)> {
+        let out = self
+            .tracks_out
             .iter()
-            .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))
-            .and_then(|t| t.track_in.upgrade())
-            .map(|t| (t.origin, t.mid))
+            .find(|t| matches!(t.state, TrackOutState::Open(m) if m == mid_out))?;
+        let track = out.track_in.upgrade()?;
+        let layer = out.pending.map_or(out.layer, |(target, _)| target);
+        Some((track.origin, track.mid, chosen_rid(&track.rids, layer)))
     }
 
     /// Whether the frame's simulcast rid matches the layer forwarded on
