@@ -203,7 +203,10 @@ async function videoInboundSnapshot(page) {
     const stats = await window.__huddlePc.getStats();
     const live = {};
     stats.forEach((report) => {
-      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      // SSRC 0 is the SFU's bandwidth-probe padding (str0m, libwebrtc
+      // convention): Chrome reports it as a video inbound-rtp that never
+      // carries a frame. It is not a media stream — leave it out.
+      if (report.type === 'inbound-rtp' && report.kind === 'video' && report.ssrc !== 0) {
         live[report.ssrc] = report.framesDecoded ?? 0;
       }
     });
@@ -464,13 +467,31 @@ async function main() {
     // Focus is a hint now (ADR 015, D5): the client sends a Focus
     // message, never a per-peer layer — and unfocusing is not a cap. With
     // bandwidth for everyone, bob stays on the high layer throughout.
+    // If alice's encoder stalls her high rid for longer than the SFU's
+    // 1.5 s liveness window, the SFU rightly falls back to her low layer
+    // (issue #78): that must warn, not fail. Stalled = no high frames
+    // sent across 2 s.
+    const aliceHighStalled = async () => {
+      const sentBefore = (await senderSimulcast(alice)).high?.framesSent ?? 0;
+      await delay(2000);
+      return ((await senderSimulcast(alice)).high?.framesSent ?? 0) <= sentBefore;
+    };
     const assertStaysHigh = async (when) => {
       const until = Date.now() + 3000;
       while (Date.now() < until) {
         const layer = await sfuSimulcastLayer('bob', 'alice');
         if (layer !== 'high') {
-          await stateDump(bob, 'bob').catch(() => {});
-          fail(`bob: the SFU left the high layer for alice ${when} (metrics layer: ${layer})`);
+          if (await aliceHighStalled()) {
+            console.warn(`WARNING: alice's high layer stalled ${when}; the SFU fell back to ${layer}`);
+            return;
+          }
+          // Producing again (a stall that just ended): the SFU must return.
+          await waitFor(`the SFU to return bob to alice's high layer ${when}`, async () => {
+            return (await sfuSimulcastLayer('bob', 'alice')) === 'high';
+          }, 10_000).catch(async () => {
+            await stateDump(bob, 'bob').catch(() => {});
+            fail(`bob: the SFU left the high layer for alice ${when} (metrics layer: ${layer})`);
+          });
         }
         await delay(250);
       }
@@ -522,18 +543,20 @@ async function main() {
     // afford one high layer and one low. The earlier subscription
     // (alice) keeps high, carol's camera is downshifted — the SFU's
     // allocation decision, asserted from /metrics (ADR 015, D3/D9).
-    await waitFor('the SFU to give bob alice on high and carol on low', async () => {
-      return (
-        (await sfuSimulcastLayer('bob', 'alice')) === 'high' &&
-        (await sfuSimulcastLayer('bob', 'carol')) === 'low'
-      );
+    await waitFor('the SFU to give bob carol on low', async () => {
+      return (await sfuSimulcastLayer('bob', 'carol')) === 'low';
     }, 30_000).catch(async () => {
-      fail(
-        `bob: expected alice high + carol low under the pinned estimate ` +
-          `(metrics: alice ${await sfuSimulcastLayer('bob', 'alice')}, ` +
-          `carol ${await sfuSimulcastLayer('bob', 'carol')})`,
-      );
+      fail(`bob: expected carol low under the pinned estimate (metrics: ${await sfuSimulcastLayer('bob', 'carol')})`);
     });
+    const aliceHigh = await tryWaitFor('the SFU to keep bob on alice high', async () => {
+      return (await sfuSimulcastLayer('bob', 'alice')) === 'high';
+    }, 30_000);
+    if (!aliceHigh) {
+      if (!(await aliceHighStalled())) {
+        fail(`bob: expected alice high under the pinned estimate (metrics: ${await sfuSimulcastLayer('bob', 'alice')})`);
+      }
+      console.warn("WARNING: alice's high layer stalled; skipping the alice-high check");
+    }
     console.log('bob: one remote high layer fits the pinned estimate (alice high, carol low)');
 
     // The focus tiebreak (ADR 015 D5, issues #114/#116): only one high
