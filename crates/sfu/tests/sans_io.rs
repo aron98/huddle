@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use huddle_protocol::VideoLayer;
 use huddle_sfu::{
-    Bitrate, PeerId, RecordedFrame, RecorderSink, Room, SfuError, SfuOutput, SimulcastConfig,
+    Bitrate, LayerSwitch, PeerId, RecordedFrame, RecorderSink, Room, SfuError, SfuOutput,
+    SimulcastConfig, SwitchReason,
 };
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
@@ -1092,6 +1093,27 @@ fn simulcast_defaults_to_high_and_downshifts_on_a_constrained_estimate() {
         room.peer_stats(a_id).unwrap().keyframes_requested > keyframes_before,
         "the downshift asked for no keyframe on the low layer"
     );
+    // The decision is handed out once, with its reason and inputs (ADR
+    // 015, D7): 500 kbps × 0.9 minus a's 40 kbps audio reserve.
+    let switches = room.drain_layer_switches();
+    assert_eq!(
+        switches,
+        vec![LayerSwitch {
+            receiver: b_id,
+            origin: a_id,
+            from: VideoLayer::High,
+            to: VideoLayer::Low,
+            reason: SwitchReason::Bwe,
+            estimate: Some(Bitrate::kbps(500)),
+            budget: Some(Bitrate::kbps(410)),
+        }]
+    );
+    assert!(room.drain_layer_switches().is_empty(), "drained twice");
+    let stats = room.peer_stats(b_id).unwrap();
+    assert_eq!(stats.egress_estimate, Some(Bitrate::kbps(500)));
+    assert!(stats.egress_desired.is_some_and(|d| !d.is_zero()));
+    assert_eq!(stats.layer_upgrade_hold, Duration::from_secs(5));
+    assert_eq!(stats.layer_switch_reasons, vec![(a_id, SwitchReason::Bwe)]);
     assert_eq!(
         count(&b, LOW),
         0,

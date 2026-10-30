@@ -10,7 +10,7 @@ use crate::alloc::{AUDIO_RESERVE, HIGH_COST, SCREEN_RESERVE, Source};
 use crate::error::SfuError;
 use crate::peer::{Peer, PollOutcome, TrackIn};
 use crate::recorder::{RecordedFrame, RecorderSink};
-use crate::{Bitrate, PeerId, PeerStats, SimulcastConfig};
+use crate::{Bitrate, LayerSwitch, PeerId, PeerStats, SimulcastConfig};
 
 use std::sync::Arc;
 
@@ -50,6 +50,8 @@ pub struct Room {
     simulcast: SimulcastConfig,
     /// When the next layer-allocation round is due.
     next_reallocate: Option<Instant>,
+    /// Layer decisions not yet handed out by [`Room::drain_layer_switches`].
+    layer_switches: Vec<LayerSwitch>,
 }
 
 impl Room {
@@ -70,6 +72,7 @@ impl Room {
             recorder: None,
             simulcast,
             next_reallocate: None,
+            layer_switches: Vec::new(),
         }
     }
 
@@ -141,6 +144,11 @@ impl Room {
                 ingress_loss_fraction: l.ingress_loss_fraction,
                 egress_loss_fraction: l.egress_loss_fraction,
                 layer_preferences: p.layer_preferences(),
+                egress_estimate: p.egress_estimate(),
+                egress_desired: p.egress_desired(),
+                bwe_can_probe: p.bwe_can_probe(),
+                layer_upgrade_hold: p.layer_upgrade_hold(),
+                layer_switch_reasons: p.last_switch_reasons(),
             }
         })
     }
@@ -366,7 +374,7 @@ impl Room {
         let Some(peer) = self.peers.get_mut(&receiver) else {
             return;
         };
-        let mut keyframes = peer.reallocate(now, &sources, reserve);
+        let mut keyframes = peer.reallocate(now, &sources, reserve, &mut self.layer_switches);
         // Every round, not just at the switch: the origin's throttle is
         // shared across receivers and may have dropped an earlier ask.
         keyframes.extend(peer.keyframes_wanted());
@@ -375,6 +383,14 @@ impl Room {
                 origin_peer.request_keyframe_throttled(mid_in, Some(rid), KeyframeRequestKind::Fir);
             }
         }
+    }
+
+    /// The simulcast layer decisions made since the last call, oldest
+    /// first (ADR 015, D7). They accumulate between calls, so an
+    /// embedder that runs [`Room::handle_timeout`] should drain them
+    /// regularly.
+    pub fn drain_layer_switches(&mut self) -> Vec<LayerSwitch> {
+        std::mem::take(&mut self.layer_switches)
     }
 
     /// Poll one peer until it yields an output for the embedder.

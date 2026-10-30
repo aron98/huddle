@@ -12,9 +12,9 @@ use str0m::media::{
 };
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 
-use crate::alloc::{LayerAllocator, Source};
+use crate::alloc::{LayerAllocator, Source, SwitchReason};
 use crate::error::SfuError;
-use crate::{PeerId, SimulcastConfig};
+use crate::{LayerSwitch, PeerId, SimulcastConfig};
 /// Minimum interval between automatic keyframe requests for the same track.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -239,6 +239,9 @@ pub(crate) struct Peer {
     alloc: LayerAllocator,
     /// The desired bitrate last handed to str0m's probe controller.
     desired: Option<Bitrate>,
+    /// The reason of the last layer switch per simulcast origin; an
+    /// origin still on its default High has no entry.
+    last_switch: Vec<(PeerId, SwitchReason)>,
     /// Next [`TrackOut::seq`].
     next_out_seq: u64,
     /// Measured ingress per incoming `(mid, rid)`, from str0m's periodic
@@ -316,6 +319,7 @@ impl Peer {
             stats_prev: None,
             alloc,
             desired: None,
+            last_switch: Vec::new(),
             next_out_seq: 0,
             ingress: HashMap::new(),
         };
@@ -919,30 +923,72 @@ impl Peer {
         self.alloc.set_override(estimate);
     }
 
+    /// The egress estimate the allocation runs on (override included),
+    /// even while frozen.
+    pub(crate) fn egress_estimate(&self) -> Option<Bitrate> {
+        self.alloc.estimate()
+    }
+
+    /// The desired bitrate last handed to str0m's probe controller.
+    pub(crate) fn egress_desired(&self) -> Option<Bitrate> {
+        self.desired
+    }
+
+    /// str0m's `can_probe` from the last estimate, if one arrived.
+    pub(crate) fn bwe_can_probe(&self) -> Option<bool> {
+        self.alloc.can_probe()
+    }
+
+    /// The reason of the last layer switch per origin this receiver
+    /// still subscribes to (none for an origin never switched).
+    pub(crate) fn last_switch_reasons(&self) -> Vec<(PeerId, SwitchReason)> {
+        self.last_switch.clone()
+    }
+
+    /// The allocator's current upgrade hold (hysteresis state).
+    pub(crate) fn layer_upgrade_hold(&self) -> Duration {
+        self.alloc.hold()
+    }
+
     /// Run one layer-allocation round for this receiver and apply its
-    /// decisions. Returns the `(origin, mid, rid)` keyframe requests the
-    /// room must relay to the origins of switched layers.
+    /// decisions, recording each in `switches`. Returns the
+    /// `(origin, mid, rid)` keyframe requests the room must relay to the
+    /// origins of switched layers.
     pub(crate) fn reallocate(
         &mut self,
         now: Instant,
         sources: &[Source],
         reserve: Bitrate,
+        switches: &mut Vec<LayerSwitch>,
     ) -> Vec<(PeerId, Mid, Rid)> {
         let desired = LayerAllocator::desired_bitrate(sources.len(), reserve);
         if !desired.is_zero() && self.desired != Some(desired) {
             self.rtc.bwe().set_desired_bitrate(desired);
             self.desired = Some(desired);
         }
+        self.last_switch
+            .retain(|(o, _)| sources.iter().any(|s| s.origin == *o));
         let mut keyframes = Vec::new();
         for d in self.alloc.evaluate(now, sources, reserve) {
-            tracing::debug!(
-                receiver = %self.id,
-                origin = %d.origin,
-                layer = ?d.layer,
-                reason = ?d.reason,
-                estimate = ?self.alloc.effective_estimate(),
-                "simulcast layer switch"
-            );
+            // Two layers: a switch always leaves the other one.
+            let from = match d.layer {
+                VideoLayer::High => VideoLayer::Low,
+                VideoLayer::Low => VideoLayer::High,
+            };
+            let estimate = self.alloc.estimate();
+            match self.last_switch.iter_mut().find(|(o, _)| *o == d.origin) {
+                Some(entry) => entry.1 = d.reason,
+                None => self.last_switch.push((d.origin, d.reason)),
+            }
+            switches.push(LayerSwitch {
+                receiver: self.id,
+                origin: d.origin,
+                from,
+                to: d.layer,
+                reason: d.reason,
+                estimate,
+                budget: estimate.map(|e| LayerAllocator::camera_budget(e, reserve)),
+            });
             // Leaving a layer that no longer delivers frames (a stalled
             // sender, or a subscription with nothing flowing yet): there
             // is nothing to keep forwarding, so switch without the gate.

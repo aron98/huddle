@@ -53,9 +53,11 @@ const BACKOFF_WINDOW: Duration = Duration::from_secs(30);
 /// This long without a downshift resets the hold.
 const HOLD_RESET: Duration = Duration::from_secs(60);
 
-/// Why a receiver's layer for an origin changed.
+/// Why a receiver's layer for an origin changed. Exhaustive on purpose:
+/// it labels the server-wide switch counter, so a new reason must be a
+/// deliberate (bounded) addition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SwitchReason {
+pub enum SwitchReason {
     /// The estimate no longer carries the allocation.
     Bwe,
     /// The estimate recovered and held the upgrade budget long enough.
@@ -162,6 +164,35 @@ impl LayerAllocator {
             .iter()
             .find(|(o, _)| *o == origin)
             .map(|(_, l)| *l)
+    }
+
+    /// The estimate as the allocator sees it, override included, even
+    /// while frozen (`can_probe == false`): the input the allocation runs
+    /// on once probing is available.
+    pub(crate) fn estimate(&self) -> Option<Bitrate> {
+        self.estimate_override
+            .or(self.estimate.map(|(estimate, _)| estimate))
+    }
+
+    /// str0m's `can_probe` from the last `Twcc` estimate, if one arrived.
+    pub(crate) fn can_probe(&self) -> Option<bool> {
+        self.estimate.map(|(_, can_probe)| can_probe)
+    }
+
+    /// The current upgrade hold (the hysteresis state, D4): how long the
+    /// upgrade budget must hold before one more High is granted.
+    pub(crate) fn hold(&self) -> Duration {
+        self.hold
+    }
+
+    /// The camera budget `estimate` leaves after `reserve`: the share
+    /// layers are allocated against (the keep budget, D3).
+    pub(crate) fn camera_budget(estimate: Bitrate, reserve: Bitrate) -> Bitrate {
+        Bitrate::bps(
+            (estimate.as_f64() * KEEP_UTILIZATION - reserve.as_f64())
+                .max(0.0)
+                .round() as u64,
+        )
     }
 
     /// The estimate allocation runs on, or `None` while frozen (no
@@ -553,12 +584,12 @@ mod tests {
         let ups = with_reason(&log, SwitchReason::Recovery);
         assert_eq!(ups.len(), holds.len(), "one upgrade per cycle: {log:?}");
         assert_eq!(with_reason(&log, SwitchReason::Bwe).len(), holds.len() + 1);
-        assert_eq!(alloc.hold, HOLD_MAX);
+        assert_eq!(alloc.hold(), HOLD_MAX);
 
         // A minute without a downshift resets the hold.
         let log = run(&mut alloc, t0, &sources, &[(t + 1, 3_300), (t + 62, 3_300)]);
         assert!(log.is_empty(), "{log:?}");
-        assert_eq!(alloc.hold, HOLD_INITIAL);
+        assert_eq!(alloc.hold(), HOLD_INITIAL);
     }
 
     #[test]
@@ -716,6 +747,113 @@ mod tests {
             vec![decision(2, VideoLayer::High, SwitchReason::Recovery)]
         );
         assert_eq!(alloc.layer(origin(1)), None, "departed origin forgotten");
+    }
+
+    #[test]
+    fn each_origin_gets_its_own_reason_in_a_mixed_round() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        let mut sources = [live(1), live(2), live(3)];
+        alloc.on_estimate(Bitrate::kbps(10_000), true);
+        assert!(alloc.evaluate(t0, &sources, RESERVE).is_empty());
+
+        // One round, two causes: the link collapses to one High's worth,
+        // so origins 2 and 3 lose their slots to the budget, while origin
+        // 1 keeps its slot but its high rid stalls.
+        alloc.on_estimate(Bitrate::kbps(2_000), true);
+        sources[0].high_live = false;
+        assert_eq!(
+            alloc.evaluate(at(t0, 1.0), &sources, RESERVE),
+            vec![
+                decision(1, VideoLayer::Low, SwitchReason::Unavailable),
+                decision(2, VideoLayer::Low, SwitchReason::Bwe),
+                decision(3, VideoLayer::Low, SwitchReason::Bwe),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_budget_downshift_onto_a_stalled_low_is_attributed_to_liveness_later() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        let mut sources = [live(1), live(2)];
+        assert!(alloc.evaluate(t0, &sources, RESERVE).is_empty());
+
+        // The budget takes origin 2's High while its low rid is not
+        // delivering: it stays on the live High, so nothing switches.
+        sources[1].low_live = false;
+        alloc.on_estimate(Bitrate::kbps(2_000), true);
+        assert!(alloc.evaluate(at(t0, 1.0), &sources, RESERVE).is_empty());
+        assert_eq!(alloc.layer(origin(2)), Some(VideoLayer::High));
+
+        // Once the low rid delivers, the deferred downshift happens, and
+        // it is the liveness change that triggered it, not the estimate.
+        sources[1].low_live = true;
+        assert_eq!(
+            alloc.evaluate(at(t0, 1.1), &sources, RESERVE),
+            vec![decision(2, VideoLayer::Low, SwitchReason::Unavailable)]
+        );
+    }
+
+    #[test]
+    fn a_focus_swap_while_frozen_is_attributed_to_focus() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        let sources = [live(1), live(2)];
+        alloc.on_estimate(Bitrate::kbps(2_000), true);
+        assert_eq!(
+            alloc.evaluate(t0, &sources, RESERVE),
+            vec![decision(2, VideoLayer::Low, SwitchReason::Bwe)]
+        );
+        // Frozen: the slot count stays, but focus still moves the slot.
+        alloc.on_estimate(Bitrate::kbps(2_000), false);
+        alloc.set_focus(Some(origin(2)));
+        assert_eq!(
+            alloc.evaluate(at(t0, 1.0), &sources, RESERVE),
+            vec![
+                decision(1, VideoLayer::Low, SwitchReason::Focus),
+                decision(2, VideoLayer::High, SwitchReason::Focus),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_join_past_the_budget_downshifts_the_newcomer_for_bwe() {
+        let mut alloc = LayerAllocator::default();
+        let t0 = Instant::now();
+        alloc.set_override(Some(Bitrate::kbps(2_500)));
+        assert!(alloc.evaluate(t0, &[live(1)], RESERVE).is_empty());
+        // The newcomer enters on the default High, which does not fit.
+        assert_eq!(
+            alloc.evaluate(at(t0, 0.1), &[live(1), live(2)], RESERVE),
+            vec![decision(2, VideoLayer::Low, SwitchReason::Bwe)]
+        );
+    }
+
+    #[test]
+    fn metrics_inputs_report_the_estimate_even_while_frozen() {
+        let mut alloc = LayerAllocator::default();
+        assert_eq!((alloc.estimate(), alloc.can_probe()), (None, None));
+        assert_eq!(alloc.hold(), HOLD_INITIAL);
+
+        alloc.on_estimate(Bitrate::kbps(1_200), false);
+        assert_eq!(alloc.estimate(), Some(Bitrate::kbps(1_200)));
+        assert_eq!(alloc.can_probe(), Some(false));
+        assert_eq!(alloc.effective_estimate(), None, "frozen");
+
+        // The override is what the allocator sees; can_probe stays str0m's.
+        alloc.set_override(Some(Bitrate::kbps(2_500)));
+        assert_eq!(alloc.estimate(), Some(Bitrate::kbps(2_500)));
+        assert_eq!(alloc.can_probe(), Some(false));
+    }
+
+    #[test]
+    fn the_camera_budget_is_the_keep_share_minus_the_reserve() {
+        let budget = LayerAllocator::camera_budget(Bitrate::kbps(2_500), RESERVE);
+        assert_eq!(budget.as_u64(), 2_170_000);
+        // A reserve above the keep share leaves nothing, not a panic.
+        let starved = LayerAllocator::camera_budget(Bitrate::kbps(50), RESERVE);
+        assert!(starved.is_zero());
     }
 
     #[test]

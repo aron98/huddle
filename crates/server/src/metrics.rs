@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 
 use huddle_protocol::VideoLayer;
+use huddle_sfu::SwitchReason;
 
 use crate::engine::{PeerReport, StatsReport};
 
@@ -63,14 +64,14 @@ pub fn render(report: &StatsReport) -> String {
         "Most recent round-trip time to this peer, milliseconds.",
         |p| p.rtt_ms,
     );
-    peer_gauge_f32(
+    peer_gauge(
         &mut out,
         report,
         "huddle_peer_ingress_loss_fraction",
         "Packet loss on the wire from this peer (fraction of 1.0).",
         |p| p.ingress_loss_fraction,
     );
-    peer_gauge_f32(
+    peer_gauge(
         &mut out,
         report,
         "huddle_peer_egress_loss_fraction",
@@ -95,6 +96,13 @@ pub fn render(report: &StatsReport) -> String {
     peer_counter(
         &mut out,
         report,
+        "huddle_peer_dropped_frames_total",
+        "Media frames shed toward this peer because its egress queue overflowed (pacer backpressure).",
+        |p| p.dropped_frames,
+    );
+    peer_counter(
+        &mut out,
+        report,
         "huddle_peer_keyframes_requested_total",
         "Keyframe (FIR/PLI) requests enqueued toward this peer.",
         |p| p.keyframes_requested,
@@ -113,6 +121,50 @@ pub fn render(report: &StatsReport) -> String {
         "Media payload bytes sent to this peer.",
         |p| p.bytes_tx,
     );
+
+    // Adaptive simulcast decision loop (ADR 015, D7).
+    peer_gauge(
+        &mut out,
+        report,
+        "huddle_peer_egress_estimate_bps",
+        "Egress bandwidth estimate this peer's simulcast layers are allocated against (override included), bits per second.",
+        |p| p.egress_estimate_bps,
+    );
+    peer_gauge(
+        &mut out,
+        report,
+        "huddle_peer_egress_desired_bps",
+        "Desired bitrate handed to the bandwidth prober for this peer, bits per second.",
+        |p| p.egress_desired_bps,
+    );
+    peer_gauge(
+        &mut out,
+        report,
+        "huddle_peer_bwe_can_probe",
+        "Whether the bandwidth estimator toward this peer can probe (0/1); a stuck 0 freezes its layer allocation.",
+        |p| p.bwe_can_probe.map(u8::from),
+    );
+    peer_gauge(
+        &mut out,
+        report,
+        "huddle_peer_layer_upgrade_hold_seconds",
+        "How long a recovered estimate must hold before this peer gets one more high layer (backs off after failed upgrades).",
+        |p| Some(p.layer_upgrade_hold_seconds),
+    );
+
+    header(
+        &mut out,
+        "huddle_simulcast_layer_switches_total",
+        "counter",
+        "Simulcast layer switches across all receivers, by direction and reason.",
+    );
+    for c in &report.layer_switches {
+        let _ = writeln!(
+            out,
+            "huddle_simulcast_layer_switches_total{{direction=\"{}\",reason=\"{}\"}} {}",
+            c.direction, c.reason, c.count
+        );
+    }
 
     header(
         &mut out,
@@ -139,7 +191,43 @@ pub fn render(report: &StatsReport) -> String {
         }
     }
 
+    header(
+        &mut out,
+        "huddle_peer_simulcast_last_switch_reason",
+        "gauge",
+        "Reason of the allocator's last layer switch for this peer and origin (0 = bwe, 1 = recovery, 2 = focus, 3 = unavailable); absent while the origin is still on its default high layer.",
+    );
+    for room in &report.rooms {
+        for peer in &room.peers {
+            for sub in &peer.simulcast_layers {
+                let Some(reason) = sub.last_switch_reason else {
+                    continue;
+                };
+                let _ = writeln!(
+                    out,
+                    "huddle_peer_simulcast_last_switch_reason{{room=\"{}\",peer=\"{}\",id=\"{}\",origin=\"{}\"}} {}",
+                    escape(&room.code),
+                    escape(&peer.name),
+                    peer.id,
+                    escape(&sub.origin),
+                    switch_reason_code(reason)
+                );
+            }
+        }
+    }
+
     out
+}
+
+/// The numeric encoding of `huddle_peer_simulcast_last_switch_reason`,
+/// documented in its HELP text; the order of the counter's `reason` labels.
+fn switch_reason_code(reason: SwitchReason) -> u8 {
+    match reason {
+        SwitchReason::Bwe => 0,
+        SwitchReason::Recovery => 1,
+        SwitchReason::Focus => 2,
+        SwitchReason::Unavailable => 3,
+    }
 }
 
 fn header(out: &mut String, name: &str, type_: &str, help: &str) {
@@ -160,24 +248,12 @@ fn peer_counter(
 }
 
 /// Emit one gauge family: header, then a sample per peer.
-fn peer_gauge(
+fn peer_gauge<T: std::fmt::Display>(
     out: &mut String,
     report: &StatsReport,
     name: &str,
     help: &str,
-    value: impl Fn(&PeerReport) -> Option<u64>,
-) {
-    header(out, name, "gauge", help);
-    for_each_peer(out, report, name, |p| value(p).map(|v| v.to_string()));
-}
-
-/// Like [`peer_gauge`] for `f32`-valued gauges (loss fractions).
-fn peer_gauge_f32(
-    out: &mut String,
-    report: &StatsReport,
-    name: &str,
-    help: &str,
-    value: impl Fn(&PeerReport) -> Option<f32>,
+    value: impl Fn(&PeerReport) -> Option<T>,
 ) {
     header(out, name, "gauge", help);
     for_each_peer(out, report, name, |p| value(p).map(|v| v.to_string()));
@@ -225,7 +301,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::engine::{PeerReport, RoomReport, SimulcastLayer};
+    use crate::engine::{PeerReport, RoomReport, SimulcastLayer, zeroed_layer_switches};
     use uuid::Uuid;
 
     fn sample_report(rtt_ms: Option<u64>, loss: Option<f32>) -> StatsReport {
@@ -245,12 +321,19 @@ mod tests {
                     rtt_ms,
                     ingress_loss_fraction: loss,
                     egress_loss_fraction: loss,
+                    dropped_frames: 3,
+                    egress_estimate_bps: Some(2_500_000),
+                    egress_desired_bps: Some(1_738_000),
+                    bwe_can_probe: Some(true),
+                    layer_upgrade_hold_seconds: 5.0,
                     simulcast_layers: vec![SimulcastLayer {
                         origin: "bob".into(),
                         layer: VideoLayer::Low,
+                        last_switch_reason: Some(SwitchReason::Bwe),
                     }],
                 }],
             }],
+            layer_switches: zeroed_layer_switches(),
         }
     }
 
@@ -301,6 +384,112 @@ mod tests {
         report.rooms[0].peers[0].simulcast_layers.clear();
         let out = render(&report);
         assert!(!out.contains("huddle_peer_simulcast_layer{"));
+    }
+
+    #[test]
+    fn renders_the_adaptive_simulcast_decision_inputs() {
+        let ids =
+            "room=\"ABCD-EFGH-JKLM\",peer=\"alice\",id=\"00000000-0000-0000-0000-000000000000\"";
+        let out = render(&sample_report(None, None));
+        for (family, type_, value) in [
+            ("huddle_peer_egress_estimate_bps", "gauge", "2500000"),
+            ("huddle_peer_egress_desired_bps", "gauge", "1738000"),
+            ("huddle_peer_bwe_can_probe", "gauge", "1"),
+            ("huddle_peer_layer_upgrade_hold_seconds", "gauge", "5"),
+            ("huddle_peer_dropped_frames_total", "counter", "3"),
+        ] {
+            assert!(
+                out.contains(&format!("# TYPE {family} {type_}\n")),
+                "{family} header"
+            );
+            assert!(
+                out.contains(&format!("{family}{{{ids}}} {value}\n")),
+                "{family} sample in:\n{out}"
+            );
+        }
+
+        // A backed-off hold keeps its fraction; a frozen estimator is 0.
+        let mut report = sample_report(None, None);
+        report.rooms[0].peers[0].layer_upgrade_hold_seconds = 12.5;
+        report.rooms[0].peers[0].bwe_can_probe = Some(false);
+        let out = render(&report);
+        assert!(out.contains(&format!(
+            "huddle_peer_layer_upgrade_hold_seconds{{{ids}}} 12.5\n"
+        )));
+        assert!(out.contains(&format!("huddle_peer_bwe_can_probe{{{ids}}} 0\n")));
+
+        // Before str0m's first estimate there is nothing to show.
+        report.rooms[0].peers[0].egress_estimate_bps = None;
+        report.rooms[0].peers[0].egress_desired_bps = None;
+        report.rooms[0].peers[0].bwe_can_probe = None;
+        let out = render(&report);
+        assert!(!out.contains("huddle_peer_egress_estimate_bps{"));
+        assert!(!out.contains("huddle_peer_egress_desired_bps{"));
+        assert!(!out.contains("huddle_peer_bwe_can_probe{"));
+        assert!(out.contains("# TYPE huddle_peer_egress_estimate_bps gauge\n"));
+    }
+
+    #[test]
+    fn layer_switches_are_eight_server_wide_series() {
+        let mut report = sample_report(None, None);
+        report.layer_switches[0].count = 4;
+        let out = render(&report);
+        assert!(out.contains("# TYPE huddle_simulcast_layer_switches_total counter\n"));
+        let samples: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("huddle_simulcast_layer_switches_total{"))
+            .collect();
+        assert_eq!(samples.len(), 8, "{samples:?}");
+        // No peer labels: the cardinality is fixed regardless of rooms.
+        assert!(samples.iter().all(|l| !l.contains("peer=")));
+        for direction in ["up", "down"] {
+            for reason in ["bwe", "recovery", "focus", "unavailable"] {
+                let series = format!(
+                    "huddle_simulcast_layer_switches_total{{direction=\"{direction}\",reason=\"{reason}\"}} "
+                );
+                assert!(samples.iter().any(|l| l.starts_with(&series)), "{series}");
+            }
+        }
+        assert!(out.contains(
+            "huddle_simulcast_layer_switches_total{direction=\"up\",reason=\"bwe\"} 4\n"
+        ));
+        // Every series exists from the first scrape, zeroed.
+        let out = render(&StatsReport {
+            rooms: Vec::new(),
+            layer_switches: zeroed_layer_switches(),
+        });
+        assert!(out.contains(
+            "huddle_simulcast_layer_switches_total{direction=\"down\",reason=\"unavailable\"} 0\n"
+        ));
+    }
+
+    #[test]
+    fn renders_the_last_switch_reason_per_origin() {
+        let series = "huddle_peer_simulcast_last_switch_reason{room=\"ABCD-EFGH-JKLM\",peer=\"alice\",id=\"00000000-0000-0000-0000-000000000000\",origin=\"bob\"}";
+        let out = render(&sample_report(None, None));
+        assert!(out.contains("# TYPE huddle_peer_simulcast_last_switch_reason gauge\n"));
+        assert!(out.contains(
+            "# HELP huddle_peer_simulcast_last_switch_reason Reason of the allocator's last layer switch for this peer and origin (0 = bwe, 1 = recovery, 2 = focus, 3 = unavailable)"
+        ));
+        assert!(out.contains(&format!("{series} 0\n")), "{out}");
+
+        // Every reason has its documented code.
+        let mut report = sample_report(None, None);
+        for (reason, code) in [
+            (SwitchReason::Recovery, 1),
+            (SwitchReason::Focus, 2),
+            (SwitchReason::Unavailable, 3),
+        ] {
+            report.rooms[0].peers[0].simulcast_layers[0].last_switch_reason = Some(reason);
+            assert!(render(&report).contains(&format!("{series} {code}\n")));
+        }
+
+        // Never switched (still on the default High): no sample, while
+        // the layer gauge still reports the subscription.
+        report.rooms[0].peers[0].simulcast_layers[0].last_switch_reason = None;
+        let out = render(&report);
+        assert!(!out.contains("huddle_peer_simulcast_last_switch_reason{"));
+        assert!(out.contains("huddle_peer_simulcast_layer{"));
     }
 
     #[test]
