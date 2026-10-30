@@ -166,7 +166,10 @@ async function videoInboundSnapshot(page) {
     const stats = await window.__huddlePc.getStats();
     const live = {};
     stats.forEach((report) => {
-      if (report.type === 'inbound-rtp' && report.kind === 'video') {
+      // SSRC 0 is the SFU's bandwidth-probe padding (str0m, libwebrtc
+      // convention): Chrome reports it as a video inbound-rtp that never
+      // carries a frame. It is not a media stream — leave it out.
+      if (report.type === 'inbound-rtp' && report.kind === 'video' && report.ssrc !== 0) {
         live[report.ssrc] = report.framesDecoded ?? 0;
       }
     });

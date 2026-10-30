@@ -15,7 +15,9 @@ use huddle_sfu::{
 };
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::format::Codec;
-use str0m::media::{Direction, MediaKind, MediaTime, Rid, Simulcast, SimulcastLayer};
+use str0m::media::{
+    Direction, KeyframeRequestKind, MediaKind, MediaTime, Rid, Simulcast, SimulcastLayer,
+};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
@@ -42,6 +44,11 @@ struct TestClient {
     media_rx_markers: HashMap<u8, usize>,
     /// Every renegotiation offer the room sent us (for msid assertions).
     server_offers: Vec<String>,
+    /// The m-line each marker byte arrived on (receive side).
+    media_rx_mids: HashMap<u8, str0m::media::Mid>,
+    /// Keyframe requests the room relayed to us as a sender, with the
+    /// simulcast rid they target.
+    keyframe_requests: Vec<(KeyframeRequestKind, Option<Rid>)>,
 }
 
 impl TestClient {
@@ -69,6 +76,8 @@ impl TestClient {
             media_rx: 0,
             media_rx_markers: HashMap::new(),
             server_offers: Vec::new(),
+            media_rx_mids: HashMap::new(),
+            keyframe_requests: Vec::new(),
         }
     }
 
@@ -367,8 +376,10 @@ fn step(room: &mut Room, clients: &mut [&mut TestClient]) {
                         client.media_rx += 1;
                         if let Some(&marker) = d.data.first() {
                             *client.media_rx_markers.entry(marker).or_insert(0) += 1;
+                            client.media_rx_mids.insert(marker, d.mid);
                         }
                     }
+                    Event::KeyframeRequest(r) => client.keyframe_requests.push((r.kind, r.rid)),
                     _ => {}
                 },
                 Err(_) => break,
@@ -1229,6 +1240,61 @@ fn switching_receivers_keep_asking_for_a_keyframe_until_one_arrives() {
 }
 
 #[test]
+fn a_receivers_keyframe_request_reaches_the_layer_it_is_forwarded() {
+    let mut room = pinned_room(OVERRIDE);
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
+    let cam_rx = b.media_rx_mids[&HIGH];
+
+    // b's decoder asks for a keyframe the way a browser does: a PLI on
+    // its plain (rid-less) receive stream. It must reach the layer b is
+    // forwarded — str0m alone would treat the missing rid as "any
+    // layer" (issue: e2e-blur stuck with no keyframe after a swap).
+    let pli_rids = |client: &TestClient| -> Vec<Option<Rid>> {
+        client
+            .keyframe_requests
+            .iter()
+            .filter(|(kind, _)| *kind == KeyframeRequestKind::Pli)
+            .map(|(_, rid)| *rid)
+            .collect()
+    };
+    let pli = |room: &mut Room, a: &mut TestClient, b: &mut TestClient| {
+        a.keyframe_requests.clear();
+        b.rtc
+            .writer(cam_rx)
+            .unwrap()
+            .request_keyframe(None, KeyframeRequestKind::Pli)
+            .unwrap();
+        drain(room, &mut [a, b], Duration::from_millis(300));
+    };
+    pli(&mut room, &mut a, &mut b);
+    assert_eq!(pli_rids(&a), vec![Some(Rid::from("high"))]);
+
+    // Downshifted to low (the same session, so the same str0m stream
+    // map): the PLI now belongs on the low layer.
+    room.set_egress_estimate_override(b_id, Some(Bitrate::kbps(500)))
+        .unwrap();
+    a.send_simulcast_frames(cam, "high", HIGH, 2);
+    a.send_simulcast_frames(cam, "low", LOW, 2);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    a.send_simulcast_gop(cam, "low", LOW, 3);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    pli(&mut room, &mut a, &mut b);
+    assert_eq!(pli_rids(&a), vec![Some(Rid::from("low"))]);
+}
+
+#[test]
 fn late_joiners_start_on_the_high_layer() {
     let mut room = pinned_room(OVERRIDE);
     let mut a = TestClient::new(1);
@@ -1342,11 +1408,14 @@ fn a_stalled_high_layer_falls_back_to_the_live_one() {
 
     // The sender only produces its low layer (Chrome drops the top
     // encoding under uplink pressure, issue #78). b is on the default
-    // High, but must not sit on a dead layer: the next round falls back
-    // to low without waiting for a keyframe.
+    // High, but must not sit on a dead layer: once low has kept flowing
+    // past the 1.5 s liveness window, b falls back to it without waiting
+    // for a keyframe.
     a.send_simulcast_gop(cam, "low", LOW, 5);
-    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
-    a.send_simulcast_frames(cam, "low", LOW, 5);
+    for _ in 0..7 {
+        drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+        a.send_simulcast_frames(cam, "low", LOW, 2);
+    }
     drain(&mut room, &mut [&mut a, &mut b], SETTLE);
     assert!(count(&b, LOW) > 0, "the live low layer was not forwarded");
     assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
@@ -1363,6 +1432,48 @@ fn a_stalled_high_layer_falls_back_to_the_live_one() {
         "the resumed high layer was not forwarded"
     );
     assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::High));
+}
+
+#[test]
+fn a_sender_resuming_after_a_pause_is_not_a_stalled_layer() {
+    // Both layers pause together (a camera swap, a frozen encoder); on
+    // resume their frames reach the SFU a few milliseconds apart. That
+    // skew must not trip the stalled-layer fallback: it used to flip the
+    // receiver to whichever layer arrived first (immediately) and back
+    // (keyframe-gated, after that keyframe had already gone by), leaving
+    // it on the wrong layer until the gate timed out.
+    let mut room = pinned_room(Bitrate::kbps(500));
+    let mut a = TestClient::new(1);
+    let mut b = TestClient::new(2);
+    let (a_id, b_id) = (a.id, b.id);
+    a.join(&mut room);
+    b.join(&mut room);
+    let cam = a.publish_simulcast_camera(&mut room);
+    drive(&mut room, &mut [&mut a, &mut b], |r, cs| {
+        cs.iter().all(|c| c.connected) && r.peer_tracks(b_id) == Some((1, 2))
+    });
+    // Starved: b is on low.
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(300));
+    send_all_layers(&mut a, cam, [HIGH, MID, LOW]);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+
+    // A pause past the liveness window, then the resumed stream's high
+    // frame lands first — both layers are encoded from the same input
+    // frame, so one layer leads by at most one frame — and the skew is
+    // held for a few allocation rounds before low's frames arrive.
+    std::thread::sleep(Duration::from_millis(1_700));
+    a.send_simulcast_gop(cam, "high", HIGH, 1);
+    drain(&mut room, &mut [&mut a, &mut b], Duration::from_millis(400));
+    a.send_simulcast_frames(cam, "low", LOW, 3);
+    drain(&mut room, &mut [&mut a, &mut b], SETTLE);
+    assert_eq!(layer_of(&room, b_id, a_id), Some(VideoLayer::Low));
+    assert_eq!(count(&b, HIGH), 0, "flipped to the high layer on resume");
+    assert_eq!(
+        count(&b, HIGH & !1),
+        0,
+        "flipped to the high layer on resume"
+    );
 }
 
 #[test]

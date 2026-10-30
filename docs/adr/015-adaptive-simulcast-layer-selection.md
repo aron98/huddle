@@ -228,6 +228,31 @@ layer"). Defaulting to High would otherwise freeze tiles. A non-live
 target layer falls back to the other live layer (`SwitchReason::Unavailable`).
 When it becomes live again, the allocator re-evaluates without any hold.
 
+*Amended after #120:* liveness is **relative**, not absolute. A rid
+counts as *stalled* only when it has been silent for more than 1.5 s
+**and** the other layer of the same camera has delivered 3 frames since
+its last one (or since the track's first frame, if it never delivered).
+Counting frames rather than time keeps the rule frame-rate independent.
+A resuming sender's layers lead each other by at most one frame, while
+a layer that really stopped is outrun at any rate, including a source
+slower than one frame per 1.5 s (a CPU-starved blur pipeline,
+screen-like content). With the absolute rule, the few milliseconds by
+which a resuming sender's layers arrive apart, after any common pause
+such as stream start or a camera swap, flipped receivers to whichever
+layer arrived first and back. A first relative rule that measured the
+other layer's continuous streak in time never detected a stall at low
+frame rates. Having any frame in the last
+1.5 s (*recent*) still decides whether a switch can skip the keyframe
+gate. Separately, a receiver's PLI/FIR carries no rid, so the SFU relays
+it to the layer that receiver is forwarded (or the target of its pending
+switch). str0m would match any layer for a missing rid.
+
+Test note: str0m sends its BWE probes as padding on **SSRC 0** on a
+video m-line, the libwebrtc convention for non-media probes. Chrome
+reports that as a video inbound-rtp with `ssrc: 0` that never decodes a
+frame, so stats-based assertions must skip ssrc 0. This was the actual
+cause of the e2e-blur failures after #113.
+
 ### D3. Budget and per-receiver allocation across origins
 
 Inputs at time `now` for one receiver:
